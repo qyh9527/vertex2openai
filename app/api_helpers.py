@@ -27,6 +27,10 @@ from failover import UpstreamUnstartedError
 # 引入报错重试统计器
 from logger import stats
 
+# 假流式前缀：请求 fake-<模型名> 时该请求走假流式（Express 通道），其余模型保持真实流式。
+# 定义在公共模块：models_api（列表暴露）、express_sdk（强制假流式）、cookie_proxy（剥前缀）共用。
+FAKE_PREFIX = "fake-"
+
 
 def _safety_score_enabled() -> bool:
     try:
@@ -926,6 +930,7 @@ async def execute_gemini_call(
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
     failover_mode: bool = False,
+    force_fake_streaming: bool = False,
 ):
     fallback_client = None
 
@@ -954,7 +959,10 @@ async def execute_gemini_call(
     if request_obj.stream:
         is_image_request = "image" in request_obj.model.lower()
 
-        if app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request:
+        # 假流式判定：仅请求模型名带 fake- 前缀（force_fake_streaming），或生图模型强制。
+        # 全局 fake_streaming 开关不再直接强制所有模型，改由模型列表暴露 fake- 前缀模型
+        # 让客户端按模型选择（见 routes/models_api.py）。
+        if force_fake_streaming or is_image_request:
             if is_image_request:
                  print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(

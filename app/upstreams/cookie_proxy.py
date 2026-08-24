@@ -42,7 +42,7 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
-from api_helpers import get_retry_settings
+from api_helpers import get_retry_settings, FAKE_PREFIX
 from failover import UpstreamUnstartedError
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -1333,6 +1333,10 @@ class CookieProxyUpstream(BaseUpstream):
         # ===== 3. 解析模型名 =====
         model_display = request_obj.model
         base_model_name = model_display
+        # fake- 前缀最先剥：fake-gemini-x-search → gemini-x-search → gemini-x
+        # （Cookie 通道无假流式实现，剥掉前缀当普通模型处理；model_display 保留原样回显）
+        if base_model_name.startswith(FAKE_PREFIX):
+            base_model_name = base_model_name[len(FAKE_PREFIX):]
         if base_model_name.endswith("-search"):
             base_model_name = base_model_name[:-len("-search")]
 

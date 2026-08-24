@@ -28,6 +28,9 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
 
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
+    # 假流式开关 = 注册 fake- 前缀模型：开启后列表额外暴露 fake-<模型名> 条目，
+    # 客户端选中即对该请求强制假流式（其余模型保持真实流式）。
+    has_fake_variants = bool(app_state.get_setting("fake_streaming", False))
 
     def add_model(base_id: str):
         suffixes = [""]
@@ -48,6 +51,20 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
                 "parent": None,
             })
             processed_ids.add(final_id)
+            if has_fake_variants:
+                fake_id = f"fake-{final_id}"
+                if fake_id in processed_ids:
+                    continue
+                final_model_list.append({
+                    "id": fake_id,
+                    "object": "model",
+                    "created": int(current_time),
+                    "owned_by": "google",
+                    "permission": [],
+                    "root": f"fake-{base_id}",
+                    "parent": None,
+                })
+                processed_ids.add(fake_id)
 
     for model_id in raw_models:
         add_model(model_id)

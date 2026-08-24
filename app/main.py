@@ -575,7 +575,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
         <div class="space-y-3">
-          <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">注册 fake- 前缀模型<span class="helpq" onclick="hlp(this,'h_fake')">?</span></span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div id="h_fake" class="helpbox">开启后，<b>/v1/models 模型列表会为每个模型额外添加 <code>fake-&lt;模型名&gt;</code> 条目</b>（例如 <code>fake-gemini-3.7-flash</code>）。客户端选中它，该请求就强制走假流式；选普通模型名则保持真实流式——假流式按模型选择，不再全局生效。<br>生图模型不受此开关影响（本来就强制假流式）；Cookie 直连通道没有假流式实现，<code>fake-</code> 前缀会被自动剥掉当普通模型处理。</div>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>

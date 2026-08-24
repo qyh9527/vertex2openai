@@ -85,6 +85,9 @@ DEFAULT_SETTINGS = {
     "failover_threshold": 3,
     "failover_cooldown_seconds": 60,
     # 开关（初始值取环境变量）
+    # 假流式：开启 = 在 /v1/models 模型列表注册 fake-<模型名> 条目（客户端选中即对该请求
+    # 强制假流式，其余模型保持真实流式）。不再全局强制所有模型。
+    # 心跳间隔仅对走假流式的请求生效。
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
     "roundrobin": ROUNDROBIN,

@@ -14,6 +14,7 @@ from api_helpers import (
     create_generation_config,
     execute_gemini_call,
     create_openai_error_response,
+    FAKE_PREFIX,
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
@@ -30,23 +31,31 @@ OPENAI_DIRECT_SUFFIX = "-openai"
 OPENAI_SEARCH_SUFFIX = "-openaisearch"
 
 
-def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
+def _normalize_model_name(model_name: str) -> tuple[str, bool, bool, str | None]:
     base_model_name = model_name
+    is_fake = False
 
-    if base_model_name.startswith(LEGACY_EXPRESS_PREFIX):
-        base_model_name = base_model_name[len(LEGACY_EXPRESS_PREFIX):]
+    # 假流式前缀与 legacy 前缀按任意顺序循环剥除：fake-[EXPRESS] x / [EXPRESS] fake-x 均支持
+    while True:
+        if base_model_name.startswith(FAKE_PREFIX):
+            is_fake = True
+            base_model_name = base_model_name[len(FAKE_PREFIX):]
+        elif base_model_name.startswith(LEGACY_EXPRESS_PREFIX):
+            base_model_name = base_model_name[len(LEGACY_EXPRESS_PREFIX):]
+        else:
+            break
 
     if base_model_name.startswith(LEGACY_PAY_PREFIX):
-        return base_model_name, False, "当前版本已经移除 Pay/Service Account 模式，请改用 Express Mode 模型名称。"
+        return base_model_name, False, False, "当前版本已经移除 Pay/Service Account 模式，请改用 Express Mode 模型名称。"
 
     if base_model_name.endswith(OPENAI_SEARCH_SUFFIX) or base_model_name.endswith(OPENAI_DIRECT_SUFFIX):
-        return base_model_name, False, "当前版本已经移除 -openai/-openaisearch 直连上游路径，请直接使用普通模型名或 -search 模型名。"
+        return base_model_name, False, False, "当前版本已经移除 -openai/-openaisearch 直连上游路径，请直接使用普通模型名或 -search 模型名。"
 
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[:-len("-search")]
 
-    return base_model_name, is_grounded_search, None
+    return base_model_name, is_grounded_search, is_fake, None
 
 
 def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
@@ -192,7 +201,7 @@ class ExpressSDKUpstream(BaseUpstream):
 
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
-        base_model_name, is_grounded_search, model_error = _normalize_model_name(request_obj.model)
+        base_model_name, is_grounded_search, is_fake, model_error = _normalize_model_name(request_obj.model)
         if model_error:
             print(f"❌ [模型名称] {model_error} 收到的模型名：{request_obj.model}")
             return JSONResponse(
@@ -312,6 +321,8 @@ class ExpressSDKUpstream(BaseUpstream):
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text, failover_mode=failover_mode,
+            # fake- 前缀请求：强制假流式输出（该请求级别，不影响其它模型）
+            force_fake_streaming=is_fake,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
             # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
