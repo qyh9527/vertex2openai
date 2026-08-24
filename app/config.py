@@ -79,6 +79,11 @@ DEFAULT_SETTINGS = {
     # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
+    # 双通道故障转移（仅 hybrid 策略生效）
+    # 熔断：某通道连续失败 >= failover_threshold 次后冷却 failover_cooldown_seconds 秒，
+    # 冷却期间路由层直接跳过该通道；成功后立即清零。纯 Express / 纯 Cookie 策略不受影响。
+    "failover_threshold": 3,
+    "failover_cooldown_seconds": 60,
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,

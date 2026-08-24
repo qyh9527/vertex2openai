@@ -43,6 +43,7 @@ from message_processing import (
 )
 from logger import stats
 from api_helpers import get_retry_settings
+from failover import UpstreamUnstartedError
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -1278,7 +1279,8 @@ class CookieProxyUpstream(BaseUpstream):
     使用 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
     """
 
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request,
+                               failover_mode: bool = False):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
@@ -1420,14 +1422,18 @@ class CookieProxyUpstream(BaseUpstream):
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, fastapi_request,
                 )
-                yield _make_openai_chunk(response_id, model_display, role="assistant")
                 if res.get("kind") != "ok":
+                    # hybrid 故障转移：生图失败且未出流（role chunk 在失败检查之后才发）→ 抛给路由层切兜底通道
+                    if failover_mode:
+                        raise UpstreamUnstartedError(res.get("message", "生图失败"))
+                    yield _make_openai_chunk(response_id, model_display, role="assistant")
                     stats.add_error()
                     print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
                     yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {res.get('message', '生图失败')}")
                     yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     return
+                yield _make_openai_chunk(response_id, model_display, role="assistant")
                 full_text = res.get("full_text") or ""
                 if prefill_text:
                     full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
@@ -1585,6 +1591,10 @@ class CookieProxyUpstream(BaseUpstream):
 
                             # 如果属于 Cookie 权限错误
                             elif status == "cookie_error":
+                                # hybrid 故障转移：会话失效且未出流 → 抛给路由层切兜底通道。
+                                # Cookie 挂了不代表 API Key 不可用，让请求成功、日志提示刷新 Cookie。
+                                if failover_mode and not has_yielded_to_client:
+                                    raise UpstreamUnstartedError(data)
                                 if not has_yielded_to_client:
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
                                 stats.add_error()
@@ -1602,6 +1612,10 @@ class CookieProxyUpstream(BaseUpstream):
                                     error_to_raise = data
                                     break  # 跳出当前 async for，进入外部循环的 sleep 阶段
                                 else:
+                                    # hybrid 故障转移：重试耗尽（429 类限流）且未出流 → 抛给路由层切兜底通道。
+                                    # fatal_error 是硬错误，不切换——切换也不会变好，直接如实报给前端。
+                                    if failover_mode and not has_yielded_to_client and status == "retryable_error":
+                                        raise UpstreamUnstartedError(data)
                                     # 如果已经开始了输出，或者错误不可重试，直接抛给前端结束
                                     if not has_yielded_to_client:
                                         yield _make_openai_chunk(response_id, model_display, role="assistant")

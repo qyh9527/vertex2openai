@@ -26,7 +26,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
-  - 标准模式 / Cookie 直连模式在线一键切换。
+  - 标准模式 / Cookie 直连 / **混合自动（双通道故障转移）** 在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（Cookie 私有接口通常不返回可靠用量）。
@@ -366,13 +366,64 @@ curl http://localhost:8050/v1/chat/completions \
 
 ---
 
+## 双通道策略（Express API Key / Cookie 直连）
+
+控制台「通道与凭证」页可选三种通道策略，`web_state.json` 中旧版 `use_web_proxy` 布尔开关会自动迁移：
+
+| 策略 | 行为 |
+|---|---|
+| `express`（默认） | 只走 Express API Key 标准通道 |
+| `cookie` | 只走 Cookie 直连反代（走网页端配额，规避 429） |
+| `hybrid`（推荐） | **Express 优先**，限流/5xx/未出流失败自动切 Cookie 兜底 |
+
+**故障转移规则**：
+- 仅对 429 / 500 / 502 / 503 / 504（限流、上游繁忙）类错误切换通道；400 / 401 / 403（配置、鉴权、权限问题）如实报错不切换——切换也不会变好。
+- Cookie 会话失效（Permission Denied）在混合模式下也会自动切 Express，日志会提示你刷新 Cookie。
+- **流式响应**：只有「尚未向客户端发出任何内容」时才会切换（SSE 心跳不计入）。一旦正文开始输出，错误只能如实收尾——SSE 流中途无法切换上游。
+- **熔断保护**：任一通道连续失败 `failover_threshold` 次（默认 3）后冷却 `failover_cooldown_seconds` 秒（默认 60），冷却期间请求自动走另一条通道，避免限流风暴反复撞墙；成功后立即恢复。
+- 通道未配置凭证（无 Express Key / 无 Cookie）会被路由层自动剔除，不会进入失败重试循环。
+
 ## 关于 429 报错与并发控制
 
 429（Resource Exhausted）常因上游限额不足或请求频率过高。项目已内置退避重试，另建议：
+- **优先启用「混合自动」通道策略**：Express 被限流时自动切 Cookie 直连兜底，无需人工干预。
 - 控制客户端并发频率。
 - 适当减小最大输出 Token。
 - 配置多个有效 Express Key 并开启轮询。
 - 及时更新失效或权限受限的 Google Cookie。
+
+---
+
+## 自建镜像持续化部署（fork 后一键升级）
+
+不依赖原作者的镜像，自己改代码、自己构建、1Panel 一键升级：
+
+1. **Fork 本仓库**到你的 GitHub 账号，clone 后改代码 push（可加 `git remote add upstream https://github.com/bad-woman/vertex2openai` 定期合并原作者的更新）。
+2. **加 GitHub Actions 自动构建**：在 fork 仓库创建 `.github/workflows/build.yml`（内容见下），push 到 main 即自动 `docker build` 并推送 `ghcr.io/你的用户名/vertex2openai:latest`。fork 仓库保持 public 则包公开，VPS 拉取免登录。
+3. **VPS 上改一次**：把 `docker-compose.yml` 的 `image` 改为 `ghcr.io/你的用户名/vertex2openai:latest`，用 1Panel 重建容器。
+4. **以后日常**：改代码 → push → Actions 自动出镜像 → 1Panel 点「重建/升级」拉取新 latest → 完成。
+
+**数据不丢**：Cookie、Project ID 与全部控制台设置持久化在挂载卷 `./data:/app/data`（`web_state.json`），升级镜像/重建容器都保留，无需 sqlite。
+
+`.github/workflows/build.yml`：
+
+```yaml
+name: build-push
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ghcr.io/${{ github.repository_owner }}/vertex2openai:latest .
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - run: docker push ghcr.io/${{ github.repository_owner }}/vertex2openai:latest
+```
 
 ---
 

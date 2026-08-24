@@ -22,6 +22,7 @@ from config import VERTEX_REASONING_TAG
 
 import model_capabilities as mc
 from runtime_state import app_state
+from failover import UpstreamUnstartedError
 
 # 引入报错重试统计器
 from logger import stats
@@ -772,6 +773,7 @@ async def gemini_fake_stream_generator(
     is_auto_attempt: bool,
     prefill_text: str = "",
     fastapi_request: Optional[Any] = None,
+    failover_mode: bool = False,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -884,6 +886,10 @@ async def gemini_fake_stream_generator(
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
         json_payload_error = json.dumps(err_resp_sse)
+        # hybrid 故障转移：失败前只发过 keep-alive 空 chunk（无内容），
+        # 抛给路由层切换到兜底通道；未出流承诺由"从未 yield 过内容 chunk"保证。
+        if failover_mode:
+            raise UpstreamUnstartedError(str(e_outer_gemini))
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
             yield "data: [DONE]\n\n"
@@ -919,6 +925,7 @@ async def execute_gemini_call(
     prefill_text: str = "",
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
+    failover_mode: bool = False,
 ):
     fallback_client = None
 
@@ -954,7 +961,7 @@ async def execute_gemini_call(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
-                    fastapi_request=fastapi_request,
+                    fastapi_request=fastapi_request, failover_mode=failover_mode,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -1077,15 +1084,21 @@ async def execute_gemini_call(
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                        if is_auto_attempt:
-                            raise e_stream_call
+                        # hybrid 故障转移：未出流 + 可切换错误（重试已耗尽）→ 抛给路由层切兜底通道。
+                        # 未出流承诺由 has_yielded 保证（keep-alive 心跳不计入，内容/预填充 chunk 才置位）。
+                        if failover_mode and not has_yielded and is_retryable:
+                            raise UpstreamUnstartedError(str(e_stream_call))
                         # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
                         if has_yielded:
                             yield "data: [DONE]\n\n"
-                        else:
-                            err_resp = create_openai_error_response(500, s_err, "server_error")
-                            yield f"data: {json.dumps(err_resp)}\n\n"
-                            yield "data: [DONE]\n\n"
+                            return
+                        # 未出流：预检（is_auto_attempt）语义 = 抛异常由调用方决定。
+                        # 修正：只有未出流才抛；出流后必须走上面的 SSE 收尾，防止整段答案重发。
+                        if is_auto_attempt:
+                            raise e_stream_call
+                        err_resp = create_openai_error_response(500, s_err, "server_error")
+                        yield f"data: {json.dumps(err_resp)}\n\n"
+                        yield "data: [DONE]\n\n"
                         return
 
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
@@ -1128,6 +1141,9 @@ async def execute_gemini_call(
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     await asyncio.sleep(wait_time)
                     continue
+                # hybrid 故障转移：限流/上游繁忙且内部重试已耗尽 → 抛给路由层切兜底通道
+                if failover_mode and is_retryable_exception(e_call):
+                    raise UpstreamUnstartedError(str(e_call))
                 raise
 
         # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”

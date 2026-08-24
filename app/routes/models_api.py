@@ -20,8 +20,8 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
 
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
     
-    # 动态放行：开启网页反代或者配置有 Express API Key 均可安全获取模型列表
-    has_web_proxy = app_state.is_web_proxy_enabled()
+    # 动态放行：开启 Cookie 直连 / 混合策略，或配置有 Express API Key，均可安全获取模型列表
+    has_web_proxy = app_state.get_channel_strategy() != "express"   # cookie 或 hybrid 都放行
     has_express_key = express_key_manager_instance.get_total_keys() > 0
     
     raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []

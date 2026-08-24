@@ -26,7 +26,7 @@ class AppState:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._state = {"use_web_proxy": False}
+        self._state = {"channel_strategy": "express"}
         self._load_from_disk()
 
     # ---------- 持久化 ----------
@@ -38,6 +38,14 @@ class AppState:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                # 旧版布尔开关 use_web_proxy → 三档 channel_strategy 迁移。
+                # 判断以「磁盘原始数据」为准：_state 的初始默认键不能作为
+                # "已迁移"的标志（否则旧文件永远走不到迁移分支）。
+                if "channel_strategy" not in data and "use_web_proxy" in data:
+                    data["channel_strategy"] = "cookie" if data.get("use_web_proxy") else "express"
+                    data.pop("use_web_proxy", None)
+                    print(f"🔄 [状态管理器] 检测到旧版通道开关 use_web_proxy，"
+                          f"已迁移为通道策略 channel_strategy={data['channel_strategy']}。")
                 self._state.update(data)
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
@@ -74,15 +82,34 @@ class AppState:
 
     # ---------- 通道开关与凭证 ----------
 
-    def enable_web_proxy(self, enabled: bool):
+    CHANNEL_STRATEGIES = ("express", "cookie", "hybrid")
+
+    def set_channel_strategy(self, strategy: str) -> bool:
+        """三档通道策略：express=只走 API Key / cookie=只走 Cookie 直连 / hybrid=混合自动（Express 主 + Cookie 兜底）。"""
+        strategy = (strategy or "").strip().lower()
+        if strategy not in self.CHANNEL_STRATEGIES:
+            return False
         with self._lock:
-            self._state["use_web_proxy"] = bool(enabled)
-            self._save()
-            print(f"🔄 [状态管理器] 网页反代状态已更新：{enabled}")
+            if self._state.get("channel_strategy") != strategy:
+                self._state["channel_strategy"] = strategy
+                self._save()
+            print(f"🔄 [状态管理器] 通道策略已更新：{strategy}")
+            return True
+
+    def get_channel_strategy(self) -> str:
+        with self._lock:
+            strategy = self._state.get("channel_strategy")
+            if strategy not in self.CHANNEL_STRATEGIES:
+                return "express"
+            return strategy
+
+    # ---- 旧布尔接口（向后兼容，内部映射到策略；新代码请用策略接口）----
+
+    def enable_web_proxy(self, enabled: bool):
+        self.set_channel_strategy("cookie" if enabled else "express")
 
     def is_web_proxy_enabled(self) -> bool:
-        with self._lock:
-            return bool(self._state.get("use_web_proxy", False))
+        return self.get_channel_strategy() == "cookie"
 
     def set_google_cookie(self, cookie_str: str):
         with self._lock:

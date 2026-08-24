@@ -343,6 +343,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input type="radio" name="mode" value="web_proxy" class="mt-1" onchange="updateMode('web_proxy')">
           <div><div class="font-medium text-sm">Cookie 直连反代</div><div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div></div>
         </label>
+        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-hybrid">
+          <input type="radio" name="mode" value="hybrid" class="mt-1" onchange="updateMode('hybrid')">
+          <div><div class="font-medium text-sm">混合自动（推荐）</div><div class="text-xs text-neutral-500 mt-0.5">Express 优先，限流/故障自动切 Cookie 兜底，含熔断保护</div></div>
+        </label>
       </div>
     </div>
     <div id="cookie-box" class="card p-5 hidden">
@@ -678,8 +682,8 @@ async function fetchStats(){
 
 /* ---------- Channel ---------- */
 async function updateMode(m){
-  $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  $('cookie-box').classList.toggle('hidden', m==='api_key');
+  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
   await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
 }
 function parseCookies(str){
@@ -700,10 +704,11 @@ async function saveCookie(){
 async function loadRuntime(){
   try{
     const s=await (await fetch('/api/settings/runtime')).json();
-    const m=s.use_web_proxy?'web_proxy':'api_key';
-    document.querySelector(`input[name=mode][value=${m}]`).checked=true;
-    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
-    $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+    const m=s.channel_strategy || (s.use_web_proxy?'web_proxy':'api_key');
+    const radio=document.querySelector(`input[name=mode][value="${m}"]`);
+    if(radio) radio.checked=true;
+    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
+    $('cookie-box').classList.toggle('hidden', m==='api_key');
     /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
        输入框留空 = 保持现有 Cookie；填了才更新。 */
     const ci=$('cookie-input');
@@ -1009,6 +1014,8 @@ class ModeSetting(BaseModel):
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     cookie = app_state.get_google_cookie()
     return JSONResponse(content={
+        "channel_strategy": app_state.get_channel_strategy(),
+        # 旧前端兼容：布尔开关仍回显
         "use_web_proxy": app_state.is_web_proxy_enabled(),
         # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
         # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
@@ -1020,8 +1027,21 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
 
 @app.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
-    app_state.enable_web_proxy(setting.mode == "web_proxy")
-    return JSONResponse(content={"status": "success"})
+    # 前端取值：api_key|web_proxy（旧）/ express|cookie|hybrid（新），统一映射到三档策略
+    raw = (setting.mode or "").strip().lower()
+    mapping = {
+        "api_key": "express",
+        "web_proxy": "cookie",
+        "express": "express",
+        "cookie": "cookie",
+        "hybrid": "hybrid",
+    }
+    strategy = mapping.get(raw)
+    if strategy is None:
+        return JSONResponse(status_code=400, content={"error": "无效的通道模式，应为 express / cookie / hybrid。"})
+    if not app_state.set_channel_strategy(strategy):
+        return JSONResponse(status_code=400, content={"error": "设置通道策略失败。"})
+    return JSONResponse(content={"status": "success", "channel_strategy": strategy})
 
 
 @app.get("/api/settings")

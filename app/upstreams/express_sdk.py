@@ -20,6 +20,7 @@ from message_processing import (create_gemini_prompt, apply_prefill_compat,
 from http_options import get_http_options, should_use_priority_paygo
 import model_capabilities as mc
 from runtime_state import app_state
+from failover import UpstreamUnstartedError
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -179,7 +180,8 @@ class ExpressSDKUpstream(BaseUpstream):
     官方 API Key Express Mode 渠道处理器
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request,
+                               failover_mode: bool = False):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
@@ -309,7 +311,7 @@ class ExpressSDKUpstream(BaseUpstream):
 
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
-            fastapi_request=fastapi_request, prefill_text=prefill_text,
+            fastapi_request=fastapi_request, prefill_text=prefill_text, failover_mode=failover_mode,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
             # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
