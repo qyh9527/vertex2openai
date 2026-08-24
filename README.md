@@ -399,31 +399,29 @@ curl http://localhost:8050/v1/chat/completions \
 不依赖原作者的镜像，自己改代码、自己构建、1Panel 一键升级：
 
 1. **Fork 本仓库**到你的 GitHub 账号，clone 后改代码 push（可加 `git remote add upstream https://github.com/bad-woman/vertex2openai` 定期合并原作者的更新）。
-2. **加 GitHub Actions 自动构建**：在 fork 仓库创建 `.github/workflows/build.yml`（内容见下），push 到 main 即自动 `docker build` 并推送 `ghcr.io/你的用户名/vertex2openai:latest`。fork 仓库保持 public 则包公开，VPS 拉取免登录。
+2. **无需自建 CI**：fork 仓库已自带上游的 GitHub Actions（`.github/workflows/docker-image.yml`，GHCR CI），push 到 main 即自动构建并推送 `ghcr.io/你的用户名/vertex2openai:latest`。fork 仓库保持 public 则包公开，VPS 拉取免登录。
 3. **VPS 上改一次**：把 `docker-compose.yml` 的 `image` 改为 `ghcr.io/你的用户名/vertex2openai:latest`，用 1Panel 重建容器。
 4. **以后日常**：改代码 → push → Actions 自动出镜像 → 1Panel 点「重建/升级」拉取新 latest → 完成。
 
 **数据不丢**：Cookie、Project ID 与全部控制台设置持久化在挂载卷 `./data:/app/data`（`web_state.json`），升级镜像/重建容器都保留，无需 sqlite。
 
-`.github/workflows/build.yml`：
+### 定期合并原作者更新（upstream 同步）
 
-```yaml
-name: build-push
-on:
-  push:
-    branches: [main]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t ghcr.io/${{ github.repository_owner }}/vertex2openai:latest .
-      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-      - run: docker push ghcr.io/${{ github.repository_owner }}/vertex2openai:latest
+Fork 后的仓库默认配置：
+
+```bash
+git remote add upstream https://github.com/bad-woman/vertex2openai.git   # 一次即可
 ```
+
+原作者更新时，拉取并合并：
+
+```bash
+git fetch upstream
+git merge upstream/main      # 或 git rebase upstream/main
+git push origin main         # 推送后 GHCR CI 自动重新构建镜像
+```
+
+⚠️ **冲突提示**：上游更新可能与你改过的文件冲突（本项目常见于 `app/routes/chat_api.py`、`app/api_helpers.py`、`app/main.py` 等）。遇到冲突时手动解决后重新提交即可；合并后跑一遍「本地开发与检查」的语法检查再推。
 
 ---
 
