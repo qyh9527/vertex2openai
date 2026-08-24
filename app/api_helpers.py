@@ -970,7 +970,8 @@ async def execute_gemini_call(
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client
                 max_retries, backoff_sec = get_retry_settings()
-                has_yielded = False  # 是否已向客户端输出过内容
+                has_yielded = False    # 是否已向客户端输出过正文/工具调用（重试与故障转移的唯一判断依据）
+                prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -988,11 +989,13 @@ async def execute_gemini_call(
 
                         # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
                         # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
-                        # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）
+                        # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）。
+                        # 预填充是"静态前缀"：重试时不重发，也**不**把它算作"已出流"，
+                        # 否则带预填充的请求（酒馆预设）遇到 429 会被误判为已输出而拒绝重试。
                         tool_indexer = ToolCallIndexer()
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
-                        if prefill_text and not has_yielded:
-                            has_yielded = True
+                        if prefill_text and not prefill_sent:
+                            prefill_sent = True
                             _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
                             yield f"data: {json.dumps(_pf)}\n\n"
 
@@ -1085,11 +1088,13 @@ async def execute_gemini_call(
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         # hybrid 故障转移：未出流 + 可切换错误（重试已耗尽）→ 抛给路由层切兜底通道。
-                        # 未出流承诺由 has_yielded 保证（keep-alive 心跳不计入，内容/预填充 chunk 才置位）。
-                        if failover_mode and not has_yielded and is_retryable:
+                        # 未出流承诺由 has_yielded 保证（keep-alive 心跳、静态预填充前缀均不计入，
+                        # 只有正文/工具调用 chunk 才置位）。
+                        # 预填充已发出时不触发 failover：切换后新通道会重发预填充，客户端会看到重复开头。
+                        if failover_mode and not has_yielded and not prefill_sent and is_retryable:
                             raise UpstreamUnstartedError(str(e_stream_call))
-                        # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
-                        if has_yielded:
+                        # 已经输出过内容（正文或预填充前缀）：不再重发错误体，只补结束标记，避免污染已有输出
+                        if has_yielded or prefill_sent:
                             yield "data: [DONE]\n\n"
                             return
                         # 未出流：预检（is_auto_attempt）语义 = 抛异常由调用方决定。
