@@ -1,6 +1,8 @@
+import contextvars
 import copy
 import json
 import os
+import random
 import tempfile
 import threading
 
@@ -9,6 +11,14 @@ import config as app_config
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
 STATE_DIR = os.environ.get("STATE_DIR", ".")
 STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
+
+# 多账号模式下，一次请求内所有 Cookie 凭证读取必须来自**同一份账号**：
+# _get_cookie_string() 与 _get_project_id() 在重试/流式路径里会被多次调用，
+# 若每次都重新轮询就会串号（cookie 是 A 的、project 是 B 的）。
+# contextvars 天然按 asyncio task（= 一次请求）隔离：首个读取点选号并缓存，
+# 同一请求后续读取复用；failover 切通道重发也复用同一账号（一致性优先）。
+_current_cookie_account = contextvars.ContextVar(
+    "current_cookie_account", default=None)
 
 
 class AppState:
@@ -27,6 +37,7 @@ class AppState:
     def __init__(self):
         self._lock = threading.RLock()
         self._state = {"channel_strategy": "express"}
+        self._cookie_rr_index = 0   # 多 Cookie 账号轮询指针（内存态，重启重头轮）
         self._load_from_disk()
 
     # ---------- 持久化 ----------
@@ -130,6 +141,107 @@ class AppState:
     def get_project_id(self) -> str:
         with self._lock:
             return self._state.get("google_project_id", "")
+
+    # ---------- 多账号凭证管理（Express Key 列表 / Cookie 账号列表）----------
+
+    def get_express_keys(self):
+        """控制台管理的 Express Key 列表；None = 从未保存过（此时用环境变量）。"""
+        with self._lock:
+            keys = self._state.get("express_keys")
+            if isinstance(keys, list):
+                return [k for k in keys if k]
+            return None
+
+    def set_express_keys(self, keys: list) -> list:
+        """整表覆盖保存 Express Key 列表（空列表 = 清空控制台列表，回落环境变量）。"""
+        clean = []
+        seen = set()
+        for k in (keys or []):
+            if not isinstance(k, str):   # None/数字等一律跳过，防误存 "None"
+                continue
+            k = k.strip()
+            if k and k not in seen:
+                clean.append(k)
+                seen.add(k)
+        with self._lock:
+            self._state["express_keys"] = clean
+            self._save()
+        print(f"🔄 [状态管理器] 已保存 {len(clean)} 个 Express API Key（控制台管理）。")
+        return clean
+
+    def get_cookie_accounts(self) -> list:
+        """Cookie 账号列表 [(cookie, project_id), ...]。
+
+        新格式存 _state["cookie_accounts"]；旧版单账号字段（google_cookie /
+        google_project_id）自动迁移成单元素列表视图，兼容老配置。
+        """
+        with self._lock:
+            accounts = self._state.get("cookie_accounts")
+            if isinstance(accounts, list):
+                return [a for a in accounts if isinstance(a, dict) and a.get("cookie")]
+            cookie = self._state.get("google_cookie", "")
+            if cookie:
+                return [{"cookie": cookie, "project_id": self._state.get("google_project_id", "")}]
+            return []
+
+    def set_cookie_accounts(self, accounts: list) -> list:
+        """整表覆盖保存 Cookie 账号列表。
+
+        每项必须含非空 cookie（project_id 可空）。保存后同步旧字段
+        google_cookie / google_project_id = 第一个账号，保证旧读取接口仍有效。
+        传空列表 = 清空全部账号（Cookie 通道回落环境变量）。
+        """
+        clean = []
+        for a in (accounts or []):
+            if not isinstance(a, dict):
+                continue
+            cookie = str(a.get("cookie") or "").strip()
+            if not cookie:
+                continue
+            clean.append({
+                "cookie": cookie,
+                "project_id": str(a.get("project_id") or "").strip(),
+            })
+        with self._lock:
+            self._state["cookie_accounts"] = clean
+            self._state.pop("google_cookie", None)
+            self._state.pop("google_project_id", None)
+            if clean:
+                # 旧读取接口（get_google_cookie / get_project_id / location 钉定）取第一个账号
+                self._state["google_cookie"] = clean[0]["cookie"]
+                self._state["google_project_id"] = clean[0]["project_id"]
+            self._cookie_rr_index = 0
+            _current_cookie_account.set(None)
+            self._save()
+        print(f"🔄 [状态管理器] 已保存 {len(clean)} 个 Cookie 账号。")
+        return clean
+
+    def get_current_cookie_account(self) -> tuple:
+        """取本次请求使用的 Cookie 账号（请求级快照，见模块注释）。
+
+        单账号直接返回；多账号按 roundrobin 设置轮询或随机选择，
+        同一请求内（含重试、流式、failover 重发）复用同一账号。
+        无任何账号时返回 (None, None)。
+        """
+        account = _current_cookie_account.get()
+        if account is None:
+            accounts = self.get_cookie_accounts()
+            if not accounts:
+                return (None, None)
+            if len(accounts) == 1:
+                account = accounts[0]
+            else:
+                use_roundrobin = bool(self.get_setting("roundrobin", app_config.ROUNDROBIN))
+                with self._lock:
+                    if use_roundrobin:
+                        idx = self._cookie_rr_index % len(accounts)
+                        self._cookie_rr_index = (self._cookie_rr_index + 1) % len(accounts)
+                    else:
+                        idx = random.randrange(len(accounts))
+                    account = accounts[idx]
+                print(f"🔑 [账号选择] 多 Cookie 账号轮询/随机选中第 {idx + 1}/{len(accounts)} 份。")
+            _current_cookie_account.set(account)
+        return (account.get("cookie", ""), account.get("project_id", ""))
 
     # ---------- 控制台可调设置 ----------
 

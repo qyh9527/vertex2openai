@@ -1,12 +1,43 @@
 import builtins
+import logging
+import os
 import time
 import asyncio
 import re
 import threading
+from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+def _setup_file_logger():
+    """日志落盘：按天轮转，保留 7 天，与 STATE_DIR 同目录（挂载卷内，重建容器不丢）。
+
+    容器日志（docker logs）随容器重建即清空，排查"昨天发生了什么"无从查起；
+    落盘后 VPS 上 `tail -f <STATE_DIR>/vertex2openai.log` 或 1Panel 文件管理直接看。
+    与 web_state.json 同目录的代价是同一份权限约束（0600 内含 Cookie 的目录），可接受。
+    """
+    state_dir = os.environ.get("STATE_DIR", ".")
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        handler = TimedRotatingFileHandler(
+            os.path.join(state_dir, "vertex2openai.log"),
+            when="midnight", backupCount=7, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        logger = logging.getLogger("vertex2openai.file")
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        logger.propagate = False
+        return logger
+    except Exception as e:
+        print(f"⚠️ [日志] 文件日志初始化失败（不影响运行）：{e}")
+        return None
+
+
+file_logger = _setup_file_logger()
 
 
 class ProxyStats:
@@ -171,6 +202,14 @@ def custom_print(*args, **kwargs):
 
         if not raw_msg:
             return
+
+        # 文件日志（STATE_DIR/vertex2openai.log，按天轮转保留 7 天）。
+        # 用清理 ANSI 后的文本，保证 VPS 上 tail -f 看到的是纯文本。
+        if file_logger is not None:
+            try:
+                file_logger.info(ANSI_ESCAPE.sub('', raw_msg))
+            except Exception:
+                pass
 
         try:
             rt_logger.push(ANSI_ESCAPE.sub('', raw_msg))

@@ -30,6 +30,10 @@
 | 4 | 带预填充的流式请求 429 不重试 bug 修复 | Bug 修复 | `e1d61c1` |
 | 5 | 假流式改为按模型选择（`fake-` 前缀模型） | 功能 | `21c4141` |
 | 6 | 上游稳定性：锁 google-genai 2.x + 钉 api_version=v1beta1 + Client 复用 | 功能 | `ab53e48` |
+| 7 | 多账号凭证管理：多 Express Key + 多 Cookie 账号（请求级快照不串号） | 功能 | 本批 |
+| 8 | 自动化测试体系：pytest 142 用例（`tests/`） | 工程 | 本批 |
+| 9 | 日志落盘：按天轮转保留 7 天（`STATE_DIR/vertex2openai.log`） | 运维 | 本批 |
+| 10 | CI 镜像双 tag（`latest` + commit sha，可回滚） | 部署 | 本批 |
 
 ---
 
@@ -93,6 +97,8 @@
 3. 沿用上游自带的 GHCR CI（`.github/workflows/docker-image.yml`）：push 到 main 自动 `docker build` → `docker push ghcr.io/qyh9527/vertex2openai:latest`（fork 仓库 public，包公开，VPS 拉取免登录）
    - 期间曾自建 `build.yml` 后删除（避免与上游 CI 重复构建同一 tag）
 4. 验证：镜像已产出 `ghcr.io/qyh9527/vertex2openai:latest`，匿名拉取可行（PUBLIC）
+5. **双 tag 可回滚**（本批）：build/push 同时打 `latest` 与 `${{ github.sha }}`。VPS 出问题时把
+   docker-compose 的 image 改回上一个 `ghcr.io/qyh9527/vertex2openai:<sha>` 即回滚，不用等重新构建
 
 **VPS 操作**（一次性）：
 
@@ -196,6 +202,72 @@ git push origin main         # 推送后 GHCR CI 自动重建镜像
 
 ---
 
+### 3.7 多账号凭证管理：多 Express Key + 多 Cookie 账号（控制台可管）
+
+**现状问题**：Express Key 只能从环境变量启动时加载（增删 Key 得改 compose 重启）；Cookie 只有单一份，多账号分摊配额/规避 429 无从谈起。
+
+**目标**：控制台「通道与凭证」页直接管理多 Key 与多 Cookie 账号，热生效，持久化在挂载卷（重建容器不丢）。
+
+#### 核心设计
+
+- **来源优先级**：控制台持久化列表（`web_state.json` 的 `express_keys` / `cookie_accounts`）> 环境变量（`VERTEX_EXPRESS_API_KEY` / `GOOGLE_COOKIE` 作初始值/兜底）。控制台保存后 `refresh_keys()` 热生效；清空列表自动回落环境变量。
+- **多 Cookie 选择 = 请求级快照**：`get_current_cookie_account()` 用 **contextvars** 按 asyncio task（＝一次请求）隔离——`_get_cookie_string()` 与 `_get_project_id()` 在重试/流式路径会被调用多次，若每次都重新选号就会**串号**（cookie 是 A 账号的、project 是 B 的）；快照保证同一请求内（含重试、流式、failover 重发）恒用同一账号。多账号时按现有 `roundrobin` 开关轮询或随机；单账号行为与改造前完全一致。
+- **选择粒度 = 账号**：location 钉定用的 project 取"第一个账号"（保存时 `google_cookie`/`google_project_id` 同步为首项），保持稳定不随轮询漂移。
+- **兼容迁移**：旧 `google_cookie`/`google_project_id` 字段自动视为单账号列表视图；保存新列表时同步旧字段，旧读取接口与 `/api/cookie` 端点全部继续有效。
+- **掩码回显**：Express Key 与 Cookie 在控制台一律只回显掩码（Key 露前后 4 位；Cookie 只报字段数/长度），不回填输入框（留空 = 保持原值），完整凭证永不进入前端 JS / 浏览器缓存。
+- **Cookie 校验**：新增账号时校验 SAPISID 族字段（`cookie_auth.validate_cookie`），无效直接拒绝并提示。
+
+#### 文件改动
+
+- `app/runtime_state.py`：`express_keys` / `cookie_accounts` 持久化 + `get_current_cookie_account()`（contextvar 快照 + 轮询/随机，index 内存态）
+- `app/express_key_manager.py`：来源改为「控制台列表优先，环境变量兜底」，`refresh_keys()` 热生效
+- `app/upstreams/cookie_proxy.py`：`_get_cookie_string` / `_get_project_id` 改走请求级账号快照
+- `app/routes/chat_api.py`：Express 预检改为「控制台列表 **或** 环境变量」——否则控制台配的 key 会被误剔除直接 503（真 bug，冒烟发现）
+- `app/main.py`：通道页新增 Express Key 列表编辑器（多行文本域整表覆盖 + 清空回落）+ 多 Cookie 账号卡片（逐行增删改）；新端点 `POST /api/express-keys`（整表覆盖）、`POST /api/cookie-account`（单账号增改删）
+
+**顺手修掉的 bug**：`set_express_keys` 曾把 `None` 存成字符串 `"None"`（已过滤非字符串类型）。
+
+---
+
+### 3.8 自动化测试体系（pytest，本机 3.11 venv）
+
+**背景**：7000+ 行 Python 此前零自动化测试，"测试记录"全为手动验证；upstream merge 后只有 `compileall` 语法检查，行为被改坏看不出来。
+
+**现状**：`tests/` 9 个文件、**142 个用例**全绿（`pytest.ini` 配 `asyncio_mode=auto`）。覆盖：
+
+- runtime_state：迁移、旧布尔接口、非法值拒绝、深拷贝隔离、原子写、损坏文件降级
+- ChannelBreaker 熔断：阈值、冷却到期、成功清零、通道独立、status
+- ExpressKeyManager：轮询/随机/无 Key/刷新
+- 模型名解析（`fake-`/`-search`/`[PAY]`/任意前缀组合）与 location 钉定、Client 缓存复用约束
+- **路由层故障转移全路径**：429/5xx 切换、400/401/403 不切、熔断冷却跳过、流式未出流切换、无兜底错误流、非 hybrid 零行为变化
+- Cookie 错误分类：项目级（Project ID/计费）vs Cookie 过期——README 专门纠正过的逻辑
+- 预填充去重：流式（PrefillDeduper）与非流式（strip_prefill_overlap）
+- 多账号凭证：迁移、轮询/随机、请求级快照不串号、来源优先级
+
+**跑法**（Windows 本机，Python 3.11 venv，与 Docker `python:3.11-slim` 一致；系统 3.14 环境是坏的，别用）：
+
+```bash
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r app\requirements.txt pytest pytest-asyncio
+.venv\Scripts\python.exe -m pytest tests -q
+```
+
+conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效），**绝不碰真实 `web_state.json`**；contextvar 账号快照有 autouse fixture 清理。
+
+**踩坑**：pytest-asyncio 需 `asyncio_mode=auto`；流式测试的"未出流失败"generator 必须带一个不可达的 `yield`（否则函数是普通协程而非 async generator，`'coroutine' object is not iterable`）。
+
+---
+
+### 3.9 日志落盘（按天轮转保留 7 天）
+
+`docker logs` 随容器重建即清空，排查"昨天发生了什么"无从查起。`app/logger.py` 落盘到 `STATE_DIR/vertex2openai.log`（与 `web_state.json` 同目录、同在挂载卷内，重建容器不丢）：
+
+- `TimedRotatingFileHandler` 按天轮转、保留 7 天、utf-8
+- `custom_print` 同时写文件（去 ANSI，VPS 上 `tail -f` 看到纯文本）与推 SSE 控制台流
+- 初始化失败不影响运行（打印警告降级为纯容器日志）；日志文件与 web_state.json 同一份 0600 权限约束
+
+---
+
 ## 四、测试记录
 
 所有测试在本机 Python 3.11 venv（与项目 Docker 环境 `python:3.11-slim` 一致）中进行：
@@ -221,6 +293,12 @@ git push origin main         # 推送后 GHCR CI 自动重建镜像
 | 3.6 改动：`python -m compileall app` 全绿 | ✅ |
 | 3.6 改动：google-genai 2.19.0 的 `HttpOptions.api_version` 字段存在（grep 已装 SDK 源码确认） | ✅ |
 | 3.6 改动：GHCR CI 构建 `ab53e48` 成功（run 32828775055） | ✅ |
+| **自动化测试（3.8）：pytest 142 用例全绿** | ✅ |
+| 多账号：控制台 key 列表保存/清空/环境变量回落（热生效） | ✅ |
+| 多账号：cookie 旧字段迁移、轮询/随机、请求级快照不串号 | ✅ |
+| 多账号：通道预检认控制台 key（修复的 bug） | ✅ |
+| 日志落盘：custom_print → 文件 + SSE 双写 | ✅ |
+| 真实 uvicorn 冒烟：保存 key → 增删 Cookie 账号 → 重启磁盘读回 → 请求路径 401/流式错误流（非 503 无通道） | ✅ |
 
 ---
 
@@ -275,6 +353,8 @@ git fetch upstream && git merge upstream/main && git push   # 合并原作者更
 - **流式 failover 是"响应头之前"级**：已出流的失败只能如实收尾，无法切换。对 429（请求未开始就被拒）完全够用
 - **Cookie 通道假流式**：目前没有实现，`fake-` 前缀在 Cookie 通道被剥掉当普通模型处理（生图除外）。若需要可为 Cookie 通道补假流式实现
 - **熔断器是进程内存态**：重启后计数清零，属正常（冷却期最长 60s，影响极小）
+- **多 Cookie 轮询 index 是内存态**：重启后从头轮，属正常（轮换本身无状态要求）
+- **账号快照的一致性优先**：保存账号列表后，正在进行的请求仍用旧快照账号，下一请求才用新列表（可接受）
 - **多实例部署**：若未来多副本，需把熔断状态/会话/签名缓存迁移到 Redis 等共享存储（当前单实例够用）
 - **Express Mode 是 Pre-GA**：SDK 已锁 2.x、api_version 已钉 v1beta1，行为可复现；升级镜像/同步 upstream 前先看 google-genai CHANGELOG，升级后开「出站调试」核对 thinking 参数是否照旧
 - **「钉定 location」是未文档化用法**：官方 Express 端点格式不含 projects/locations，实测可用但 Pre-GA 下 Google 可能收紧；已有 `is_location_pin_failure` 兜底（失败自动退回裸模型名），真失效时不会更糟，只是回到后端自选路由

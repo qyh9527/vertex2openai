@@ -21,8 +21,8 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 ## 功能特性
 
 - **双上游通道，一键切换**
-  - Express API Key：多 Key 随机或轮询调用官方 SDK。
-  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
+  - Express API Key：多 Key 随机或轮询调用官方 SDK。**控制台可在线增删 Key 列表**（无需改 compose 重启），保存后热生效；未在控制台配置时回落环境变量。
+  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**支持多 Cookie 账号**（每账号 = 一份 Cookie + 一个 Project ID），按「多 Key 轮询」开关轮询或随机选号，同一请求内恒用同一账号（快照隔离不串号）。**注意：走的是私有接口，见下方风险提示。**
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
@@ -72,7 +72,7 @@ http://localhost:8050
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
 | `API_KEY` | 是 | `123456` | 保护本代理的 Key，同时也是**控制台登录密码**。客户端请求用 `Authorization: Bearer <API_KEY>`。 |
-| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Mode API Key，多个用英文逗号分隔。标准模式使用。 |
+| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Mode API Key，多个用英文逗号分隔。标准模式使用。**控制台可在线增删 Key 列表并持久化（`web_state.json`），保存后覆盖环境变量；未在控制台配置时环境变量作为兜底。** |
 | `ROUNDROBIN` | 否 | `false` | 多 Express Key 轮询(`true`)或随机(`false`)。可在控制台热改。 |
 | `FAKE_STREAMING` | 否 | `false` | 假流式开关：开启后 `/v1/models` 为每个模型注册 `fake-<模型名>` 条目，客户端选中即对该请求强制假流式（其余模型保持真实流式）；生图模型始终强制假流式。可在控制台热改。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
@@ -383,6 +383,15 @@ curl http://localhost:8050/v1/chat/completions \
 - **熔断保护**：任一通道连续失败 `failover_threshold` 次（默认 3）后冷却 `failover_cooldown_seconds` 秒（默认 60），冷却期间请求自动走另一条通道，避免限流风暴反复撞墙；成功后立即恢复。
 - 通道未配置凭证（无 Express Key / 无 Cookie）会被路由层自动剔除，不会进入失败重试循环。
 
+### 多账号凭证管理（Express Key 列表 / 多 Cookie 账号）
+
+控制台「通道与凭证」页可在线管理（持久化在挂载卷 `web_state.json`，重建容器不丢）：
+
+- **Express Key 列表**：多行文本框整表覆盖（每行一个 Key），可一键清除回落环境变量；只回显掩码（前后 4 位 + 长度），保存后 `refresh_keys()` 热生效。
+- **Cookie 账号**：每行 = 一份 Cookie + 一个 Project ID，支持添加/更新/删除；新增时校验 SAPISID 族字段；Cookie 输入框留空 = 保持该账号原值。多账号时按「多 Key 轮询」开关轮询或随机选号；单账号行为与原来完全一致。
+- **同一请求恒用同一账号**：重试、流式、故障转移重发都不会串号（cookie 与 project 取自请求级快照）；location 钉定用的 Project ID 取第一个账号，稳定不漂移。
+- **凭证永不回显明文**：前端只显示掩码，完整 Cookie / Key 不会进入浏览器缓存或截图。
+
 ## 关于 429 报错与并发控制
 
 429（Resource Exhausted）常因上游限额不足或请求频率过高。项目已内置退避重试，另建议：
@@ -442,6 +451,11 @@ git push origin main         # 推送后 GHCR CI 自动重新构建镜像
 ```bash
 # 语法检查
 python -m compileall app
+
+# 自动化测试（Python 3.11 venv，与 Docker 环境一致；系统 Python 3.14 环境是坏的别用）
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r app\requirements.txt pytest pytest-asyncio
+.venv\Scripts\python.exe -m pytest tests -q
 
 # 本地启动
 cd app

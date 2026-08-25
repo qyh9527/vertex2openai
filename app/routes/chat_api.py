@@ -51,12 +51,13 @@ def _available_channels(order: list) -> list:
     out = []
     for channel in order:
         if channel == "express":
-            if app_config.VERTEX_EXPRESS_API_KEY_VAL:
+            # 实际生效的 key：控制台列表优先，其次环境变量（与 ExpressKeyManager 一致）
+            if app_state.get_express_keys() or app_config.VERTEX_EXPRESS_API_KEY_VAL:
                 out.append(channel)
             else:
                 print("ℹ️ [通道预检] Express 通道跳过：未配置 VERTEX_EXPRESS_API_KEY。")
         else:  # cookie
-            if app_state.get_google_cookie() and app_state.get_project_id():
+            if app_state.get_cookie_accounts():
                 out.append(channel)
             else:
                 print("ℹ️ [通道预检] Cookie 通道跳过：未配置 Google Cookie / Project ID。")

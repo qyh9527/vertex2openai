@@ -1072,10 +1072,15 @@ def _make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
 # ========== 认证解析 ==========
 
 def _get_cookie_string() -> str:
-    return app_config.GOOGLE_COOKIE or app_state.get_google_cookie() or ""
+    # 多账号：按请求从当前账号取（见 runtime_state.get_current_cookie_account 注释，
+    # 重试/流式路径会多次调用，必须固定同一份账号）。
+    # 无账号列表时回落环境变量 GOOGLE_COOKIE。
+    account_cookie, _ = app_state.get_current_cookie_account()
+    return account_cookie or app_config.GOOGLE_COOKIE or ""
 
 def _get_project_id() -> str:
-    return app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or ""
+    account_cookie, account_project = app_state.get_current_cookie_account()
+    return account_project or app_config.GOOGLE_PROJECT_ID or ""
 
 
 def _wants_usage(request_obj: OpenAIRequest) -> bool:

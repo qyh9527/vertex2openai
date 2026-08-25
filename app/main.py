@@ -161,6 +161,15 @@ def mask_cookie(cookie_str: str) -> str:
     return f"已配置（共 {len(names)} 个 cookie 字段，{len(cookie_str)} 字符）"
 
 
+def mask_key(key: str) -> str:
+    """Express API Key 掩码：只露前后 4 位 + 长度。"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return f"****（{len(key)} 字符）"
+    return f"{key[:4]}…{key[-4:]}（{len(key)} 字符）"
+
+
 async def require_auth(request: Request):
     if not _is_authed(request):
         raise HTTPException(status_code=401, detail="未登录")
@@ -349,16 +358,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
     </div>
-    <div id="cookie-box" class="card p-5 hidden">
-      <div class="lbl mb-2">Google Cookie（含 HttpOnly 字段）</div>
-      <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
-      <div class="lbl mb-2">Google Cloud Project ID</div>
-      <input id="project-input" class="inp mb-3" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取">
-      <div class="flex items-center justify-between">
-        <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
-        <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
+    <div id="express-key-box" class="card p-5 hidden">
+      <div class="lbl mb-2">Express API Key（控制台管理，可多个）</div>
+      <div id="express-keys-summary" class="text-xs text-neutral-500 mb-2"></div>
+      <textarea id="express-keys-input" rows="3" class="inp log mb-3" placeholder="每行一个 Key；留空 = 保持不变；填写 = 整表覆盖当前列表（多 Key 轮询/随机摊薄限流）"></textarea>
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <button class="text-xs text-neutral-500 underline" onclick="clearExpressKeys()">清除控制台 Key（回落环境变量）</button>
+        <button class="btn px-4 py-2 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
       </div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+    </div>
+    <div id="cookie-box" class="card p-5 hidden">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+        <div class="lbl">Google Cookie 账号（可配多个，按轮询/随机选择使用）</div>
+        <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addCookieAccount()">+ 添加账号</button>
+      </div>
+      <div id="cookie-accounts"></div>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个 Google 账号：粘贴完整 Cookie（含 HttpOnly 字段，支持 Cookie-Editor 导出的 JSON / Header String，自动解析）+ 对应 Project ID。<b>Cookie 输入框留空 = 保持该账号原值不变</b>，只更新 Project ID。多账号时按「多 Key 轮询」开关轮询或随机选号，单账号行为与原来一致。Cookie 过期会自动切换其它可用账号/通道（hybrid 模式）。</p>
+      <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
     </div>
   </section>
 
@@ -683,7 +699,10 @@ async function fetchStats(){
 
 /* ---------- Channel ---------- */
 async function updateMode(m){
-  $('cookie-box').classList.toggle('hidden', m==='api_key');
+  const showKey=(m==='api_key'||m==='express'||m==='hybrid');
+  const showCookie=(m==='web_proxy'||m==='cookie'||m==='hybrid');
+  $('express-key-box').classList.toggle('hidden', !showKey);
+  $('cookie-box').classList.toggle('hidden', !showCookie);
   $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
   await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
 }
@@ -692,14 +711,74 @@ function parseCookies(str){
   if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
   return str;
 }
-async function saveCookie(){
-  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
-  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
-  $('cookie-input').value=ck; $('project-input').value=pid;
-  if(!pid){ toast('请填写 Project ID'); return; }
+function extractProject(pid){
+  pid=(pid||'').trim();
+  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/);
+  return m?m[1]:pid;
+}
+async function saveExpressKeys(){
+  const text=$('express-keys-input').value.trim();
+  if(!text){ toast('留空表示不修改；如需覆盖请粘贴 Key 列表'); return; }
+  const keys=text.split(/\n+/).map(s=>s.trim()).filter(Boolean);
   try{
-    const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
-    const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
+    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存 '+d.count+' 个 Express API Key'); $('express-keys-input').value=''; loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function clearExpressKeys(){
+  try{
+    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:[]})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已清除控制台 Key，回落环境变量'); loadRuntime(); }
+    else toast('❌ '+(d.error||'操作失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function cookieRowHtml(acc, isNew){
+  const idx=acc?acc.index:-1;
+  const ck=acc?acc.cookie:'';
+  const pid=acc?(acc.project_id||''):'';
+  const row=document.createElement('div');
+  row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
+  const head=acc
+    ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${ck}</span></div>`
+    : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
+  row.innerHTML=head+
+    `<textarea class="inp log mb-2 acc-cookie" rows="2" placeholder="粘贴完整 Cookie（Cookie-Editor 导出内容自动解析；留空 = 保持原值）"></textarea>`+
+    `<input class="inp mb-2 acc-project" placeholder="Project ID 或含 ?project= 的整条 URL，自动提取" value="${pid}">`+
+    `<div class="flex justify-end gap-2">`+
+    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delCookieAccount(${idx})">删除</button>`:'')+
+    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveCookieRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
+    `</div>`;
+  return row;
+}
+function addCookieAccount(){
+  $('cookie-accounts').appendChild(cookieRowHtml(null,true));
+}
+function renderCookieAccounts(accounts){
+  const box=$('cookie-accounts'); box.innerHTML='';
+  (accounts||[]).forEach(a=>box.appendChild(cookieRowHtml(a,false)));
+}
+async function saveCookieRow(btn, idx){
+  const row=btn.closest('.account-row');
+  const ck=parseCookies(row.querySelector('.acc-cookie').value);
+  const pid=extractProject(row.querySelector('.acc-project').value);
+  if(!ck && !pid){ toast('没有要保存的内容'); return; }
+  try{
+    const r=await fetch('/api/cookie-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,cookie:ck,project_id:pid,delete:false})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存（当前共 '+d.count+' 个账号）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function delCookieAccount(idx){
+  if(!confirm('确认删除该 Cookie 账号？')) return;
+  try{
+    const r=await fetch('/api/cookie-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,cookie:'',project_id:'',delete:true})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已删除（当前共 '+d.count+' 个账号）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'删除失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function loadRuntime(){
@@ -709,17 +788,18 @@ async function loadRuntime(){
     const radio=document.querySelector(`input[name=mode][value="${m}"]`);
     if(radio) radio.checked=true;
     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
-    $('cookie-box').classList.toggle('hidden', m==='api_key');
-    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
-       输入框留空 = 保持现有 Cookie；填了才更新。 */
-    const ci=$('cookie-input');
-    if(ci){
-      ci.value='';
-      ci.placeholder = s.google_cookie_configured
-        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
-        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
-    }
-    if(s.google_project_id) $('project-input').value=s.google_project_id;
+    const showKey=(m==='api_key'||m==='express'||m==='hybrid');
+    const showCookie=(m==='web_proxy'||m==='cookie'||m==='hybrid');
+    $('express-key-box').classList.toggle('hidden', !showKey);
+    $('cookie-box').classList.toggle('hidden', !showCookie);
+    /* 凭证只回显掩码，绝不回填到输入框（否则保存时会把真实值覆盖成掩码）。
+       输入框留空 = 保持现有值；填了才更新。 */
+    const keys=s.express_keys||[];
+    const envN=s.express_keys_env_count||0;
+    const ctrl=s.express_keys_controlled;
+    $('express-keys-summary').textContent='当前生效 '+(keys.length||0)+' 个：'+(keys.join('、')||'（未配置）')+
+      (ctrl?'　[控制台管理]':(envN?'　[来自环境变量]':''));
+    renderCookieAccounts(s.cookie_accounts||[]);
   }catch(e){}
 }
 
@@ -941,8 +1021,13 @@ try{
   es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
 }catch(e){}
 
-/* ---------- Project ID auto-extract ---------- */
-$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
+/* ---------- Project ID auto-extract（按行内 input 冒泡委托，兼容动态添加的账号行） ---------- */
+document.addEventListener('input',e=>{
+  if(e.target && e.target.classList && e.target.classList.contains('acc-project')){
+    const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/);
+    if(m) e.target.value=m[1];
+  }
+});
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
@@ -1014,6 +1099,8 @@ class ModeSetting(BaseModel):
 @app.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     cookie = app_state.get_google_cookie()
+    accounts = app_state.get_cookie_accounts()
+    keys = express_key_manager.express_keys
     return JSONResponse(content={
         "channel_strategy": app_state.get_channel_strategy(),
         # 旧前端兼容：布尔开关仍回显
@@ -1023,7 +1110,75 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
         "google_cookie": mask_cookie(cookie),
         "google_cookie_configured": bool(cookie),
         "google_project_id": app_state.get_project_id(),
+        # 多账号凭证（掩码回显）
+        "express_keys": [mask_key(k) for k in keys],
+        "express_keys_controlled": app_state.get_express_keys() is not None,
+        "express_keys_env_count": len(config.VERTEX_EXPRESS_API_KEY_VAL),
+        "cookie_accounts": [
+            {"index": i, "cookie": mask_cookie(a["cookie"]),
+             "project_id": a.get("project_id", "")}
+            for i, a in enumerate(accounts)
+        ],
     })
+
+
+@app.post("/api/express-keys")
+async def save_express_keys(request: Request, _auth: bool = Depends(require_auth)):
+    """整表覆盖保存 Express API Key 列表（控制台管理，覆盖环境变量）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON。"})
+    if not isinstance(body, dict) or not isinstance(body.get("keys"), list):
+        return JSONResponse(status_code=400, content={"error": "请求体需要 keys 数组。"})
+    clean = app_state.set_express_keys(body["keys"])
+    express_key_manager.refresh_keys()
+    print(f"🔑 [密钥管理] 控制台已保存 {len(clean)} 个 Express API Key。")
+    return JSONResponse(content={"status": "success", "count": len(clean)})
+
+
+class CookieAccountItem(BaseModel):
+    index: int = -1          # >=0 更新已有账号；-1 新增
+    cookie: str = ""         # 留空 = 保持该账号原 Cookie 不变
+    project_id: str = ""
+    delete: bool = False
+
+
+@app.post("/api/cookie-account")
+async def save_cookie_account(item: CookieAccountItem, _auth: bool = Depends(require_auth)):
+    """多 Cookie 账号单行增/改/删（旧 /api/cookie 单账号端点保留兼容）。"""
+    accounts = app_state.get_cookie_accounts()
+    pid = (item.project_id or "").strip()
+
+    if item.delete:
+        if 0 <= item.index < len(accounts):
+            removed = accounts.pop(item.index)
+            app_state.set_cookie_accounts(accounts)
+            print(f"🔑 [账号管理] 已删除 Cookie 账号 #{item.index + 1}。")
+            return JSONResponse(content={"status": "success", "count": len(accounts)})
+        return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
+
+    new_cookie = (item.cookie or "").strip()
+    if 0 <= item.index < len(accounts):
+        if new_cookie:
+            accounts[item.index] = {"cookie": new_cookie, "project_id": pid}
+        elif pid:
+            accounts[item.index] = {**accounts[item.index], "project_id": pid}
+        else:
+            return JSONResponse(status_code=400, content={"error": "没有要更新的内容（Cookie 与 Project ID 都为空）。"})
+        app_state.set_cookie_accounts(accounts)
+        print(f"🔑 [账号管理] 已更新 Cookie 账号 #{item.index + 1}。")
+        return JSONResponse(content={"status": "success", "count": len(accounts)})
+
+    if not new_cookie:
+        return JSONResponse(status_code=400, content={"error": "新增账号必须填写 Cookie。"})
+    validation = validate_cookie(new_cookie)
+    if not validation["valid"]:
+        return JSONResponse(status_code=400, content={"error": validation["message"]})
+    accounts.append({"cookie": new_cookie, "project_id": pid})
+    app_state.set_cookie_accounts(accounts)
+    print(f"🔑 [账号管理] 已新增 Cookie 账号（当前共 {len(accounts)} 个）。")
+    return JSONResponse(content={"status": "success", "count": len(accounts)})
 
 
 @app.post("/api/settings/mode")
