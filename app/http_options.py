@@ -30,6 +30,10 @@ def get_http_options(
     base_url = base_url or (app_config.VERTEX_BASE_URL or None)
     if base_url:
         options["base_url"] = base_url
+    # 显式钉住 API 版本：thinking_level / thinking_budget 等参数只在 v1beta1 提供
+    # （官方 REST 参考确认 v1beta1 同时有 generateContent 与 streamGenerateContent）。
+    # 不钉住会随 google-genai 升级的默认值漂移，行为不可复现。
+    options["api_version"] = "v1beta1"
     if client_args:
         options["client_args"] = client_args
         options["async_client_args"] = client_args

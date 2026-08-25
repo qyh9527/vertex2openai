@@ -2,7 +2,9 @@ fastapi>=0.110.0
 uvicorn>=0.27.1
 pydantic>=2.9.0
 pydantic-settings>=2.2.1
-google-genai>=2.0.0
+# Express Mode 是 Pre-GA（官方 REST 参考文档明确 "as is"），接口可能变更。
+# 锁在 2.x：允许补丁级更新，挡住 3.0 的破坏性变更（默认 api_version、参数行为等）。
+google-genai>=2.0.0,<3.0.0
 httpx[socks]>=0.25.0
 curl_cffi>=0.7.1
 Pillow>=10.0.0

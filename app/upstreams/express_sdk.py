@@ -1,4 +1,5 @@
 import re
+import threading
 from functools import partial
 
 from typing import Any
@@ -29,6 +30,34 @@ LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
 OPENAI_DIRECT_SUFFIX = "-openai"
 OPENAI_SEARCH_SUFFIX = "-openaisearch"
+
+# Client 复用缓存：按 (api_key, base_url, priority_paygo) 复用 google-genai Client。
+# google-genai 的 httpx 连接是惰性创建的，复用 Client 对象即复用 TLS/HTTP 连接池，
+# 省掉每个请求重新握手（VPS → Google 链路的纯开销）。
+# 额度按 API Key 与请求计费，与连接是否复用无关；429 限流也按请求判定，不受影响。
+# dict 的 get/set 在 GIL 下原子，异步协程并发安全；极端并发下重复创建只是多费一个对象。
+_CLIENT_CACHE: dict = {}
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_client(express_api_key: str, priority_paygo: bool) -> Any:
+    """取（必要时创建）复用的 google-genai Client。
+
+    缓存键含 priority_paygo：Priority PayGo 请求头必须只用于钉定到 global 的
+    资源路径，绝不能复用到普通请求上（流量等级会标错）。
+    """
+    base_url = app_config.VERTEX_BASE_URL or None
+    cache_key = (express_api_key, base_url, priority_paygo)
+    with _CLIENT_CACHE_LOCK:
+        client = _CLIENT_CACHE.get(cache_key)
+        if client is None:
+            client = genai.Client(
+                vertexai=True,
+                api_key=express_api_key,
+                http_options=get_http_options(priority_paygo=priority_paygo),
+            )
+            _CLIENT_CACHE[cache_key] = client
+    return client
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, bool, str | None]:
@@ -231,11 +260,7 @@ class ExpressSDKUpstream(BaseUpstream):
         model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
         priority_paygo = should_use_priority_paygo(model_to_call)
 
-        client_to_use = genai.Client(
-            vertexai=True,
-            api_key=express_api_key,
-            http_options=get_http_options(priority_paygo=priority_paygo),
-        )
+        client_to_use = _get_cached_client(express_api_key, priority_paygo)
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -327,10 +352,6 @@ class ExpressSDKUpstream(BaseUpstream):
             # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
-                lambda: genai.Client(
-                    vertexai=True,
-                    api_key=express_api_key,
-                    http_options=get_http_options(priority_paygo=False),
-                )
+                lambda: _get_cached_client(express_api_key, False)
             ) if priority_paygo else None,
         )
