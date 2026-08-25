@@ -29,6 +29,7 @@
 | 3 | upstream 定期同步流程 | 文档 | `9efb0b4` |
 | 4 | 带预填充的流式请求 429 不重试 bug 修复 | Bug 修复 | `e1d61c1` |
 | 5 | 假流式改为按模型选择（`fake-` 前缀模型） | 功能 | `21c4141` |
+| 6 | 上游稳定性：锁 google-genai 2.x + 钉 api_version=v1beta1 + Client 复用 | 功能 | `ab53e48` |
 
 ---
 
@@ -161,6 +162,40 @@ git push origin main         # 推送后 GHCR CI 自动重建镜像
 
 ---
 
+### 3.6 上游稳定性：锁 SDK 2.x + 钉 api_version=v1beta1 + Client 复用
+
+**起因**：研读官方 Express Mode REST 参考（`reference/express-mode/api-reference` 与 `.../rest/v1beta1/publishers.models/{generateContent,streamGenerateContent}`），确认三件事：
+
+1. **Express Mode 是 Pre-GA**（文档明示 "as is"，接口可能变）→ 不能放任 SDK 版本漂移，否则重建镜像后行为静默变化
+2. **端点只有三个方法**：`countTokens` / `generateContent` / `streamGenerateContent`（v1 与 v1beta1 各一套）——项目已全覆盖，无缺能力
+3. 请求体另有 `labels`（仅用于计费与报告）与 `cachedContent`（显式上下文缓存，可省成本）字段，当前均未使用（见"已知边界"）
+
+**改动**：
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `app/requirements.txt` | `google-genai>=2.0.0` → `>=2.0.0,<3.0.0` | 允许 2.x 补丁更新，挡住 3.0 破坏性变更 |
+| `app/http_options.py` | `HttpOptions` 显式 `api_version="v1beta1"` | `thinking_level`/`thinking_budget` 只在 v1beta1 提供；不钉会随 SDK 升级的默认值漂移 |
+| `app/upstreams/express_sdk.py` | 新增 `_CLIENT_CACHE` + `_get_cached_client()` | 按 `(api_key, base_url, priority_paygo)` 复用 genai.Client（httpx 连接池惰性创建，复用即省 TLS 握手） |
+
+**Client 复用的三个设计约束**（改缓存时别破坏）：
+
+- 缓存键必须含 `priority_paygo`——Priority PayGo 请求头只能用于钉定到 global 的资源路径，串给普通请求会标错流量等级
+- dict 的 get/set 在 GIL 下原子，异步协程并发安全；极端并发下重复创建只是多费一个对象
+- **额度按 API Key 与请求计费，与连接是否复用无关**；429 限流也按请求判定，复用不会更严——单号用户放心复用
+- 主路径与 location 钉定回退路径共用同一缓存（`fallback_client_factory` 也走 `_get_cached_client(key, False)`）
+
+**踩坑记录（重要）**：
+
+- ⚠️ **`gh run list` 显示的是旧记录**（列表有缓存/同步问题），判断 CI 是否触发、是否成功**必须用 API**：
+  ```bash
+  gh api repos/qyh9527/vertex2openai/actions/runs --jq '.workflow_runs[0:5][] | {id, status, conclusion, head_sha}'
+  ```
+- ⚠️ **系统 Python 3.14 的依赖环境是坏的**（pydantic 与 annotated_types 冲突、fastapi 缺 `__version__`），全量 import 冒烟在 Windows 本机跑不了；验证手段是 `python -m compileall app` + 直接 grep 已安装 google-genai 的 `types.py` 确认字段存在（2.19.0 确认 `HttpOptions.api_version` 合法）
+- 文档核对结论：Express Mode 的**额度不是无限的**——官方专门有 [Error code 429](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/deploy/error-code-429) 与[吞吐量配额](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/resources/throughput-quota) 文档，429 是常态（项目熔断/failover 正是为此存在）
+
+---
+
 ## 四、测试记录
 
 所有测试在本机 Python 3.11 venv（与项目 Docker 环境 `python:3.11-slim` 一致）中进行：
@@ -183,6 +218,9 @@ git push origin main         # 推送后 GHCR CI 自动重建镜像
 | 假流式：开关关无 fake- 条目 / 开关开每模型 +2 条目（含 `-search`） | ✅ |
 | 假流式：fake- 请求走 `🌊 [假流式]`，普通请求走真流式 | ✅ |
 | 假流式：root 字段、Cookie 通道前缀剥离 | ✅ |
+| 3.6 改动：`python -m compileall app` 全绿 | ✅ |
+| 3.6 改动：google-genai 2.19.0 的 `HttpOptions.api_version` 字段存在（grep 已装 SDK 源码确认） | ✅ |
+| 3.6 改动：GHCR CI 构建 `ab53e48` 成功（run 32828775055） | ✅ |
 
 ---
 
@@ -238,3 +276,6 @@ git fetch upstream && git merge upstream/main && git push   # 合并原作者更
 - **Cookie 通道假流式**：目前没有实现，`fake-` 前缀在 Cookie 通道被剥掉当普通模型处理（生图除外）。若需要可为 Cookie 通道补假流式实现
 - **熔断器是进程内存态**：重启后计数清零，属正常（冷却期最长 60s，影响极小）
 - **多实例部署**：若未来多副本，需把熔断状态/会话/签名缓存迁移到 Redis 等共享存储（当前单实例够用）
+- **Express Mode 是 Pre-GA**：SDK 已锁 2.x、api_version 已钉 v1beta1，行为可复现；升级镜像/同步 upstream 前先看 google-genai CHANGELOG，升级后开「出站调试」核对 thinking 参数是否照旧
+- **「钉定 location」是未文档化用法**：官方 Express 端点格式不含 projects/locations，实测可用但 Pre-GA 下 Google 可能收紧；已有 `is_location_pin_failure` 兜底（失败自动退回裸模型名），真失效时不会更糟，只是回到后端自选路由
+- **后续可选**：① `labels` 请求体字段（仅计费报告用，一行级改动，可给请求打 `channel=express` 等标签方便看账单）；② `cachedContent` 显式上下文缓存（官方称可保证成本节省，酒馆长预设场景有价值，但需自己管缓存创建/过期/删除生命周期，工作量中）
