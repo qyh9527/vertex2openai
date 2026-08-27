@@ -84,6 +84,12 @@ DEFAULT_SETTINGS = {
     # 冷却期间路由层直接跳过该通道；成功后立即清零。纯 Express / 纯 Cookie 策略不受影响。
     "failover_threshold": 3,
     "failover_cooldown_seconds": 60,
+    # Express Client 复用（google-genai Client 连接池，见 upstreams/express_sdk.py）
+    # client_reuse=False → 每请求新建 Client，不用缓存（排查"复用后持续连接错误"时用，牺牲连接复用）
+    # client_reuse_evict_threshold：缓存 Client 连续"连接级失败"（httpx.TransportError 类，
+    # 不含 429 限流——连接本身健康）≥ 该值即自动舍弃，下次请求重建连接池；0 = 永不自动舍弃。
+    "client_reuse": True,
+    "client_reuse_evict_threshold": 5,
     # 开关（初始值取环境变量）
     # 假流式：开启 = 在 /v1/models 模型列表注册 fake-<模型名> 条目（客户端选中即对该请求
     # 强制假流式，其余模型保持真实流式）。不再全局强制所有模型。

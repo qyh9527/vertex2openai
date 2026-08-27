@@ -587,6 +587,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- Express Client 复用 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-sm font-semibold">Express Client 复用</div>
+          <label class="switch"><input type="checkbox" id="client_reuse"><span class="slider"></span></label>
+        </div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between"><span class="text-sm">连接级失败自动舍弃阈值(次)<span class="helpq" onclick="hlp(this,'h_cre')">?</span></span><input id="client_reuse_evict_threshold" type="number" class="inp" style="width:90px"></div>
+          <div id="h_cre" class="helpbox">google-genai 的 Client 复用了 httpx 连接池（省 TLS 握手）；但长驻进程里可能残留<b>失效的 keep-alive 连接</b>，导致连续的连接级错误（<code>RemoteProtocolError</code> / <code>ConnectError</code> / 超时）。<br>此开关开启时：缓存 Client 连续连接级失败达到阈值（默认 5 次，0=不自动舍弃）即<b>自动舍弃</b>，下次请求重建连接池。<b>429 限流不算连接级失败</b>（连接本身健康），不会误触发。安全策略拦截等硬错误会<b>立即舍弃</b>，不等阈值。<br>关闭此开关：每个请求都新建 Client（彻底避免复用失效连接），但失去连接复用、延迟开销增大——仅排查"复用后持续连接错误"时临时用。</div>
+        </div>
+      </div>
+
       <!-- 开关 -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
@@ -810,8 +822,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -975,6 +987,8 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    client_reuse:$('client_reuse').checked,
+    client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
@@ -994,7 +1008,7 @@ async function saveSettings(){
     });
   }
   const scope = overriding
-    ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
+    ? '将保存全局的基础设施项（图压缩/重试/Client 复用/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
     : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
   if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{

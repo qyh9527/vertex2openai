@@ -36,8 +36,63 @@ OPENAI_SEARCH_SUFFIX = "-openaisearch"
 # 省掉每个请求重新握手（VPS → Google 链路的纯开销）。
 # 额度按 API Key 与请求计费，与连接是否复用无关；429 限流也按请求判定，不受影响。
 # dict 的 get/set 在 GIL 下原子，异步协程并发安全；极端并发下重复创建只是多费一个对象。
+#
+# 两个控制台可调行为（「Express Client 复用」卡片）：
+#   client_reuse=False              → 每请求新建 Client，彻底不用缓存
+#   client_reuse_evict_threshold=N  → 缓存 Client 连续 N 次"连接级失败"（httpx.TransportError
+#                                    类，如 RemoteProtocolError / ConnectError / 超时，不含 429
+#                                    限流）自动舍弃，下次请求重建连接池（0=不自动舍弃）。
+#                                    长驻进程里残留的失效 keep-alive 连接正是这类失败之源。
 _CLIENT_CACHE: dict = {}
 _CLIENT_CACHE_LOCK = threading.Lock()
+_CLIENT_FAILURES: dict = {}  # cache_key -> 连续连接级失败次数
+
+
+def _new_express_client(express_api_key: str, priority_paygo: bool,
+                        cache_key: Any = None) -> Any:
+    """创建 genai.Client；复用模式下挂上失败上报回调（由 api_helpers 调用）。"""
+    client = genai.Client(
+        vertexai=True,
+        api_key=express_api_key,
+        http_options=get_http_options(priority_paygo=priority_paygo),
+    )
+    if cache_key is not None:
+        client._vertex_cache_key = cache_key
+        client._vertex_on_failure = partial(_on_client_failure, cache_key)
+    return client
+
+
+def _on_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -> None:
+    """复用 Client 的一次失败上报（hook，由 api_helpers 触发）。
+
+    kind="evict"：立即舍弃缓存 Client（如安全策略拦截等"这条连接/会话状态不对"的硬错误），
+                 下次请求重建连接池。
+    kind="conn"（默认）：连接级失败计数，累计达到 client_reuse_evict_threshold 才舍弃；
+                 429 限流等 HTTP 状态错误不会走到这里（连接本身健康）。
+    """
+    if kind == "evict":
+        with _CLIENT_CACHE_LOCK:
+            _CLIENT_CACHE.pop(cache_key, None)
+            _CLIENT_FAILURES.pop(cache_key, None)
+        print(f"⚠️ [Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），下次请求重建连接池。")
+        return
+    try:
+        threshold = int(app_state.get_setting(
+            "client_reuse_evict_threshold",
+            app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]))
+    except (TypeError, ValueError):
+        threshold = app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]
+    if threshold <= 0:
+        return
+    with _CLIENT_CACHE_LOCK:
+        cnt = _CLIENT_FAILURES.get(cache_key, 0) + 1
+        if cnt >= threshold:
+            _CLIENT_CACHE.pop(cache_key, None)
+            _CLIENT_FAILURES.pop(cache_key, None)
+            print(f"⚠️ [Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已舍弃，"
+                  f"下次请求将重建连接池。")
+        else:
+            _CLIENT_FAILURES[cache_key] = cnt
 
 
 def _get_cached_client(express_api_key: str, priority_paygo: bool) -> Any:
@@ -45,17 +100,16 @@ def _get_cached_client(express_api_key: str, priority_paygo: bool) -> Any:
 
     缓存键含 priority_paygo：Priority PayGo 请求头必须只用于钉定到 global 的
     资源路径，绝不能复用到普通请求上（流量等级会标错）。
+    控制台 client_reuse 关闭时不做缓存，每请求新建 Client。
     """
+    if not app_state.get_setting("client_reuse", True):
+        return _new_express_client(express_api_key, priority_paygo, cache_key=None)
     base_url = app_config.VERTEX_BASE_URL or None
     cache_key = (express_api_key, base_url, priority_paygo)
     with _CLIENT_CACHE_LOCK:
         client = _CLIENT_CACHE.get(cache_key)
         if client is None:
-            client = genai.Client(
-                vertexai=True,
-                api_key=express_api_key,
-                http_options=get_http_options(priority_paygo=priority_paygo),
-            )
+            client = _new_express_client(express_api_key, priority_paygo, cache_key=cache_key)
             _CLIENT_CACHE[cache_key] = client
     return client
 

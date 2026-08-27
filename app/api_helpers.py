@@ -203,6 +203,23 @@ def is_retryable_exception(e):
         return True
     return False
 
+
+def report_client_failure(client, kind: str = "conn", reason: str = "") -> None:
+    """向复用层上报一次 Client 失败（stale 连接池 / 网络突变 / 安全拦截等）。
+
+    kind="conn"：连接级失败计数，达到阈值自动舍弃重建（只有 httpx.TransportError 类异常
+                 才上报此类型；429 等 HTTP 状态错误是连接健康的证明，不要上报）。
+    kind="evict"：立即舍弃复用 Client（如安全策略拦截等硬错误），下次请求重建连接池。
+    Express 通道的缓存 Client 挂有 _vertex_on_failure 回调（见 express_sdk）；
+    非复用 Client 无回调，静默跳过。
+    """
+    hook = getattr(client, "_vertex_on_failure", None)
+    if callable(hook):
+        try:
+            hook(kind=kind, reason=reason)
+        except Exception:
+            pass
+
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     
@@ -836,6 +853,8 @@ async def gemini_fake_stream_generator(
                 raise
             except Exception as e_call:
                 last_error = e_call
+                if isinstance(e_call, httpx.TransportError):
+                    report_client_failure(gemini_client_instance, kind="conn")
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
                     print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
@@ -871,6 +890,9 @@ async def gemini_fake_stream_generator(
             if hasattr(raw_gemini_response.prompt_feedback, "block_reason_message") and \
                raw_gemini_response.prompt_feedback.block_reason_message:
                 block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
+            # 安全策略拦截属硬错误：立即舍弃复用 Client，下次请求重建连接池
+            report_client_failure(gemini_client_instance, kind="evict",
+                                  reason=f"安全策略拦截（{raw_gemini_response.prompt_feedback.block_reason}）")
             raise ValueError(block_message)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
@@ -1052,6 +1074,8 @@ async def execute_gemini_call(
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
+                        if isinstance(e_stream_call, httpx.TransportError):
+                            report_client_failure(current_client, kind="conn")
                         error_str = str(e_stream_call).lower()
                         is_retryable = (
                             "429" in error_str or "503" in error_str or "too many requests" in error_str
@@ -1138,6 +1162,8 @@ async def execute_gemini_call(
                 print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                 raise
             except Exception as e_call:
+                if isinstance(e_call, httpx.TransportError):
+                    report_client_failure(current_client, kind="conn")
                 if (fallback_model and model_to_call != fallback_model
                         and is_location_pin_failure(e_call)):
                     print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
@@ -1175,6 +1201,9 @@ async def execute_gemini_call(
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
+            # 安全策略拦截属硬错误：立即舍弃复用 Client，下次请求重建连接池
+            report_client_failure(current_client, kind="evict",
+                                  reason=f"安全策略拦截（{response_obj_call.prompt_feedback.block_reason}）")
             raise ValueError(block_msg)
 
         if not is_gemini_response_valid(response_obj_call):

@@ -106,3 +106,74 @@ class TestClientCache:
         plain = sdk._get_cached_client("key1", False)
         paygo = sdk._get_cached_client("key1", True)
         assert paygo is not plain
+
+
+class TestClientReuseGuard:
+    """Client 复用开关 + 自动舍弃（连接级失败阈值 / 硬错误立即舍弃）。"""
+
+    def _clear(self):
+        import upstreams.express_sdk as sdk
+        with sdk._CLIENT_CACHE_LOCK:
+            sdk._CLIENT_CACHE.clear()
+            sdk._CLIENT_FAILURES.clear()
+
+    def _restore_settings(self):
+        app_state.update_settings({
+            "client_reuse": True,
+            "client_reuse_evict_threshold": app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"],
+        })
+
+    def test_reuse_disabled_returns_fresh_client_each_time(self):
+        import upstreams.express_sdk as sdk
+        self._clear()
+        try:
+            app_state.update_settings({"client_reuse": False})
+            a = sdk._get_cached_client("key1", False)
+            b = sdk._get_cached_client("key1", False)
+            assert a is not b
+            # 非复用 Client 不挂失败回调（无缓存可舍弃）
+            assert getattr(a, "_vertex_on_failure", None) is None
+        finally:
+            self._restore_settings()
+
+    def test_conn_failure_evicts_after_threshold(self):
+        import upstreams.express_sdk as sdk
+        self._clear()
+        try:
+            app_state.update_settings({"client_reuse_evict_threshold": 2})
+            client = sdk._get_cached_client("key1", False)
+            assert sdk._get_cached_client("key1", False) is client
+            # 第一次连接级失败：计数 1 < 2，不清缓存
+            client._vertex_on_failure(kind="conn")
+            assert sdk._get_cached_client("key1", False) is client
+            # 第二次：达到阈值，舍弃缓存，下次请求重建
+            client._vertex_on_failure(kind="conn")
+            fresh = sdk._get_cached_client("key1", False)
+            assert fresh is not client
+        finally:
+            self._restore_settings()
+
+    def test_hard_error_evicts_immediately(self):
+        """安全策略拦截等硬错误不走阈值，立即舍弃复用。"""
+        import upstreams.express_sdk as sdk
+        self._clear()
+        try:
+            client = sdk._get_cached_client("key1", False)
+            assert sdk._get_cached_client("key1", False) is client
+            client._vertex_on_failure(kind="evict", reason="安全策略拦截")
+            fresh = sdk._get_cached_client("key1", False)
+            assert fresh is not client
+        finally:
+            self._restore_settings()
+
+    def test_eviction_disabled_when_threshold_zero(self):
+        import upstreams.express_sdk as sdk
+        self._clear()
+        try:
+            app_state.update_settings({"client_reuse_evict_threshold": 0})
+            client = sdk._get_cached_client("key1", False)
+            for _ in range(3):
+                client._vertex_on_failure(kind="conn")
+            assert sdk._get_cached_client("key1", False) is client
+        finally:
+            self._restore_settings()

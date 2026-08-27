@@ -34,6 +34,7 @@
 | 8 | 自动化测试体系：pytest 142 用例（`tests/`） | 工程 | 本批 |
 | 9 | 日志落盘：按天轮转保留 7 天（`STATE_DIR/vertex2openai.log`） | 运维 | 本批 |
 | 10 | CI 镜像双 tag（`latest` + commit sha，可回滚） | 部署 | 本批 |
+| 11 | Express Client 复用防护：开关 + 连接级失败自动舍弃 / 硬错误立即舍弃 | 功能 | 本批 |
 
 ---
 
@@ -268,6 +269,46 @@ conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效）�
 
 ---
 
+### 3.10 Express Client 复用防护：开关 + 自动舍弃
+
+**现状问题**：3.6 引入按 `(api_key, base_url, priority_paygo)` 复用 genai.Client（省 TLS 握手）后，长驻进程里可能残留**失效的 keep-alive 连接**（上游空闲超时关闭、VPS 网络/网关变化等）。复用死连接会持续抛 `httpx.TransportError` 类错误（`RemoteProtocolError` / `ConnectError` / 超时）——连接本身已坏，重试 429/503 的逻辑救不了它。
+
+**目标**：给复用层加两重保护——① 控制台可一键关掉复用（彻底新建 Client）；② 自动识别"连接级失败"，连续达到阈值后舍弃缓存 Client，下次请求重建连接池。
+
+#### 核心设计
+
+- **两个新设置**（控制台「Express Client 复用」卡片）：
+  - `client_reuse`（默认 true）：关闭后 `_get_cached_client` 每请求新建 Client 不入缓存（排查"复用后持续连接错误"时用；代价是失去连接池、延迟增大）
+  - `client_reuse_evict_threshold`（默认 5，0=不自动舍弃）：缓存 Client **连续连接级失败** ≥ 阈值即自动舍弃，下次请求重建
+- **失败分类上报**（`api_helpers.report_client_failure(client, kind, reason)` → Client 上挂 `_vertex_on_failure` 回调）：
+  - `kind="conn"`：**连接级失败计数**（`httpx.TransportError` 类：`ConnectError`/`RemoteProtocolError`/超时等）。**429 限流不算**——连接本身健康，误舍弃会在限流最狠的时候频繁重建握手
+  - `kind="evict"`：**立即舍弃**，不等阈值——安全策略拦截（`PROHIBITED_CONTENT` 等 `promptFeedback.block_reason`）等"这条连接/会话状态不对"的硬错误
+- **接入点**（api_helpers 三条路径）：假流式 / 真流式 / 非流式异常处理中识别 `httpx.TransportError` → `kind="conn"` 上报；假流式与非流式的 `block_reason` 检测点 → `kind="evict"` 上报。非复用 Client 无回调，静默跳过
+- **计数不清零**（成功不归零）：stale 池会连续失败直到被舍弃，计数模型匹配；零星几次失败后正常回收也不痛（重建仅多一次握手）
+
+**踩坑**：线程锁不可重入——舍弃逻辑在持有 `_CLIENT_CACHE_LOCK` 时内联 pop，不能调用外层再加锁的函数。
+
+#### 文件改动
+
+- `app/config.py`：新增 `client_reuse` / `client_reuse_evict_threshold` 默认值
+- `app/upstreams/express_sdk.py`：缓存重构为 `_new_express_client` + `_on_client_failure(kind)`，`_get_cached_client` 支持开关
+- `app/api_helpers.py`：新增 `report_client_failure`，三条异常路径 / 两处 block 检测接线
+- `app/main.py`：控制台「Express Client 复用」卡片 + loadParams/saveSettings 接线
+- `tests/test_express_sdk.py`：新增 4 条（开关 / 阈值舍弃 / 硬错误立即舍弃 / 阈值 0）
+
+**研究依据**（联网 + 已装 SDK 源码核验）：
+
+- 共享 httpx.AsyncClient 复用失效 keep-alive 连接 → `RemoteProtocolError` 的实战案例（"Ghost 503s"）；httpx 连接池参数（`max_connections` / `keepalive_expiry`）说明；google-genai [issue #516](https://github.com/googleapis/python-genai/issues/516)（并发下每请求新建 Client 明显变慢 → 复用有必要，应保留默认复用、靠自动舍弃兜底）
+- 已装 SDK 源码核验：`genai.Client` 持有单个 `AsyncHttpxClient` 跨请求复用；`HttpOptions.async_client_args` 可传 httpx 池参数；SDK 自带 `_CONNECTION_ERRORS = (httpx.TimeoutException, httpx.ConnectError)`；`types.py` 确认 `PROHIBITED_CONTENT` 枚举与 `block_reason_message` 字段
+
+**已知边界**：
+
+- 舍弃只救"下一请求"：正在失败的请求已经失败；且 Express 通道连接级错误当前**不参与内部重试**（仅 429/503/quota 会重试），是"连续 N 次请求失败后恢复"
+- 安全拦截舍弃**不改变拦截结果**：客户端收到的仍是拦截错误，仅强制后续请求重建连接池
+- 真流式路径的 `prompt_feedback` block 未接（流式拦截以上抛异常形态出现，需字符串匹配，留待有实际报错样本再加）
+
+---
+
 ## 四、测试记录
 
 所有测试在本机 Python 3.11 venv（与项目 Docker 环境 `python:3.11-slim` 一致）中进行：
@@ -299,6 +340,11 @@ conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效）�
 | 多账号：通道预检认控制台 key（修复的 bug） | ✅ |
 | 日志落盘：custom_print → 文件 + SSE 双写 | ✅ |
 | 真实 uvicorn 冒烟：保存 key → 增删 Cookie 账号 → 重启磁盘读回 → 请求路径 401/流式错误流（非 503 无通道） | ✅ |
+| Client 复用：开关关 → 每请求新建 Client（无回调、不入缓存） | ✅ |
+| Client 复用：连接级失败达阈值 → 自动舍弃重建 | ✅ |
+| Client 复用：硬错误（安全拦截）→ 立即舍弃不等阈值 | ✅ |
+| Client 复用：阈值 0 = 不自动舍弃 | ✅ |
+| **回归：全量 pytest 146 用例全绿（原 142 + 新 4）** | ✅ |
 
 ---
 
@@ -316,7 +362,8 @@ app/
 │   ├── chat_api.py              # 多通道路由、_dispatch、_stream_with_failover
 │   └── models_api.py            # fake- 变体注册、放行条件
 └── upstreams/
-    ├── express_sdk.py           # _normalize_model_name 4 元组、force_fake_streaming 透传
+    ├── express_sdk.py           # _normalize_model_name 4 元组、force_fake_streaming 透传、
+    │                            #   Client 复用防护（开关 + 连接级失败舍弃/硬错误立即舍弃）
     └── cookie_proxy.py          # failover_mode 分支、fake- 前缀剥离
 .github/workflows/docker-image.yml  # 上游自带 GHCR CI（自动构建 latest）
 ```
@@ -353,6 +400,7 @@ git fetch upstream && git merge upstream/main && git push   # 合并原作者更
 - **流式 failover 是"响应头之前"级**：已出流的失败只能如实收尾，无法切换。对 429（请求未开始就被拒）完全够用
 - **Cookie 通道假流式**：目前没有实现，`fake-` 前缀在 Cookie 通道被剥掉当普通模型处理（生图除外）。若需要可为 Cookie 通道补假流式实现
 - **熔断器是进程内存态**：重启后计数清零，属正常（冷却期最长 60s，影响极小）
+- **Client 复用自动舍弃是"下一请求级"**：正在失败的请求不会因舍弃而重放成功；且 Express 通道连接级错误不参与内部重试（仅 429/503/quota 重试）。若想"一次请求内连接错误立即重连"，需额外把 `httpx.TransportError` 类并入可重试判定（当前刻意没做，避免改变既有失败语义）
 - **多 Cookie 轮询 index 是内存态**：重启后从头轮，属正常（轮换本身无状态要求）
 - **账号快照的一致性优先**：保存账号列表后，正在进行的请求仍用旧快照账号，下一请求才用新列表（可接受）
 - **多实例部署**：若未来多副本，需把熔断状态/会话/签名缓存迁移到 Redis 等共享存储（当前单实例够用）
