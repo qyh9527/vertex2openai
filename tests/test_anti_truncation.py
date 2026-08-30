@@ -225,3 +225,60 @@ class TestPersistence:
         # 未知键不会被接受
         st2.update_settings({"bogus_field": "x"})
         assert st2.get_setting("bogus_field", "fallback") == "fallback"
+
+
+class TestFakeStreamCompatibility:
+    """防截断 + fake- 假流式组合：假流式路径的解构必须生效（fake 管传输方式，
+    防截断管生成方式，两者可叠加且互不破坏）。"""
+
+    async def test_fake_stream_with_anti_truncation(self):
+        import json
+        from api_helpers import gemini_fake_stream_generator
+        from models import OpenAIRequest
+
+        tool_name = "v2o_emit_x"
+        resp = types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(parts=[types.Part(
+                function_call=types.FunctionCall(
+                    name=tool_name, args={"content": "假流式下的完整回答"}))],
+            )
+        )])
+
+        class FakeModels:
+            async def generate_content(self, model, contents, config):
+                return resp
+
+        class FakeAio:
+            models = FakeModels()
+
+        class FakeClient:
+            aio = FakeAio()
+
+        req = OpenAIRequest(model="fake-gemini-3.6-flash",
+                            messages=[{"role": "user", "content": "hi"}], stream=True)
+        chunks = []
+        async for sse in gemini_fake_stream_generator(
+            FakeClient(), "gemini-3.6-flash", [], {}, req, False,
+            synthetic_tool_name=tool_name,
+        ):
+            chunks.append(sse)
+
+        contents = []
+        tool_names = []
+        for sse in chunks:
+            if not sse.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(sse[len("data: "):].strip())
+            except Exception:
+                continue
+            for choice in payload.get("choices", []):
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    contents.append(delta["content"])
+                for tc in (delta.get("tool_calls") or []):
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        tool_names.append(fn["name"])
+        assert "".join(contents) == "假流式下的完整回答"
+        assert tool_names == []          # 合成工具调用被剥离，不泄漏
