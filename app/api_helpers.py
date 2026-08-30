@@ -417,8 +417,27 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
     return p_tk, c_tk, t_tk
 
 
-def _record_usage(resp: Any) -> dict:
-    """记录 token 用量，并打印上游实际返回的流量等级。"""
+def _extract_cached_tokens(resp: Any) -> int:
+    """从 SDK 响应里取命中上下文缓存的输入 token 数（隐式缓存；未命中返回 0）。
+
+    服务账号（标准 Vertex）通道的隐式缓存默认开启（90% 折扣）；此值用于统计缓存命中率。
+    """
+    um = getattr(resp, "usage_metadata", None)
+    if not um:
+        return 0
+    return int(getattr(um, "cached_content_token_count", 0) or 0)
+
+
+def _effective_pricing_tier() -> str:
+    """按控制台 paygo_tier 设置决定美刀计费档（standard/priority/flex/auto/off）。"""
+    try:
+        return str(app_state.get_setting("paygo_tier", "auto") or "auto")
+    except Exception:
+        return "auto"
+
+
+def _record_usage(resp: Any, model_name: str = "") -> dict:
+    """记录 token 用量（含缓存命中），并打印上游实际返回的流量等级。"""
     usage_metadata = getattr(resp, "usage_metadata", None)
     traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
     if traffic_type:
@@ -427,8 +446,11 @@ def _record_usage(resp: Any) -> dict:
 
     p_tk, c_tk, t_tk = _extract_usage(resp)
     if p_tk or c_tk:
-        stats.add_tokens(p_tk, c_tk)
-        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+        cached = _extract_cached_tokens(resp)
+        stats.add_tokens(p_tk, c_tk, cached=cached, model=model_name,
+                         tier=_effective_pricing_tier())
+        cache_note = f" | 缓存命中: {cached}" if cached else ""
+        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens{cache_note}")
     return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
 
 
@@ -887,7 +909,7 @@ async def gemini_fake_stream_generator(
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
         
-        _record_usage(raw_gemini_response)
+        _record_usage(raw_gemini_response, request_obj.model)
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
         if synthetic_tool_name:
@@ -1045,10 +1067,12 @@ async def execute_gemini_call(
                             yield f"data: {json.dumps(_pf)}\n\n"
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+                        final_cached_tk = 0
 
                         async for chunk_item_call in stream_gen_obj:
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
+                                final_cached_tk = _extract_cached_tokens(chunk_item_call)
 
                             # 防截断：剥离合成工具 part，把 content 作为正文 delta 直接输出。
                             # 合成调用不进入 ToolCallIndexer，finish_reason 判定只反映真实工具；
@@ -1085,8 +1109,11 @@ async def execute_gemini_call(
                                 yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
                         if final_p_tk > 0 or final_c_tk > 0:
-                            stats.add_tokens(final_p_tk, final_c_tk)
-                            print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
+                            stats.add_tokens(final_p_tk, final_c_tk,
+                                             cached=final_cached_tk, model=request_obj.model,
+                                             tier=_effective_pricing_tier())
+                            cache_note = f" | 缓存命中: {final_cached_tk}" if final_cached_tk else ""
+                            print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens{cache_note}")
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
                         if wants_usage(request_obj):
@@ -1258,7 +1285,7 @@ async def execute_gemini_call(
                 error_details += f"Response type: {type(response_obj_call).__name__}"
             raise ValueError(error_details)
 
-        _record_usage(response_obj_call)
+        _record_usage(response_obj_call, request_obj.model)
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         if synthetic_tool_name:

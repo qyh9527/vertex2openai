@@ -351,6 +351,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
           <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
+          <div class="flex justify-between text-sm"><span class="text-neutral-600">缓存命中 <span class="text-neutral-400">（隐式缓存 90% 折扣，命中即省钱）</span></span><span class="val font-semibold"><span id="t-cached">0</span> tokens · <span id="t-hitrate">—</span></span></div>
+          <div class="flex justify-between text-sm"><span class="text-neutral-600">估算花费 <span class="text-neutral-400">（按官方按量价）</span></span><span id="t-cost" class="val font-semibold">$0.00</span></div>
           <div class="pt-3 border-t border-neutral-100">
             <div class="flex items-center justify-between mb-2">
               <span class="text-xs text-neutral-500">每日 Token 趋势</span>
@@ -445,8 +447,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <option value="flex">flex · 允许排队至 30 分钟（仅 global）</option>
             <option value="priority">priority · 优先调度（仅 global）</option>
           </select>
-          <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="paygo_only"><span>paygo_only（标准档绕过预配吞吐、纯按量；flex/priority 自带该语义）</span></label>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">这是 ST-Vertex-PayGo 方案融合出的官方「按量共享容量」层级头。Flex/Priority 仅对 <code>location=global</code> 生效，非 global 自动降级并告警；Cookie 通道走 batchGraphql，不受此设置影响。</p>
+          <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="paygo_only"><span>paygo_only（标准档绕过预配吞吐、强制纯按量；flex/priority 自带该语义）</span></label>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">这是 ST-Vertex-PayGo 方案融合出的官方「按量共享容量」层级头。Flex/Priority 仅对 <code>location=global</code> 生效，非 global 自动降级并告警；Cookie 通道走 batchGraphql，不受此设置影响。<br>💡 <b>默认关闭</b>。勾选 = 打 <code>shared</code> 标记强制走<b>按量计费</b>（绕过预配吞吐）——按量正是 <b>Google Cloud $300 赠金可抵扣</b>的计费方式，<b>不会阻止使用赠金</b>；反而「预配吞吐」是预付费承诺容量、不走按量账单。</p>
         </div>
 
         <div class="flex justify-end mt-5">
@@ -836,6 +838,10 @@ async function fetchStats(){
     $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
     $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
     $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
+    const cached=d.cached_prompt_tokens||0;
+    $('t-cached').textContent=fmt(cached);
+    $('t-hitrate').textContent=(d.prompt_tokens>0)?((cached/d.prompt_tokens*100).toFixed(1)+'%'):'—';
+    $('t-cost').textContent='$'+((d.cost||0)).toFixed(4);
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
     DAILY=d.daily||[]; renderTrend();
     renderChart(d.success,d.error,d.retries);

@@ -58,7 +58,9 @@ class ProxyStats:
         self.retry_counts = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
-        self._daily = {}          # "YYYY-MM-DD" -> {requests, success, prompt_tokens, completion_tokens}
+        self.cached_prompt_tokens = 0     # 命中上下文缓存的输入 token（隐式缓存 90% 折扣）
+        self.cost = 0.0                   # 估算美刀成本（按官方按量价，见 model_pricing）
+        self._daily = {}          # "YYYY-MM-DD" -> {requests, success, prompt_tokens, completion_tokens, cached_prompt_tokens, cost}
         self._last_save = 0.0
         self.lock = threading.Lock()
         self._load_from_disk()
@@ -82,6 +84,8 @@ class ProxyStats:
             self.retry_counts = int(t.get("retries", 0))
             self.prompt_tokens = int(t.get("prompt_tokens", 0))
             self.completion_tokens = int(t.get("completion_tokens", 0))
+            self.cached_prompt_tokens = int(t.get("cached_prompt_tokens", 0))
+            self.cost = float(t.get("cost", 0) or 0)
             daily = data.get("daily") or {}
             if isinstance(daily, dict):
                 self._daily = {k: dict(v) for k, v in daily.items() if isinstance(v, dict)}
@@ -104,6 +108,8 @@ class ProxyStats:
                     "retries": self.retry_counts,
                     "prompt_tokens": self.prompt_tokens,
                     "completion_tokens": self.completion_tokens,
+                    "cached_prompt_tokens": self.cached_prompt_tokens,
+                    "cost": round(self.cost, 6),
                 },
                 "daily": self._daily,
             }
@@ -118,14 +124,20 @@ class ProxyStats:
         except Exception as e:
             print(f"⚠️ [用量统计] 落盘失败（不影响运行）：{e}")
 
-    def _touch_daily(self, prompt=0, completion=0, success=0, request=0):
+    def _touch_daily(self, prompt=0, completion=0, success=0, request=0,
+                     cached=0, cost=0.0):
         key = self._today_key()
-        day = self._daily.setdefault(
-            key, {"requests": 0, "success": 0, "prompt_tokens": 0, "completion_tokens": 0})
-        day["requests"] += request
-        day["success"] += success
-        day["prompt_tokens"] += prompt
-        day["completion_tokens"] += completion
+        day = self._daily.get(key)
+        if day is None:
+            day = {"requests": 0, "success": 0, "prompt_tokens": 0,
+                   "completion_tokens": 0, "cached_prompt_tokens": 0, "cost": 0.0}
+            self._daily[key] = day
+        day["requests"] = day.get("requests", 0) + request
+        day["success"] = day.get("success", 0) + success
+        day["prompt_tokens"] = day.get("prompt_tokens", 0) + prompt
+        day["completion_tokens"] = day.get("completion_tokens", 0) + completion
+        day["cached_prompt_tokens"] = day.get("cached_prompt_tokens", 0) + cached
+        day["cost"] = float(day.get("cost", 0) or 0) + cost
         # 只保留最近 180 天，防止无界增长
         if len(self._daily) > 180:
             for k in sorted(self._daily)[:len(self._daily) - 180]:
@@ -170,12 +182,27 @@ class ProxyStats:
             self._touch_daily(success=1)
             self._maybe_save()
 
-    def add_tokens(self, p_tokens, c_tokens):
+    def add_tokens(self, p_tokens, c_tokens, cached=0, model=None, tier="standard"):
+        """累计 token 用量；cached = 命中上下文缓存的输入 token（隐式缓存 90% 折扣）。
+
+        model + tier（standard/priority/flex/auto/off）用于按官方按量价估算美刀成本
+        （model_pricing）；未知模型不计费。
+        """
         with self.lock:
             self.prompt_tokens += p_tokens
             self.completion_tokens += c_tokens
+            cached = max(0, cached or 0)
+            self.cached_prompt_tokens += cached
+            try:
+                from model_pricing import estimate_cost
+                cost = estimate_cost(model, p_tokens, c_tokens, cached, tier=tier)
+            except Exception:
+                cost = None
+            cost = cost if cost is not None else 0.0
+            self.cost += cost
             self.success_requests += 1
-            self._touch_daily(prompt=p_tokens, completion=c_tokens, success=1)
+            self._touch_daily(prompt=p_tokens, completion=c_tokens, success=1,
+                              cached=cached, cost=cost)
             self._maybe_save()
 
     def get_json_stats(self):
@@ -189,6 +216,8 @@ class ProxyStats:
                 "retries": self.retry_counts,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
+                "cached_prompt_tokens": self.cached_prompt_tokens,
+                "cost": round(self.cost, 6),
                 "daily": daily,
             }
 

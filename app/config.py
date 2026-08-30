@@ -120,6 +120,9 @@ DEFAULT_SETTINGS = {
     #   priority  = shared + "X-Vertex-AI-LLM-Shared-Request-Type: priority"
     # Flex/Priority 仅对 location=global 有效（非 global 自动降级并告警）。
     "paygo_tier": "auto",
+    # paygo_only：默认关。仅对 standard 档生效——勾选时打 "X-Vertex-AI-LLM-Request-Type: shared"
+    # 标记强制走按量计费（绕过预配吞吐）。按量正是 Google Cloud $300 赠金可抵扣的方式，
+    # 不影响赠金使用；flex/priority 档自带 shared 语义无需此开关。
     "paygo_only": False,
     # 开关（初始值取环境变量）
     # 假流式：开启 = 在 /v1/models 模型列表注册 fake-<模型名> 条目（客户端选中即对该请求

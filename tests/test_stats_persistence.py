@@ -45,6 +45,25 @@ class TestStatsPersistence:
         assert day["completion_tokens"] == 50
         assert day["success"] == 2
 
+    def test_cached_and_cost_persisted(self, tmp_path, monkeypatch):
+        """缓存命中 token 与美刀成本也落盘并恢复（模拟重启）。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.add_tokens(1_000_000, 1_000_000, cached=500_000, model="gemini-3.6-flash")
+        st._flush()
+        st2 = logger_mod.ProxyStats()
+        assert st2.cached_prompt_tokens == 500_000
+        # 0.375(未命中输入) + 0.0375(命中输入 10%) + 3.75(输出)
+        assert abs(st2.cost - (0.375 + 0.0375 + 3.75)) < 1e-6
+        day = st2.get_json_stats()["daily"][0]
+        assert day["cached_prompt_tokens"] == 500_000
+        assert day["cost"] > 0
+
+    def test_unknown_model_no_cost(self, tmp_path, monkeypatch):
+        """未知模型不计费（cost 保持 0，不误报）。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.add_tokens(1000, 500, model="gemini-9.9-flash")
+        assert st.cost == 0.0
+
     def test_corrupt_file_fallback(self, tmp_path, monkeypatch):
         monkeypatch.setattr(logger_mod, "STATS_FILE", str(tmp_path / "stats.json"))
         (tmp_path / "stats.json").write_text("{ not json", encoding="utf-8")

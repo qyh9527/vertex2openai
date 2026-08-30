@@ -32,7 +32,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - 标准模式 / Cookie 直连 / 服务账号 / **混合自动（三通道故障转移）** 在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
-  - **实时监控**：运行日志推流（含**持久化历史回放** + 「📌 自动滚动」开关）、健康度图表（成功/错误/拥堵重试）、**Token 用量统计已持久化**（`STATE_DIR/stats.json`，重建容器不丢）+ **每日趋势柱状图**（7/30 天切换）。Cookie 私有接口通常不返回可靠用量，token 统计仅标准 Express / 服务账号通道计入。
+  - **实时监控**：运行日志推流（含**持久化历史回放** + 「📌 自动滚动」开关）、健康度图表（成功/错误/拥堵重试）、**Token 用量统计已持久化**（`STATE_DIR/stats.json`，重建容器不丢）+ **每日趋势柱状图**（7/30 天切换）+ **缓存命中率**（隐式上下文缓存 90% 折扣是否生效，命中即省钱）+ **估算美刀花费**（按官方按量价，见下方「用量与花费统计」）。Cookie 私有接口通常不返回可靠用量，token/缓存/花费统计仅标准 Express / 服务账号通道计入。
   - **防截断（Anti-Truncation）**：下游请求体加 `"anti_truncation": true`（字段名可在控制台自定义）即对**该请求**启用"合成传输工具"包装——指示模型把最终回答放进工具参数输出，绕开重提示词场景（酒馆复杂预设/长历史）下的回答截断，代理透明还原为 `assistant.content`，真实工具调用不受影响（仅文本/Chat 模型适用）。
   - **模型列表手动管理**：模型列表**不再自动拉取**远程配置（曾启动时 + `/v1/models` 每 3600s 自动刷新）；控制台「🌐 获取远程模型」手动刷新（结果持久化到磁盘）、「📝 编辑模型」弹窗添加/删除**自定义模型**（持久化，合并进 `/v1/models`）。
 - **Gemini 能力与适配**
@@ -371,6 +371,14 @@ curl http://localhost:8050/v1/chat/completions \
 > - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
 `/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型在控制台「📝 编辑模型」添加即可（能力自动归类，无需改代码）。
+
+---
+
+## 用量与花费统计
+
+- **Token 用量**：标准 Express / 服务账号通道请求后由上游回传的 `usageMetadata` 累计（Cookie 私有接口通常不回传，不计入）。持久化在 `STATE_DIR/stats.json`，重建容器不丢；首页展示累计数字 + 最近 7/30 天每日趋势。
+- **缓存命中率**：`usageMetadata.cachedContentTokenCount` 报告命中上下文缓存的输入 token。**服务账号（标准 Vertex）通道默认开启隐式缓存（90% 折扣）**，命中率 = 缓存命中 / 输入 token——命中率越高越省钱。
+- **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值，官方调价后请更新 `MODEL_PRICING`（3.7/3.6-flash 的 introductory 价 2027-01 到期）。
 
 ---
 
