@@ -28,7 +28,7 @@ express_key_manager = ExpressKeyManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
+    print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 / 服务账号 三通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
     if config.API_KEY == DEFAULT_API_KEY:
@@ -247,7 +247,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; }
+  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; --viz-prompt:#2a78d6; --viz-completion:#eb6834; --viz-track:#f3f4f6; --viz-grid:#e5e7eb; --status-good:#0ca30c; --status-warning:#f59e0b; --status-critical:#d03b3b; }
   * { -webkit-font-smoothing:antialiased; }
   body { background:var(--bg); color:var(--fg); font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif; }
   .card { background:#fff; border:1px solid var(--border); border-radius:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
@@ -296,6 +296,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .helpbox code { display:inline; white-space:normal; }
   .helpbox b { color:var(--fg); }
   .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
+
+  /* 数据概览：所有数据色在此集中定义，避免默认黑色把健康度/趋势误画成无信息色块。 */
+  .metric-track { height:7px; border-radius:999px; overflow:hidden; background:var(--viz-track); }
+  .metric-fill { height:100%; width:0; border-radius:999px; transition:width .3s ease; }
+  .metric-fill.prompt { background:var(--viz-prompt); }
+  .metric-fill.completion { background:var(--viz-completion); }
+  .health-ring { position:relative; width:144px; height:144px; flex:0 0 auto; }
+  .health-ring canvas { width:100% !important; height:100% !important; }
+  .health-centre { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; pointer-events:none; }
+  .health-centre strong { color:var(--fg); font-size:25px; line-height:1; letter-spacing:-.04em; }
+  .health-centre span { margin-top:5px; color:var(--muted); font-size:11px; }
+  .health-legend { width:100%; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-top:15px; }
+  .health-legend-item { min-width:0; padding:7px 6px; border:1px solid #f0f0f2; border-radius:8px; background:#fcfcfd; text-align:center; }
+  .health-legend-label { display:flex; align-items:center; justify-content:center; gap:4px; color:var(--muted); font-size:10px; white-space:nowrap; }
+  .health-legend-value { display:block; margin-top:2px; color:var(--fg); font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .legend-dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; }
+  .legend-dot.success { background:var(--status-good); }
+  .legend-dot.error { background:var(--status-critical); }
+  .legend-dot.retry { background:var(--status-warning); }
+  .trend-legend { display:flex; align-items:center; gap:12px; color:var(--muted); font-size:11px; }
+  .trend-legend-item { display:inline-flex; align-items:center; gap:5px; }
+  .trend-swatch { width:9px; height:9px; border-radius:3px; }
+  .trend-swatch.prompt { background:var(--viz-prompt); }
+  .trend-swatch.completion { background:var(--viz-completion); }
+  .trend-chart { --trend-columns:7; display:grid; grid-template-columns:repeat(var(--trend-columns),minmax(0,1fr)); gap:clamp(4px,1vw,8px); height:132px; padding:4px 0 0; }
+  .trend-cell { min-width:0; height:100%; display:flex; flex-direction:column; gap:7px; }
+  .trend-bar-zone { position:relative; min-height:0; flex:1; display:flex; align-items:flex-end; border-bottom:1px solid var(--viz-grid); }
+  .trend-mark { position:relative; width:100%; height:100%; display:flex; align-items:flex-end; justify-content:center; outline:none; border-radius:5px; cursor:default; }
+  .trend-mark:focus-visible { box-shadow:0 0 0 2px rgba(79,70,229,.32); }
+  .trend-bar { width:min(24px,72%); min-height:5px; display:flex; flex-direction:column-reverse; gap:2px; overflow:hidden; border-radius:4px 4px 0 0; transition:height .3s ease; }
+  .trend-segment { min-height:0; }
+  .trend-segment.prompt { background:var(--viz-prompt); }
+  .trend-segment.completion { background:var(--viz-completion); }
+  .trend-zero { width:min(24px,72%); height:2px; border-radius:999px; background:var(--viz-grid); }
+  .trend-label { color:#898781; font-size:10px; line-height:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .trend-tooltip { position:absolute; z-index:10; left:50%; bottom:8px; width:max-content; max-width:152px; padding:7px 8px; border:1px solid var(--border); border-radius:8px; background:#fff; color:var(--fg); box-shadow:0 8px 18px rgba(16,24,40,.12); font-size:11px; line-height:1.55; opacity:0; pointer-events:none; transform:translate(-50%,4px); transition:opacity .14s ease,transform .14s ease; }
+  .trend-tooltip strong { display:block; margin-bottom:2px; }
+  .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { opacity:1; transform:translate(-50%,0); }
+  @media (max-width:640px) { .health-legend { gap:4px; } .health-legend-item { padding:6px 3px; } .trend-chart { gap:3px; } .trend-bar { width:78%; } .trend-tooltip { left:0; transform:translate(0,4px); } .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { transform:translate(0,0); } }
 </style>
 </head>
 <body class="min-h-screen">
@@ -314,7 +353,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </svg>
       <div>
         <h1 class="text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
-        <p class="text-xs text-neutral-500 mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
+        <p class="text-xs text-neutral-500 mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 三通道</p>
       </div>
     </div>
     <div class="flex items-center gap-2">
@@ -342,27 +381,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
       <div class="card p-5 flex flex-col items-center justify-center">
-        <div class="lbl w-full mb-3">服务健康度</div>
-        <div class="w-36 h-36"><canvas id="donut"></canvas></div>
+        <div class="lbl w-full mb-3">服务健康度 <span class="text-neutral-400 font-normal">· 成功 / 错误</span></div>
+        <div class="health-ring">
+          <canvas id="donut" aria-label="服务健康度：成功与错误请求占比" role="img"></canvas>
+          <div class="health-centre" aria-hidden="true"><strong id="health-rate">—</strong><span>已完成成功率</span></div>
+        </div>
+        <div class="health-legend" aria-label="服务健康度明细">
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot success"></i>成功</span><strong id="h-success" class="health-legend-value">0</strong></div>
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot error"></i>错误</span><strong id="h-error" class="health-legend-value">0</strong></div>
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot retry"></i>重试</span><strong id="h-retries" class="health-legend-value">0</strong></div>
+        </div>
       </div>
       <div class="card p-5 md:col-span-2">
-        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 已持久化（重建容器不丢）· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 已持久化 · Express / 服务账号计入（Cookie 不回传）</span></div>
         <div class="space-y-4">
-          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
-          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="metric-track" role="progressbar" aria-label="Prompt 输入 Token 占比" aria-valuemin="0" aria-valuemax="100"><div id="t-prompt-bar" class="metric-fill prompt"></div></div></div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="metric-track" role="progressbar" aria-label="Completion 输出 Token 占比" aria-valuemin="0" aria-valuemax="100"><div id="t-completion-bar" class="metric-fill completion"></div></div></div>
           <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
           <div class="flex justify-between text-sm"><span class="text-neutral-600">缓存命中 <span class="text-neutral-400">（隐式缓存 90% 折扣，命中即省钱）</span></span><span class="val font-semibold"><span id="t-cached">0</span> tokens · <span id="t-hitrate">—</span></span></div>
           <div class="flex justify-between text-sm"><span class="text-neutral-600">估算花费 <span class="text-neutral-400">（按官方按量价）</span></span><span id="t-cost" class="val font-semibold">$0.00</span></div>
           <div class="pt-3 border-t border-neutral-100">
-            <div class="flex items-center justify-between mb-2">
-              <span class="text-xs text-neutral-500">每日 Token 趋势</span>
-              <div class="flex gap-1 text-xs">
+            <div class="flex items-center justify-between gap-3 mb-2">
+              <div><span class="text-xs text-neutral-600 font-medium">每日 Token 趋势</span><span class="text-[11px] text-neutral-400 ml-1">· 悬停查看明细</span></div>
+              <div class="flex gap-1 text-xs shrink-0">
                 <button class="px-2 py-0.5 rounded border border-neutral-200" id="range7" onclick="renderTrend(7)">7 天</button>
                 <button class="px-2 py-0.5 rounded border border-neutral-200" id="range30" onclick="renderTrend(30)">30 天</button>
               </div>
             </div>
-            <div id="trend-chart" class="flex items-end gap-1 h-24"></div>
-            <div id="trend-empty" class="text-xs text-neutral-400 py-1">暂无历史数据</div>
+            <div class="trend-legend" aria-label="趋势图图例"><span class="trend-legend-item"><i class="trend-swatch prompt"></i>Prompt</span><span class="trend-legend-item"><i class="trend-swatch completion"></i>Completion</span></div>
+            <div id="trend-chart" class="trend-chart" role="group" aria-label="最近每日 Prompt 与 Completion Token 的堆叠趋势图"></div>
+            <div id="trend-empty" class="text-xs text-neutral-400 py-2">暂无历史数据；将显示最近日期窗口。</div>
           </div>
         </div>
       </div>
@@ -803,31 +851,93 @@ function switchTab(t){
 }
 
 /* ---------- Overview ---------- */
-function renderChart(s,e,r){
-  const ctx=$('donut').getContext('2d');
-  let data=[s,e,r], colors=['#171717','#e11d48','#f59e0b'];
-  if(s===0&&e===0&&r===0){ data=[1]; colors=['#ededed']; }
-  if(chart){ chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors; chart.update(); return; }
-  chart=new Chart(ctx,{type:'doughnut',data:{labels:['成功','错误','重试'],datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff'}]},options:{cutout:'72%',plugins:{legend:{display:false}}}});
+const CHART_COLORS={success:'#0ca30c',error:'#d03b3b',retry:'#f59e0b',empty:'#e5e7eb'};
+function renderChart(successCount,errorCount,retryCount){
+  const success=Math.max(0,Number(successCount)||0);
+  const error=Math.max(0,Number(errorCount)||0);
+  const retries=Math.max(0,Number(retryCount)||0);
+  const completed=success+error;
+  const hasCompleted=completed>0;
+  const rate=hasCompleted ? (success/completed*100) : null;
+  $('health-rate').textContent=rate===null?'—':rate.toFixed(rate===100?0:1)+'%';
+  $('h-success').textContent=fmt(success); $('h-error').textContent=fmt(error); $('h-retries').textContent=fmt(retries);
+
+  /* 重试是一次额外尝试，不是请求最终结果；不能和成功/错误混画成“部分-整体”圆环。 */
+  if(typeof Chart==='undefined') return;
+  const canvas=$('donut'); if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const data=hasCompleted?[success,error]:[1];
+  const colors=hasCompleted?[CHART_COLORS.success,CHART_COLORS.error]:[CHART_COLORS.empty];
+  const labels=hasCompleted?['成功','错误']:['暂无已完成请求'];
+  if(chart){
+    chart.data.labels=labels; chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors;
+    chart.update(); return;
+  }
+  chart=new Chart(ctx,{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff',hoverOffset:3}]},options:{responsive:true,maintainAspectRatio:false,cutout:'72%',plugins:{legend:{display:false},tooltip:{displayColors:true,padding:9,callbacks:{label:c=>`${c.label}：${fmt(c.raw)}`}}}}});
 }
+
+function updateMetricBars(promptTokens,completionTokens){
+  const prompt=Math.max(0,Number(promptTokens)||0);
+  const completion=Math.max(0,Number(completionTokens)||0);
+  const max=Math.max(1,prompt,completion);
+  [["t-prompt-bar",prompt],["t-completion-bar",completion]].forEach(([id,value])=>{
+    const bar=$(id); if(!bar) return;
+    const percent=Math.round(value/max*100);
+    bar.style.width=percent+'%';
+    const track=bar.parentElement;
+    if(track){ track.setAttribute('aria-valuenow',String(percent)); track.setAttribute('aria-valuetext',fmt(value)+' tokens'); }
+  });
+}
+
 let DAILY=[]; let TREND_RANGE=7;
 function setTrendBtn(){
-  ['range7','range30'].forEach(id=>{ const b=$(id); if(!b) return; const on=(id==='range'+TREND_RANGE); b.style.background=on?'#111':''; b.style.color=on?'#fff':''; });
+  ['range7','range30'].forEach(id=>{ const b=$(id); if(!b) return; const on=(id==='range'+TREND_RANGE); b.style.background=on?'var(--accent)':''; b.style.color=on?'#fff':''; });
+}
+function dateKey(date){
+  const p=n=>String(n).padStart(2,'0');
+  return `${date.getFullYear()}-${p(date.getMonth()+1)}-${p(date.getDate())}`;
+}
+function keyToLocalDate(key){
+  const parts=String(key||'').split('-').map(Number);
+  return parts.length===3 && parts.every(Number.isFinite) ? new Date(parts[0],parts[1]-1,parts[2],12) : null;
+}
+function buildTrendWindow(days){
+  const byDate=new Map((DAILY||[]).filter(d=>d&&keyToLocalDate(d.date)).map(d=>[d.date,d]));
+  const latest=(DAILY||[]).length ? keyToLocalDate(DAILY[DAILY.length-1].date) : null;
+  const end=latest || new Date();
+  end.setHours(12,0,0,0);
+  return Array.from({length:days},(_,i)=>{
+    const date=new Date(end); date.setDate(end.getDate()-days+1+i);
+    const key=dateKey(date);
+    return {date:key,...(byDate.get(key)||{})};
+  });
 }
 function renderTrend(days){
   if(days) TREND_RANGE=days;
   const c=$('trend-chart'); if(!c) return;
   setTrendBtn();
-  const last=DAILY.slice(-TREND_RANGE);
-  const maxV=Math.max(1,...last.map(d=>(d.prompt_tokens||0)+(d.completion_tokens||0)));
-  c.innerHTML='';
-  const empty=$('trend-empty'); if(empty) empty.style.display=last.length?'none':'block';
-  last.forEach(d=>{
-    const v=(d.prompt_tokens||0)+(d.completion_tokens||0);
-    const hgt=Math.max(3,Math.round(v/maxV*88));
+  const slots=buildTrendWindow(TREND_RANGE);
+  const totalOf=d=>Math.max(0,Number(d.prompt_tokens)||0)+Math.max(0,Number(d.completion_tokens)||0);
+  const maxV=Math.max(1,...slots.map(totalOf));
+  c.style.setProperty('--trend-columns',String(slots.length));
+  c.replaceChildren();
+  const empty=$('trend-empty');
+  if(empty){ empty.style.display=DAILY.length?'none':'block'; empty.textContent=DAILY.length?'':'暂无历史数据；将显示最近日期窗口。'; }
+
+  slots.forEach((d,index)=>{
+    const prompt=Math.max(0,Number(d.prompt_tokens)||0);
+    const completion=Math.max(0,Number(d.completion_tokens)||0);
+    const total=prompt+completion;
+    const requests=Math.max(0,Number(d.requests)||0);
+    const height=total?Math.max(6,Math.round(total/maxV*100)):0;
+    const segments=[];
+    if(prompt) segments.push(`<span class="trend-segment prompt" style="flex:${prompt} 1 0"></span>`);
+    if(completion) segments.push(`<span class="trend-segment completion" style="flex:${completion} 1 0"></span>`);
+    const label=d.date.slice(5).replace('-','/');
+    const showLabel=TREND_RANGE<=7 || index===0 || index===slots.length-1 || index%5===0;
     const cell=document.createElement('div');
-    cell.className='flex-1 flex flex-col items-center gap-1 min-w-0';
-    cell.innerHTML=`<div class="w-full bg-neutral-800 rounded-t" style="height:${hgt}px" title="${d.date} · ${fmt(v)} tokens · ${d.requests||0} 请求"></div><div class="text-[9px] text-neutral-400 truncate w-full text-center">${d.date.slice(5)}</div>`;
+    cell.className='trend-cell';
+    cell.innerHTML=`<div class="trend-bar-zone"><div class="trend-mark" tabindex="0" role="img" aria-label="${d.date}：Prompt ${fmt(prompt)} tokens，Completion ${fmt(completion)} tokens，共 ${fmt(total)} tokens，${fmt(requests)} 请求">${total?`<div class="trend-bar" style="height:${height}%">${segments.join('')}</div>`:'<div class="trend-zero"></div>'}<div class="trend-tooltip" role="tooltip"><strong>${d.date}</strong><span>Prompt：${fmt(prompt)}</span><br><span>Completion：${fmt(completion)}</span><br><span>总计：${fmt(total)} · ${fmt(requests)} 请求</span></div></div></div><div class="trend-label" title="${d.date}">${showLabel?label:'&nbsp;'}</div>`;
     c.appendChild(cell);
   });
 }
@@ -836,11 +946,12 @@ async function fetchStats(){
     const d=await (await fetch('/api/stats')).json();
     $('s-total').textContent=fmt(d.total); $('s-success').textContent=fmt(d.success);
     $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
-    $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
-    $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
+    const prompt=Math.max(0,Number(d.prompt_tokens)||0), completion=Math.max(0,Number(d.completion_tokens)||0);
+    $('t-prompt').textContent=fmt(prompt); $('t-comp').textContent=fmt(completion);
+    $('t-total').textContent=fmt(prompt+completion); updateMetricBars(prompt,completion);
     const cached=d.cached_prompt_tokens||0;
     $('t-cached').textContent=fmt(cached);
-    $('t-hitrate').textContent=(d.prompt_tokens>0)?((cached/d.prompt_tokens*100).toFixed(1)+'%'):'—';
+    $('t-hitrate').textContent=(prompt>0)?((cached/prompt*100).toFixed(1)+'%'):'—';
     $('t-cost').textContent='$'+((d.cost||0)).toFixed(4);
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
     DAILY=d.daily||[]; renderTrend();
