@@ -14,6 +14,7 @@ from upstreams.service_account import (
     validate_sa_credentials, build_sa_credentials, ServiceAccountUpstream,
     _get_cached_sa_client, _SA_CLIENT_CACHE, _SA_CLIENT_CACHE_LOCK,
 )
+from api_helpers import sa_channel_hint
 from runtime_state import app_state
 import config as app_config
 
@@ -293,3 +294,29 @@ class TestResolveClient:
         assert result == "ok"
         # 到达父类时仍是完整 fake- 模型名，前缀剥离与假流式判定由父类统一负责
         assert captured["model"] == "fake-gemini-3.6-flash"
+
+
+class TestSaChannelHint:
+    """服务账号通道 403 排查指引：只对 vertex 通道、且错误确属计费/权限类时返回指引。"""
+
+    def test_billing_hint(self):
+        h = sa_channel_hint("vertex", "403 requires billing to be enabled for project 123")
+        assert "计费" in h
+        assert "1)" in h
+
+    def test_permission_hint(self):
+        h = sa_channel_hint(
+            "vertex",
+            "403 Permission 'aiplatform.endpoints.predict' denied on resource projects/123")
+        assert "roles/aiplatform.user" in h
+
+    def test_non_vertex_no_hint(self):
+        assert sa_channel_hint("express", "403 requires billing") == ""
+        assert sa_channel_hint("cookie", "403 permission denied") == ""
+
+    def test_vertex_unrelated_error_no_hint(self):
+        assert sa_channel_hint("vertex", "500 internal server error") == ""
+        assert sa_channel_hint("vertex", "429 too many requests") == ""
+
+    def test_none_channel_no_hint(self):
+        assert sa_channel_hint(None, "403 requires billing") == ""

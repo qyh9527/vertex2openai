@@ -152,6 +152,26 @@ def is_synthetic_part(part: Any, tool_name: str) -> bool:
     return fc is not None and getattr(fc, "name", None) == tool_name
 
 
+def has_synthetic_tool_call(openai_dict: dict, tool_name: str) -> bool:
+    """OpenAI 响应 dict 中是否出现合成工具调用（判断防截断是否实际生效）。
+
+    需在解构（strip_synthetic_from_openai_dict）**之前**调用：解构会把合成调用移除，
+    之后无法再区分"模型没调合成工具"与"已剥离"。
+    """
+    if not tool_name or not isinstance(openai_dict, dict):
+        return False
+    for choice in openai_dict.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        for tc in (choice.get("message") or {}).get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict) and fn.get("name") == tool_name:
+                return True
+    return False
+
+
 def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str) -> dict:
     """非流式/假流式：从 OpenAI 响应 dict 解构合成工具调用，还原为标准 assistant.content。
 
@@ -191,8 +211,13 @@ def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str) -> dict:
             continue  # 本 choice 没有合成调用，原样
 
         # 合成内容为最终正文（取代普通 content，防止双来源拼接）；
-        # 模型调用合成工具却给出空 content 时，回退普通 content 兜底。
-        message["content"] = "".join(synthetic_contents) or message.get("content")
+        # 模型调用合成工具却给出空 content 时，回退普通 content 兜底（防合成工具泄漏），
+        # 并留一行日志便于排查"开了防截断却输出为空"。
+        if synthetic_contents:
+            message["content"] = "".join(synthetic_contents)
+        else:
+            message["content"] = message.get("content")
+            print(f"⚠️ [防截断] 模型调用了合成工具 {tool_name} 但 content 为空，已回退普通输出。")
 
         if real_calls:
             for i, tc in enumerate(real_calls):

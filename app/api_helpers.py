@@ -23,7 +23,11 @@ from config import VERTEX_REASONING_TAG
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
-from anti_truncation import strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk
+from anti_truncation import (
+    has_synthetic_tool_call,
+    strip_synthetic_from_openai_dict,
+    strip_synthetic_from_stream_chunk,
+)
 
 # 引入报错重试统计器
 from logger import stats
@@ -198,6 +202,29 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
         else:
             code = 500
     return code, msg
+
+
+def sa_channel_hint(channel_name: Optional[str], error_msg: str) -> str:
+    """服务账号通道 403 类错误的排查指引（与 Cookie 通道项目级指引同风格）。
+
+    服务账号通道的 403 一般来自两处：项目未开计费（requires billing）或 SA 缺
+    roles/aiplatform.user 权限（permission denied）。只对 vertex 通道补充指引，
+    其余通道不干预；错误文本不匹配时返回空串（调用方无需打印）。
+    """
+    if channel_name != "vertex":
+        return ""
+    lower = (error_msg or "").lower()
+    if "requires billing" in lower or "billing to be enabled" in lower or "billing account" in lower:
+        return ("项目未开启计费（requires billing）。请依次检查：\n"
+                "1) 控制台「服务账号」页 Project ID 覆盖是否留空（留空 = 取 SA JSON 自带 project_id，更稳妥）；\n"
+                "2) 该 Google Cloud 项目是否已开启计费；\n"
+                "3) 项目是否已启用 Vertex AI API。")
+    if "permission" in lower or "denied" in lower or "forbidden" in lower or "unauthorized" in lower:
+        return ("服务账号权限不足（permission denied）。请依次检查：\n"
+                "1) 该 Service Account 是否已授予 roles/aiplatform.user（Vertex AI 用户）角色；\n"
+                "2) 项目是否已开启计费（有权限但无计费同样报错）；\n"
+                "3) 控制台里的 Project ID 与 SA JSON 是否属于同一项目。")
+    return ""
 
 
 def is_retryable_exception(e):
@@ -913,6 +940,9 @@ async def gemini_fake_stream_generator(
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
         if synthetic_tool_name:
+            if not has_synthetic_tool_call(openai_response_dict, synthetic_tool_name):
+                print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
+                      "本次未生效（如实透传普通输出）。")
             openai_response_dict = strip_synthetic_from_openai_dict(
                 openai_response_dict, synthetic_tool_name)
         _prepend_prefill(openai_response_dict, prefill_text)
@@ -942,6 +972,9 @@ async def gemini_fake_stream_generator(
     except Exception as e_outer_gemini:
         err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
         print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
+        _sa_hint = sa_channel_hint(channel_name, str(e_outer_gemini))
+        if _sa_hint:
+            print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
@@ -1039,6 +1072,8 @@ async def execute_gemini_call(
                 max_retries, backoff_sec = get_retry_settings(channel_name)
                 has_yielded = False    # 是否已向客户端输出过正文/工具调用（重试与故障转移的唯一判断依据）
                 prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
+                synthetic_seen = False            # 防截断：本次流式是否出现过合成工具调用（流末用于"未生效"提示）
+                synthetic_empty_warned = False    # 防截断：空 content 只告警一次，避免刷屏
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -1078,8 +1113,17 @@ async def execute_gemini_call(
                             # 合成调用不进入 ToolCallIndexer，finish_reason 判定只反映真实工具；
                             # 输出过合成正文即置 has_yielded（后续重试/故障转移以此为出流依据）。
                             if synthetic_tool_name:
+                                _orig_chunk = chunk_item_call
                                 chunk_item_call, _syn_contents = strip_synthetic_from_stream_chunk(
                                     chunk_item_call, 0, synthetic_tool_name)
+                                # 返回 None（全合成 part）或新副本（混有真实 part）= 本 chunk 含合成调用；
+                                # 原样返回同一对象 = 本 chunk 无合成 part。
+                                if chunk_item_call is None or chunk_item_call is not _orig_chunk:
+                                    synthetic_seen = True
+                                    if not _syn_contents and not synthetic_empty_warned:
+                                        synthetic_empty_warned = True
+                                        print("⚠️ [防截断] 流式出现合成工具调用但 content 为空，"
+                                              "已剥离该部分（正文以真实输出为准）。")
                                 if _syn_contents:
                                     has_yielded = True
                                     for _sc in _syn_contents:
@@ -1100,6 +1144,11 @@ async def execute_gemini_call(
                                     if sse_chunk is None:
                                         continue  # 正文暂存于去重器，跳过空 chunk
                                 yield sse_chunk
+
+                        # 防截断已启用但全程未出现合成工具调用：模型没走合成通道，本次防截断未生效
+                        if synthetic_tool_name and not synthetic_seen:
+                            print(f"⚠️ [防截断] 请求已启用防截断但全程未出现合成工具调用（{synthetic_tool_name}），"
+                                  "本次未生效（如实透传普通输出）。")
 
                         # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
                         if deduper is not None and not deduper.done:
@@ -1174,6 +1223,9 @@ async def execute_gemini_call(
 
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
+                        _sa_hint = sa_channel_hint(channel_name, str(e_stream_call))
+                        if _sa_hint:
+                            print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         # hybrid 故障转移：未出流 + 可切换错误（重试已耗尽）→ 抛给路由层切兜底通道。
                         # 未出流承诺由 has_yielded 保证（keep-alive 心跳、静态预填充前缀均不计入，
@@ -1239,6 +1291,10 @@ async def execute_gemini_call(
                 # hybrid 故障转移：限流/上游繁忙且内部重试已耗尽 → 抛给路由层切兜底通道
                 if failover_mode and is_retryable_exception(e_call):
                     raise UpstreamUnstartedError(str(e_call))
+                # 服务账号通道 403（计费/权限）给专属排查指引
+                _sa_hint = sa_channel_hint(channel_name, str(e_call))
+                if _sa_hint:
+                    print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
                 raise
 
         # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”
@@ -1289,6 +1345,9 @@ async def execute_gemini_call(
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         if synthetic_tool_name:
+            if not has_synthetic_tool_call(openai_response_content, synthetic_tool_name):
+                print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
+                      "本次未生效（如实透传普通输出）。")
             openai_response_content = strip_synthetic_from_openai_dict(
                 openai_response_content, synthetic_tool_name)
         _prepend_prefill(openai_response_content, prefill_text)

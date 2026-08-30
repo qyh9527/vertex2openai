@@ -10,7 +10,7 @@ from google.genai import types
 from anti_truncation import (
     generate_synthetic_tool_name, build_synthetic_tool, build_control_message,
     inject_request, is_enabled_for_request, extract_content_from_args,
-    strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk,
+    has_synthetic_tool_call, strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk,
     TOOL_PREFIX,
 )
 from models import OpenAIRequest, OpenAIMessage
@@ -153,6 +153,51 @@ class TestStripOpenaiDict:
         msg = out["choices"][0]["message"]
         assert "tool_calls" not in msg
         assert out["choices"][0]["finish_reason"] == "stop"
+
+
+class TestHasSyntheticToolCall:
+    """解构前检测合成工具是否被调用（用于"防截断未生效"提示）。"""
+
+    def _msg_with_calls(self, calls, finish_reason="tool_calls"):
+        return {"message": {"role": "assistant", "content": None, "tool_calls": calls},
+                "finish_reason": finish_reason}
+
+    def test_present(self):
+        syn = "v2o_emit_x"
+        d = {"choices": [self._msg_with_calls([
+            {"index": 0, "type": "function", "function": {"name": syn, "arguments": '{"content":"x"}'}},
+        ])]}
+        assert has_synthetic_tool_call(d, syn) is True
+
+    def test_mixed_present(self):
+        syn = "v2o_emit_x"
+        d = {"choices": [self._msg_with_calls([
+            {"index": 0, "type": "function", "function": {"name": "weather_api", "arguments": "{}"}},
+            {"index": 1, "type": "function", "function": {"name": syn, "arguments": '{"content":"y"}'}},
+        ])]}
+        assert has_synthetic_tool_call(d, syn) is True
+
+    def test_absent(self):
+        syn = "v2o_emit_x"
+        d = {"choices": [self._msg_with_calls([
+            {"index": 0, "type": "function", "function": {"name": "weather_api", "arguments": "{}"}},
+        ])]}
+        assert has_synthetic_tool_call(d, syn) is False
+
+    def test_no_tool_calls(self):
+        d = {"choices": [{"message": {"role": "assistant", "content": "普通输出"},
+                          "finish_reason": "stop"}]}
+        assert has_synthetic_tool_call(d, "v2o_emit_x") is False
+
+    def test_empty_or_none_tool_name(self):
+        d = {"choices": [self._msg_with_calls([
+            {"index": 0, "type": "function", "function": {"name": "v2o_emit_x", "arguments": "{}"}},
+        ])]}
+        assert has_synthetic_tool_call(d, None) is False
+        assert has_synthetic_tool_call(d, "") is False
+
+    def test_not_dict(self):
+        assert has_synthetic_tool_call(None, "v2o_emit_x") is False
 
 
 class TestStripStreamChunk:
