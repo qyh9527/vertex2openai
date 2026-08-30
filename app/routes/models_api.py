@@ -10,17 +10,11 @@ router = APIRouter()
 
 @router.get("/v1/models")
 async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_key)):
+    current_time = time.time()
     # 不再自动从远程刷新模型配置（曾每 3600s 自动拉取）——远程获取改为控制台
-    # 「获取远程模型」按钮手动触发；这里用磁盘缓存 + 控制台自定义模型列表。
-    express_key_manager_instance = fastapi_request.app.state.express_key_manager
-    
-    # 动态放行：开启 Cookie 直连 / 服务账号 / 混合策略，或配置有 Express API Key，
-    # 均可安全获取模型列表（模型列表与通道无关，任一通道有凭证即可）
-    has_web_proxy = app_state.get_channel_strategy() != "express"   # cookie / vertex / hybrid 都放行
-    has_sa_account = bool(app_state.get_sa_accounts())
-    has_express_key = express_key_manager_instance.get_total_keys() > 0
-
-    raw_models = await get_express_models() if (has_express_key or has_web_proxy or has_sa_account) else []
+    # 「获取远程模型」按钮手动触发；这里用磁盘缓存 + 本地配置 + 内置兜底 + 自定义模型。
+    # 模型列表是配置数据（与通道凭证无关），始终返回，供客户端发现可用模型。
+    raw_models = await get_express_models()
 
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()

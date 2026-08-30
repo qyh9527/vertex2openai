@@ -20,6 +20,21 @@ _LOCAL_MODEL_FILE_CANDIDATES = [
     Path(__file__).resolve().parent.parent / "vertexModels.json",
 ]
 
+# 内置兜底模型列表：磁盘缓存与本地 vertexModels.json 都不可用时使用，保证 /v1/models 绝不返回空。
+_DEFAULT_FALLBACK_MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-image",
+    "gemini-3-pro-image",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+]
+
 _MODELS_DISK_FILE = os.path.join(os.environ.get("STATE_DIR", "."), "models.json")
 
 
@@ -107,8 +122,9 @@ async def get_models_config() -> Dict[str, List[str]]:
             if _model_cache is None:
                 print("📦 [模型配置] 磁盘缓存为空，回退本地 vertexModels.json。")
                 _model_cache = _load_local_models_config()
-            if _model_cache is None:
-                _model_cache = {"models": []}
+            if _model_cache is None or not _model_cache.get("models"):
+                print("📦 [模型配置] 本地配置为空，使用内置默认模型列表（可在控制台「获取远程模型」刷新）。")
+                _model_cache = {"models": list(_DEFAULT_FALLBACK_MODELS)}
     return _model_cache
 
 

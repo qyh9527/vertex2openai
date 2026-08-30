@@ -46,6 +46,28 @@ class TestGetModelsConfig:
         cfg = await ml.get_models_config()
         assert cfg == {"models": ["gemini-local"]}
 
+    async def test_builtin_fallback_never_empty(self, tmp_path, monkeypatch, clear_cache):
+        """磁盘与本地都空时使用内置默认列表，/v1/models 绝不返回空。"""
+        monkeypatch.setattr(ml, "_MODELS_DISK_FILE", str(tmp_path / "nope.json"))
+        monkeypatch.setattr(ml, "_load_local_models_config", lambda: {"models": []})
+        cfg = await ml.get_models_config()
+        assert len(cfg["models"]) > 0
+        assert "gemini-3.7-flash" in cfg["models"]
+
+
+class TestListModelsRoute:
+    async def test_v1_models_returns_list_without_credentials(self, tmp_path, monkeypatch,
+                                                              clear_cache):
+        """/v1/models 无凭证也返回模型列表（回归：曾因移除自动刷新时误删 current_time
+        导致 NameError 500，客户端以为接口被删）。"""
+        from routes.models_api import list_models
+        result = await list_models(fastapi_request=object(), api_key="x")
+        assert result["object"] == "list"
+        assert len(result["data"]) > 0
+        ids = [m["id"] for m in result["data"]]
+        assert "gemini-3.7-flash" in ids
+        assert any(m["created"] > 0 for m in result["data"])   # current_time 必须可用
+
 
 class TestRefresh:
     async def test_refresh_writes_disk(self, tmp_path, monkeypatch, clear_cache):
