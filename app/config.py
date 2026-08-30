@@ -22,6 +22,11 @@ class AppSettings(BaseSettings):
     GOOGLE_PROJECT_ID: Optional[str] = None     # Google Cloud Project ID
     EXPERIMENT_FLAGS: Optional[str] = None      # experimentFlagsBinary (optional; paste from a console request if needed)
 
+    # 服务账号（第三通道）环境变量兜底：控制台未配账号时用它们。
+    # VERTEX_SA_JSON = 内联服务账号 JSON 字符串；VERTEX_SA_FILE = 指向 SA JSON 文件（docker 挂载常用）。
+    VERTEX_SA_JSON: Optional[str] = None
+    VERTEX_SA_FILE: Optional[str] = None
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
@@ -47,6 +52,9 @@ VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
+
+VERTEX_SA_JSON = _settings.VERTEX_SA_JSON
+VERTEX_SA_FILE = _settings.VERTEX_SA_FILE
 
 REASONING_TAG = "agent_platform_think_tag"
 # 向后兼容别名（历史代码引用 VERTEX_REASONING_TAG）
@@ -90,6 +98,24 @@ DEFAULT_SETTINGS = {
     # 不含 429 限流——连接本身健康）≥ 该值即自动舍弃，下次请求重建连接池；0 = 永不自动舍弃。
     "client_reuse": True,
     "client_reuse_evict_threshold": 5,
+    # ===== 第三通道：服务账号（Vertex SA，标准 Vertex AI 认证）=====
+    # 混合自动的可配置行为（hybrid 策略下生效）：
+    #   hybrid_channels          参与混合自动的通道及优先级顺序（有序列表，只取存在的通道键）
+    #   channel_retry_overrides  每通道独立重试次数覆盖（None/缺省 = 用全局 retry_max）；
+    #                            键 = express | cookie | vertex
+    "hybrid_channels": ["express", "cookie"],
+    "channel_retry_overrides": {"express": None, "cookie": None, "vertex": None},
+    # ===== PayGo 流量等级（ST-Vertex-PayGo 方案融合，作用于标准 Vertex 端点类通道）=====
+    # Express 与 服务账号 两通道打同一组官方"按量共享容量"层级头（cookie 通道走 batchGraphql 不适用）：
+    #   auto      = 保持现状：钉定到 global 时自动打 priority 头
+    #   off       = 不打任何层级头
+    #   standard  = 仅当 paygo_only=true 时打 "X-Vertex-AI-LLM-Request-Type: shared"
+    #   flex      = shared + "X-Vertex-AI-LLM-Shared-Request-Type: flex" + "X-Server-Timeout: 1800"
+    #               （允许排队至 30 分钟，需放大 httpx 超时到 1800s）
+    #   priority  = shared + "X-Vertex-AI-LLM-Shared-Request-Type: priority"
+    # Flex/Priority 仅对 location=global 有效（非 global 自动降级并告警）。
+    "paygo_tier": "auto",
+    "paygo_only": False,
     # 开关（初始值取环境变量）
     # 假流式：开启 = 在 /v1/models 模型列表注册 fake-<模型名> 条目（客户端选中即对该请求
     # 强制假流式，其余模型保持真实流式）。不再全局强制所有模型。

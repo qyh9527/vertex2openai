@@ -9,10 +9,11 @@ app_port: 7860
 
 # Vertex2OpenAI Express Adapter
 
-Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 与 `/v1/models` 接口，对内支持两条上游通道调用 **Google Agent Platform（原 Vertex AI）的 Gemini 模型**：
+Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 与 `/v1/models` 接口，对内支持三条上游通道调用 **Google Agent Platform（原 Vertex AI）的 Gemini 模型**：
 
 - **Express API Key（标准模式）**：用官方 `google-genai` SDK + `VERTEX_EXPRESS_API_KEY` 调用。
 - **Cookie 直连反代模式**：用 Google Cloud 控制台 Cookie + Project ID 直连控制台私有 `batchGraphql` 接口（无需浏览器）。
+- **服务账号（Vertex SA）**：用 Google Cloud **服务账号 JSON** 走标准 Vertex AI 认证（Bearer token），由 `google-genai` SDK 内部完成 OAuth2 JWT-bearer 换 token。
 
 > 管理控制台 UI 名为 **agentplatform2api**；仓库/镜像名仍沿用 `Vertex2OpenAI`。
 >
@@ -20,27 +21,29 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 ## 功能特性
 
-- **双上游通道，一键切换**
+- **三上游通道，一键切换**
   - Express API Key：多 Key 随机或轮询调用官方 SDK。**控制台可在线增删 Key 列表**（无需改 compose 重启），保存后热生效；未在控制台配置时回落环境变量。
   - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**支持多 Cookie 账号**（每账号 = 一份 Cookie + 一个 Project ID），按「多 Key 轮询」开关轮询或随机选号，同一请求内恒用同一账号（快照隔离不串号）。**注意：走的是私有接口，见下方风险提示。**
+  - **服务账号（Vertex SA）**：Google Cloud 服务账号 JSON 认证，走标准 Vertex AI 端点（与 Express 同一套 generateContent，用 Bearer token）。**支持多服务账号**，按轮询/随机选号、请求级快照不串号；区域默认 `global`。适合"有项目配额、想按项目维度管理"的场景。
+  - **混合自动（四标签页可配）**：通道页分 **Express / Cookie / 服务账号 / 混合自动** 四个标签页；「混合自动」页可**开关 3 个参与通道、调整优先级顺序、每通道独立重试次数**（熔断仍按通道独立计数）。
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
-  - 标准模式 / Cookie 直连 / **混合自动（双通道故障转移）** 在线一键切换。
+  - 标准模式 / Cookie 直连 / 服务账号 / **混合自动（三通道故障转移）** 在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（Cookie 私有接口通常不返回可靠用量）。
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
-  - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
+  - **安全分类对齐**：三条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
     > 📌 **更正**：早期版本曾把"有思考、正文为空"归因于 Cookie 通道缺少 `HARM_CATEGORY_JAILBREAK`。这个解释是错的——按官方文档，**越狱分类器默认就是关闭的**，要打开必须显式把该分类的阈值设成具体的拦截值；不下发它不会启用任何过滤，下发 `OFF` 也只是空操作。该现象的真实成因见下方"3.6-flash 只返回思考"一节（前端恒发 `reasoning_effort=xhigh` 导致原生思考在 HIGH 档跑飞/被截断）。
   - **上游错误如实透传**：模型在当前项目/区域不可用（404）、权限不足（403）、参数非法（400）等，会以对应 HTTP 状态码 + OpenAI 错误格式返回，而非笼统的 500。
   - Google Search 增强：**文本模型**在模型名后加 `-search` 后缀按需开启。
   - 自动保留 Gemini 思考过程（Thinking），以 `reasoning_content` 返回。
   - 生图模型：输入图压缩、按模型的比例白名单校验、4K 等分辨率、图片输出转 Markdown data URL；生图强制"假流式"整块输出，避免超大 base64 卡死前端。
   - **按模型能力自动裁剪参数**：不同模型支持的参数不同，代理会自动移除目标模型不支持的参数以避免 400（详见"控制台与模型参数"）。
-  - **自动退避重试**：两条通道均内置 429/拥堵自动退避重试，**次数与间隔可在控制台调整**（默认约 10 次）。流式模式下，连接建立即发送 SSE 心跳、且退避等待期间持续发送心跳，避免前端因长时间无数据（如 3.1-pro 频繁 429）而**超时断开**。
+  - **自动退避重试**：三条通道均内置 429/拥堵自动退避重试，**次数与间隔可在控制台调整**（默认约 10 次；混合自动里还可按通道独立设重试次数）。流式模式下，连接建立即发送 SSE 心跳、且退避等待期间持续发送心跳，避免前端因长时间无数据（如 3.1-pro 频繁 429）而**超时断开**。
   - **预填充智能兼容**：自动处理"以 model 轮次结尾"被新模型拒绝（400）的问题（详见下文）。
   - **断连即停**：客户端断开后立即停止上游调用与重试。
 - **中文运行日志**：密钥轮询、上游调用、重试退避、权限报错、Token 统计等均为中文实时说明。
@@ -83,6 +86,8 @@ http://localhost:8050
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
+| `VERTEX_SA_JSON` | 否 | 空 | 服务账号通道的 SA JSON（内联字符串；控制台未配账号时作兜底，也可直接在控制台粘贴）。 |
+| `VERTEX_SA_FILE` | 否 | 空 | 服务账号通道的 SA JSON **文件路径**（docker 挂载常用；优先级低于 `VERTEX_SA_JSON`，两者都有时用内联）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
 | `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
@@ -102,7 +107,7 @@ http://localhost:8050
 | **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
 | **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 主要通过 OpenAI 扩展 `extra_content.google.thought_signature` 原样回传；进程内短期缓存、旧 id 格式与官方 `skip_thought_signature_validator` 哨兵仅作兼容兜底 |
 | **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史并保留 thought signature |
-| **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
+| **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对三条通道都生效） |
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
 | **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
 | **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
@@ -366,31 +371,72 @@ curl http://localhost:8050/v1/chat/completions \
 
 ---
 
-## 双通道策略（Express API Key / Cookie 直连）
+## 三通道策略与混合自动（Express API Key / Cookie 直连 / 服务账号）
 
-控制台「通道与凭证」页可选三种通道策略，`web_state.json` 中旧版 `use_web_proxy` 布尔开关会自动迁移：
+控制台「通道与凭证」页以**四个标签页**切换与管理，`web_state.json` 中旧版 `use_web_proxy` 布尔开关会自动迁移：
 
-| 策略 | 行为 |
+| 标签页 / 策略 | 行为 |
 |---|---|
 | `express`（默认） | 只走 Express API Key 标准通道 |
 | `cookie` | 只走 Cookie 直连反代（走网页端配额，规避 429） |
-| `hybrid`（推荐） | **Express 优先**，限流/5xx/未出流失败自动切 Cookie 兜底 |
+| `vertex` | 只走服务账号（标准 Vertex AI 认证） |
+| `hybrid`（推荐） | 按「混合自动」页配置的顺序尝试，限流/5xx/未出流失败自动切换下一通道 |
+
+**混合自动可配置（「混合自动」标签页）**：
+- **参与通道开关**：3 个通道各自勾选是否参与（至少要勾一个）。
+- **优先级顺序**：↑↓ 调整尝试顺序（越靠上越先尝试）。
+- **每通道独立重试次数**：各通道可单独设"失败后的内部重试上限"（留空 = 用全局 `retry_max`）——例如 Express 只重试 2 次就切走、Cookie 可重试 8 次扛限流。
+- **PayGo 流量等级**：`auto / off / standard / flex / priority` + `paygo_only` 开关（作用于 Express 与服务账号两通道，见下方「PayGo 流量等级」）。
 
 **故障转移规则**：
 - 仅对 429 / 500 / 502 / 503 / 504（限流、上游繁忙）类错误切换通道；400 / 401 / 403（配置、鉴权、权限问题）如实报错不切换——切换也不会变好。
-- Cookie 会话失效（Permission Denied）在混合模式下也会自动切 Express，日志会提示你刷新 Cookie。
+- Cookie 会话失效（Permission Denied）在混合模式下也会自动切其它通道，日志会提示你刷新 Cookie。
 - **流式响应**：只有「尚未向客户端发出任何内容」时才会切换（SSE 心跳不计入）。一旦正文开始输出，错误只能如实收尾——SSE 流中途无法切换上游。
-- **熔断保护**：任一通道连续失败 `failover_threshold` 次（默认 3）后冷却 `failover_cooldown_seconds` 秒（默认 60），冷却期间请求自动走另一条通道，避免限流风暴反复撞墙；成功后立即恢复。
-- 通道未配置凭证（无 Express Key / 无 Cookie）会被路由层自动剔除，不会进入失败重试循环。
+- **熔断保护**：任一通道连续失败 `failover_threshold` 次（默认 3）后冷却 `failover_cooldown_seconds` 秒（默认 60），冷却期间请求自动走另一条通道，避免限流风暴反复撞墙；成功后立即恢复。熔断按通道独立计数。
+- 通道未配置凭证（无 Express Key / 无 Cookie / 无服务账号）会被路由层自动剔除，不会进入失败重试循环。
 
-### 多账号凭证管理（Express Key 列表 / 多 Cookie 账号）
+### 多账号凭证管理（Express Key 列表 / 多 Cookie 账号 / 多服务账号）
 
 控制台「通道与凭证」页可在线管理（持久化在挂载卷 `web_state.json`，重建容器不丢）：
 
 - **Express Key 列表**：多行文本框整表覆盖（每行一个 Key），可一键清除回落环境变量；只回显掩码（前后 4 位 + 长度），保存后 `refresh_keys()` 热生效。
 - **Cookie 账号**：每行 = 一份 Cookie + 一个 Project ID，支持添加/更新/删除；新增时校验 SAPISID 族字段；Cookie 输入框留空 = 保持该账号原值。多账号时按「多 Key 轮询」开关轮询或随机选号；单账号行为与原来完全一致。
-- **同一请求恒用同一账号**：重试、流式、故障转移重发都不会串号（cookie 与 project 取自请求级快照）；location 钉定用的 Project ID 取第一个账号，稳定不漂移。
-- **凭证永不回显明文**：前端只显示掩码，完整 Cookie / Key 不会进入浏览器缓存或截图。
+- **服务账号**：每行 = 一份 SA JSON（+ 可选 Project ID 覆盖 + 区域，区域默认 `global`），支持添加/更新/删除；新增时校验 JSON 结构与必需字段。只回显 `client_email` + project + location 掩码，SA JSON 永不回填（输入框留空 = 保持原值）。
+- **同一请求恒用同一账号**：重试、流式、故障转移重发都不会串号（凭证取自请求级快照）。
+- **凭证永不回显明文**：前端只显示掩码，完整 Cookie / Key / SA JSON 不会进入浏览器缓存或截图。
+
+---
+
+## 服务账号（Vertex SA）通道配置指引
+
+**认证原理**：`google-genai` SDK + `google-auth` 内部完成标准 OAuth2 JWT-bearer 授权——用服务账号私钥签 RS256 断言 JWT → `oauth2.googleapis.com/token` 换 `access_token`（约 1 小时）→ 请求带 `Authorization: Bearer`，过期自动刷新。**无需手写认证代码。**
+
+**准备步骤**：
+1. 在 Google Cloud 控制台创建服务账号（或直接用现有账号），授予该项目 `roles/aiplatform.user` 角色，并确保项目**已开启计费**（否则报 `403 requires billing to be enabled`）。
+2. 为该服务账号创建 **Key（JSON）** 并下载（安全提示：服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限，请妥善保管、只用于本项目、必要时轮换）。
+3. 在控制台「通道与凭证 → 服务账号」标签页粘贴整段 SA JSON（`client_email` / `private_key` / `project_id` 三个字段必须有），选区域（默认 `global`），保存。或设置环境变量 `VERTEX_SA_FILE` 指向 key 文件路径（docker 挂载场景）。
+
+**旧配置兼容**：带 `[PAY]` 前缀的模型名（旧版服务账号模式的入口）在 `vertex` / `hybrid` 策略下会被自动剥掉前缀走服务账号通道。
+
+**常见错误**：
+- `403 Permission 'aiplatform.endpoints.predict' denied` → 服务账号缺角色或项目没开计费（见上）。
+- `401 Unauthorized` / token 类错误 → SA Key 无效或已删除，重新生成。
+
+---
+
+## PayGo 流量等级（ST-Vertex-PayGo 方案融合）
+
+融合自 `ST-Vertex-PayGo(-Server)` 的官方「按量共享容量」层级头机制，作用于 **Express 与服务账号**两通道（Cookie 通道走 batchGraphql 不适用）：
+
+| 等级 | 请求头 | 说明 |
+|---|---|---|
+| `auto`（默认） | global 请求自动打 Priority 头 | 保持改造前行为 |
+| `off` | 无 | 不打任何层级头 |
+| `standard` | 仅 `paygo_only=true` 时打 `X-Vertex-AI-LLM-Request-Type: shared` | 绕过预配吞吐、纯按量 |
+| `flex` | shared + `X-Vertex-AI-LLM-Shared-Request-Type: flex` + `X-Server-Timeout: 1800` | 允许排队至 30 分钟（同步放大 httpx 超时） |
+| `priority` | shared + `X-Vertex-AI-LLM-Shared-Request-Type: priority` | 优先调度 |
+
+**约束**：Flex/Priority 仅对 `location=global` 的请求有效，非 global 自动降级为普通请求并在日志告警。
 
 ## 关于 429 报错与并发控制
 

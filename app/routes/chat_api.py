@@ -9,6 +9,7 @@ from auth import get_api_key
 from runtime_state import app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
+from upstreams.service_account import ServiceAccountUpstream
 from api_helpers import extract_upstream_error, create_openai_error_response, is_retryable_exception
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
@@ -18,10 +19,18 @@ router = APIRouter()
 # 实例化多通道策略
 express_upstream = ExpressSDKUpstream()
 cookie_upstream = CookieProxyUpstream()
+sa_upstream = ServiceAccountUpstream()
 
 CHANNELS = {
     "express": express_upstream,
     "cookie": cookie_upstream,
+    "vertex": sa_upstream,
+}
+
+CHANNEL_NAMES = {
+    "express": "Express API Key",
+    "cookie": "Cookie 直连",
+    "vertex": "服务账号",
 }
 
 # 可切换错误白名单：只有这些状态码才触发跨通道故障转移。
@@ -33,12 +42,16 @@ def _channel_order(strategy: str) -> list:
     """按策略返回通道尝试顺序：
     - express  -> [express]                只走 API Key（默认，向后兼容）
     - cookie   -> [cookie]                 只走 Cookie 直连反代
-    - hybrid   -> [express, cookie]        Express 主，限流/故障自动切 Cookie 兜底
+    - vertex   -> [vertex]                 只走服务账号（标准 Vertex）
+    - hybrid   -> 控制台可配顺序（hybrid_channels 设置，默认 [express, cookie]，
+                  可在「混合自动」标签页加入 vertex 并排序）
     """
     if strategy == "cookie":
         return ["cookie"]
+    if strategy == "vertex":
+        return ["vertex"]
     if strategy == "hybrid":
-        return ["express", "cookie"]
+        return app_state.get_hybrid_channels()
     return ["express"]
 
 
@@ -47,6 +60,7 @@ def _available_channels(order: list) -> list:
 
     - express：至少配置了一个 VERTEX_EXPRESS_API_KEY
     - cookie ：控制台已保存 Cookie 与 Project ID（环境变量也算）
+    - vertex ：控制台已保存服务账号 JSON（环境变量 VERTEX_SA_JSON/VERTEX_SA_FILE 也算）
     """
     out = []
     for channel in order:
@@ -56,11 +70,16 @@ def _available_channels(order: list) -> list:
                 out.append(channel)
             else:
                 print("ℹ️ [通道预检] Express 通道跳过：未配置 VERTEX_EXPRESS_API_KEY。")
-        else:  # cookie
+        elif channel == "cookie":
             if app_state.get_cookie_accounts():
                 out.append(channel)
             else:
                 print("ℹ️ [通道预检] Cookie 通道跳过：未配置 Google Cookie / Project ID。")
+        else:  # vertex
+            if app_state.get_sa_accounts():
+                out.append(channel)
+            else:
+                print("ℹ️ [通道预检] 服务账号通道跳过：未配置 SA JSON 凭证。")
     return out
 
 
@@ -76,7 +95,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         return JSONResponse(
             status_code=503,
             content=create_openai_error_response(
-                503, "当前策略下没有可用的上游通道：请配置 Express API Key 或 Google Cookie 与 Project ID。",
+                503, "当前策略下没有可用的上游通道：请配置 Express API Key、Google Cookie 或服务账号 JSON。",
                 "upstream_error"),
         )
 
@@ -196,7 +215,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     通道策略（控制台「通道与凭证」页可切）：
     - express  -> 只走 ExpressSDKUpstream（官方 API Key 标准通道）
     - cookie   -> 只走 CookieProxyUpstream（Cookie 直连反代通道，规避 429 限流）
-    - hybrid   -> Express 优先，限流/5xx/未出流失败自动切 Cookie 兜底；
+    - vertex   -> 只走 ServiceAccountUpstream（服务账号 JSON，标准 Vertex 认证）
+    - hybrid   -> 按控制台「混合自动」标签页的通道顺序尝试（默认 Express 优先，
+                  限流/5xx/未出流失败自动切 Cookie 兜底，可在控制台加入/排序服务账号通道）；
                   任一通道连续失败自动熔断冷却（failover_threshold / failover_cooldown_seconds）
 
     统一异常兜底：把上游抛出的 404/403/400 等如实转成 OpenAI 错误格式，
@@ -209,8 +230,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         return JSONResponse(
             status_code=503,
             content=create_openai_error_response(
-                503, f"当前策略（{strategy}）下没有可用通道：请配置 VERTEX_EXPRESS_API_KEY，"
-                     "或在大盘控制台「通道与凭证」页粘贴 Google Cookie 与 Project ID。",
+                503, f"当前策略（{strategy}）下没有可用通道：请配置 VERTEX_EXPRESS_API_KEY、"
+                     "Google Cookie 与服务账号 JSON 中的至少一种，"
+                     "或在大盘控制台「通道与凭证」页配置。",
                 "upstream_error"),
         )
     try:

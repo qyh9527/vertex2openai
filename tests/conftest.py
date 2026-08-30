@@ -23,9 +23,11 @@ sys.path.insert(0, str(APP_DIR))
 
 
 @pytest.fixture(autouse=True)
-def _clear_cookie_account_context():
-    """每个测试前后清空请求级 Cookie 账号快照（contextvar 跨测试会残留）。"""
+def _clear_account_context():
+    """每个测试前后清空请求级账号快照（contextvar 跨测试会残留）。"""
     import runtime_state
     runtime_state._current_cookie_account.set(None)
+    runtime_state._current_sa_account.set(None)
     yield
     runtime_state._current_cookie_account.set(None)
+    runtime_state._current_sa_account.set(None)

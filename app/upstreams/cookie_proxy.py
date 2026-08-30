@@ -1396,7 +1396,8 @@ class CookieProxyUpstream(BaseUpstream):
             client_kwargs["proxy"] = app_config.PROXY_URL
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
-        retry_max, backoff_sec = get_retry_settings()
+        # Cookie 通道的重试次数可独立覆盖（channel_retry_overrides["cookie"]）
+        retry_max, backoff_sec = get_retry_settings("cookie")
 
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"

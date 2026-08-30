@@ -40,17 +40,23 @@ def _safety_score_enabled() -> bool:
 
 
 
-def get_retry_settings() -> tuple[int, float]:
+def get_retry_settings(channel: Optional[str] = None) -> tuple[int, float]:
     """读取重试配置。
 
     **语义（全项目统一）**：`retry_max` 是「失败后的重试次数」，
     总请求次数 = retry_max + 1。所以循环一律写 `range(retry_max + 1)`。
     旧实现在 Express 通道写成 `range(retry_max)`，retry_max=0 时一次请求都不发（P0-2）。
+
+    `channel` 非空且在控制台配置了该通道的独立重试次数（channel_retry_overrides）时，
+    用通道专属值覆盖全局 retry_max（混合自动里各通道可独立决定重试次数）。
     """
     try:
         retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
     except (TypeError, ValueError):
         retry_max = app_config.DEFAULT_SETTINGS["retry_max"]
+    override = app_state.get_channel_retry(channel) if channel else None
+    if override is not None:
+        retry_max = override
     try:
         backoff = float(app_state.get_setting(
             "retry_backoff_seconds", app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]))
@@ -795,12 +801,13 @@ async def gemini_fake_stream_generator(
     prefill_text: str = "",
     fastapi_request: Optional[Any] = None,
     failover_mode: bool = False,
+    channel_name: Optional[str] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
-    max_retries, backoff_sec = get_retry_settings()
+    max_retries, backoff_sec = get_retry_settings(channel_name)
 
     async def _client_gone() -> bool:
         if fastapi_request is None:
@@ -953,6 +960,7 @@ async def execute_gemini_call(
     fallback_client_factory: Optional[Callable[[], Any]] = None,
     failover_mode: bool = False,
     force_fake_streaming: bool = False,
+    channel_name: Optional[str] = None,
 ):
     fallback_client = None
 
@@ -992,6 +1000,7 @@ async def execute_gemini_call(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
+                    channel_name=channel_name,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -999,7 +1008,7 @@ async def execute_gemini_call(
             async def _gemini_real_stream_generator_inner():
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client
-                max_retries, backoff_sec = get_retry_settings()
+                max_retries, backoff_sec = get_retry_settings(channel_name)
                 has_yielded = False    # 是否已向客户端输出过正文/工具调用（重试与故障转移的唯一判断依据）
                 prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
@@ -1141,7 +1150,7 @@ async def execute_gemini_call(
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
-        max_retries, backoff_sec = get_retry_settings()
+        max_retries, backoff_sec = get_retry_settings(channel_name)
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
         for attempt in range(max_retries + 1):

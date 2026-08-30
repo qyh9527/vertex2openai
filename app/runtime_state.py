@@ -20,6 +20,41 @@ STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
 _current_cookie_account = contextvars.ContextVar(
     "current_cookie_account", default=None)
 
+# 服务账号通道同一套快照机制：一次请求内 project/location/sa_json 恒来自同一账号。
+_current_sa_account = contextvars.ContextVar(
+    "current_sa_account", default=None)
+
+
+def _sa_env_fallback() -> list:
+    """服务账号环境变量兜底：VERTEX_SA_JSON（内联）或 VERTEX_SA_FILE（文件路径）。
+
+    控制台未保存账号列表时使用，返回单账号列表（sa_json 为原始 JSON 字符串，
+    location 默认 global，project_id 从 SA JSON 自身读取）。非法输入返回空列表。
+    """
+    raw = (app_config.VERTEX_SA_JSON or "").strip()
+    if not raw and app_config.VERTEX_SA_FILE:
+        try:
+            with open(app_config.VERTEX_SA_FILE, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except OSError as e:
+            print(f"⚠️ [服务账号] 读取 VERTEX_SA_FILE 失败，已忽略：{e}")
+            return []
+    if not raw:
+        return []
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        print("⚠️ [服务账号] VERTEX_SA_JSON/VERTEX_SA_FILE 不是合法 JSON，已忽略。")
+        return []
+    if not isinstance(info, dict) or not info.get("client_email") or not info.get("private_key"):
+        print("⚠️ [服务账号] 环境变量里的 SA JSON 缺少 client_email/private_key，已忽略。")
+        return []
+    return [{
+        "project_id": str(info.get("project_id") or ""),
+        "location": "global",
+        "sa_json": raw,
+    }]
+
 
 class AppState:
     """运行态管理器（内存优先 + 写时落盘）。
@@ -38,6 +73,7 @@ class AppState:
         self._lock = threading.RLock()
         self._state = {"channel_strategy": "express"}
         self._cookie_rr_index = 0   # 多 Cookie 账号轮询指针（内存态，重启重头轮）
+        self._sa_rr_index = 0       # 多服务账号轮询指针（内存态，重启重头轮）
         self._load_from_disk()
 
     # ---------- 持久化 ----------
@@ -93,10 +129,10 @@ class AppState:
 
     # ---------- 通道开关与凭证 ----------
 
-    CHANNEL_STRATEGIES = ("express", "cookie", "hybrid")
+    CHANNEL_STRATEGIES = ("express", "cookie", "vertex", "hybrid")
 
     def set_channel_strategy(self, strategy: str) -> bool:
-        """三档通道策略：express=只走 API Key / cookie=只走 Cookie 直连 / hybrid=混合自动（Express 主 + Cookie 兜底）。"""
+        """四档通道策略：express=只走 API Key / cookie=只走 Cookie 直连 / vertex=只走服务账号 / hybrid=混合自动。"""
         strategy = (strategy or "").strip().lower()
         if strategy not in self.CHANNEL_STRATEGIES:
             return False
@@ -242,6 +278,104 @@ class AppState:
                 print(f"🔑 [账号选择] 多 Cookie 账号轮询/随机选中第 {idx + 1}/{len(accounts)} 份。")
             _current_cookie_account.set(account)
         return (account.get("cookie", ""), account.get("project_id", ""))
+
+    # ---------- 服务账号（第三通道）凭证管理 ----------
+
+    def get_sa_accounts(self) -> list:
+        """服务账号列表 [{project_id, location, sa_json}, ...]（控制台列表优先，空则回落环境变量）。"""
+        with self._lock:
+            accounts = self._state.get("sa_accounts")
+            if isinstance(accounts, list):
+                accounts = [a for a in accounts if isinstance(a, dict) and a.get("sa_json")]
+                if accounts:
+                    return accounts
+        return _sa_env_fallback()
+
+    def get_sa_accounts_console(self) -> list:
+        """仅控制台持久化列表（不含环境变量兜底）；账号增删改用这个。"""
+        with self._lock:
+            accounts = self._state.get("sa_accounts")
+            if isinstance(accounts, list):
+                return [a for a in accounts if isinstance(a, dict) and a.get("sa_json")]
+        return []
+
+    def set_sa_accounts(self, accounts: list) -> list:
+        """整表覆盖保存服务账号列表；空列表 = 清空控制台列表，回落环境变量。
+
+        每项必须含非空 sa_json（project_id/location 可空，为空时用默认值）。
+        """
+        clean = []
+        seen = set()
+        for a in (accounts or []):
+            if not isinstance(a, dict):
+                continue
+            sa_json = str(a.get("sa_json") or "").strip()
+            if not sa_json or sa_json in seen:
+                continue
+            seen.add(sa_json)
+            clean.append({
+                "project_id": str(a.get("project_id") or "").strip(),
+                "location": (str(a.get("location") or "global").strip() or "global"),
+                "sa_json": sa_json,
+            })
+        with self._lock:
+            self._state["sa_accounts"] = clean
+            self._sa_rr_index = 0
+            _current_sa_account.set(None)
+            self._save()
+        print(f"🔑 [状态管理器] 已保存 {len(clean)} 个服务账号。")
+        return clean
+
+    def get_current_sa_account(self) -> tuple:
+        """取本次请求使用的服务账号（请求级快照，同 Cookie 账号机制）。
+
+        返回 (project_id, location, sa_json)。多账号按 roundrobin 设置轮询或随机选择，
+        同一请求内（含重试、流式、failover 重发）复用同一账号；无任何账号返回 (None, None, None)。
+        """
+        account = _current_sa_account.get()
+        if account is None:
+            accounts = self.get_sa_accounts()
+            if not accounts:
+                return (None, None, None)
+            if len(accounts) == 1:
+                account = accounts[0]
+            else:
+                use_roundrobin = bool(self.get_setting("roundrobin", app_config.ROUNDROBIN))
+                with self._lock:
+                    if use_roundrobin:
+                        idx = self._sa_rr_index % len(accounts)
+                        self._sa_rr_index = (self._sa_rr_index + 1) % len(accounts)
+                    else:
+                        idx = random.randrange(len(accounts))
+                    account = accounts[idx]
+                print(f"🔑 [账号选择] 多服务账号轮询/随机选中第 {idx + 1}/{len(accounts)} 份。")
+            _current_sa_account.set(account)
+        return (account.get("project_id", ""), account.get("location", "global"), account.get("sa_json", ""))
+
+    # ---------- 混合自动的可配置行为（hybrid 策略下生效）----------
+
+    def get_hybrid_channels(self) -> list:
+        """混合自动的通道顺序（只保留已知通道键，非法/空则回落默认顺序）。"""
+        raw = self.get_setting("hybrid_channels", app_config.DEFAULT_SETTINGS["hybrid_channels"])
+        known = ("express", "cookie", "vertex")
+        if isinstance(raw, list):
+            out = [c for c in raw if c in known]
+            if out:
+                return out
+        return list(app_config.DEFAULT_SETTINGS["hybrid_channels"])
+
+    def get_channel_retry(self, channel: str):
+        """该通道的独立重试次数覆盖；无覆盖/非法返回 None（= 用全局 retry_max）。"""
+        overrides = self.get_setting(
+            "channel_retry_overrides", app_config.DEFAULT_SETTINGS["channel_retry_overrides"])
+        if isinstance(overrides, dict) and channel in overrides:
+            v = overrides.get(channel)
+            if v is not None:
+                try:
+                    return max(0, min(50, int(v)))
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     # ---------- 控制台可调设置 ----------
 

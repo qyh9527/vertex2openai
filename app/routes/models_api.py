@@ -20,11 +20,13 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
 
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
     
-    # 动态放行：开启 Cookie 直连 / 混合策略，或配置有 Express API Key，均可安全获取模型列表
-    has_web_proxy = app_state.get_channel_strategy() != "express"   # cookie 或 hybrid 都放行
+    # 动态放行：开启 Cookie 直连 / 服务账号 / 混合策略，或配置有 Express API Key，
+    # 均可安全获取模型列表（模型列表与通道无关，任一通道有凭证即可）
+    has_web_proxy = app_state.get_channel_strategy() != "express"   # cookie / vertex / hybrid 都放行
+    has_sa_account = bool(app_state.get_sa_accounts())
     has_express_key = express_key_manager_instance.get_total_keys() > 0
-    
-    raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []
+
+    raw_models = await get_express_models() if (has_express_key or has_web_proxy or has_sa_account) else []
 
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()

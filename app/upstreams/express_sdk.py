@@ -19,7 +19,7 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
-from http_options import get_http_options, should_use_priority_paygo
+from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
@@ -49,12 +49,17 @@ _CLIENT_FAILURES: dict = {}  # cache_key -> 连续连接级失败次数
 
 
 def _new_express_client(express_api_key: str, priority_paygo: bool,
+                        headers: dict | None = None, timeout: int | None = None,
                         cache_key: Any = None) -> Any:
-    """创建 genai.Client；复用模式下挂上失败上报回调（由 api_helpers 调用）。"""
+    """创建 genai.Client；复用模式下挂上失败上报回调（由 api_helpers 调用）。
+
+    headers/timeout 由 PayGo 流量等级解析得出（http_options.resolve_paygo_bundle）。
+    """
     client = genai.Client(
         vertexai=True,
         api_key=express_api_key,
-        http_options=get_http_options(priority_paygo=priority_paygo),
+        http_options=get_http_options(headers=headers, timeout=timeout,
+                                      priority_paygo=priority_paygo),
     )
     if cache_key is not None:
         client._vertex_cache_key = cache_key
@@ -95,21 +100,25 @@ def _on_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -
             _CLIENT_FAILURES[cache_key] = cnt
 
 
-def _get_cached_client(express_api_key: str, priority_paygo: bool) -> Any:
+def _get_cached_client(express_api_key: str, priority_paygo: bool = False,
+                       *, headers: dict | None = None, timeout: int | None = None) -> Any:
     """取（必要时创建）复用的 google-genai Client。
 
-    缓存键含 priority_paygo：Priority PayGo 请求头必须只用于钉定到 global 的
-    资源路径，绝不能复用到普通请求上（流量等级会标错）。
+    缓存键含 priority_paygo 与 PayGo 层级头：Priority PayGo 请求头必须只用于钉定到
+    global 的资源路径，绝不能复用到普通请求上（流量等级会标错）；换层级必须换连接池语义。
     控制台 client_reuse 关闭时不做缓存，每请求新建 Client。
     """
     if not app_state.get_setting("client_reuse", True):
-        return _new_express_client(express_api_key, priority_paygo, cache_key=None)
+        return _new_express_client(express_api_key, priority_paygo,
+                                   headers=headers, timeout=timeout, cache_key=None)
     base_url = app_config.VERTEX_BASE_URL or None
-    cache_key = (express_api_key, base_url, priority_paygo)
+    headers_key = tuple(sorted((headers or {}).items()))
+    cache_key = (express_api_key, base_url, priority_paygo, headers_key)
     with _CLIENT_CACHE_LOCK:
         client = _CLIENT_CACHE.get(cache_key)
         if client is None:
-            client = _new_express_client(express_api_key, priority_paygo, cache_key=cache_key)
+            client = _new_express_client(express_api_key, priority_paygo,
+                                         headers=headers, timeout=timeout, cache_key=cache_key)
             _CLIENT_CACHE[cache_key] = client
     return client
 
@@ -272,6 +281,54 @@ class ExpressSDKUpstream(BaseUpstream):
     官方 API Key Express Mode 渠道处理器
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
+    # 通道名：用于每通道独立重试（channel_retry_overrides）与熔断统计；子类（服务账号）覆盖。
+    channel_name = "express"
+
+    def _resolve_client(self, fastapi_request: Request, base_model_name: str, settings: dict) -> dict:
+        """解析本通道实际使用的 Client 与模型路径（子类覆盖点）。
+
+        返回 dict：
+          {"client", "model_to_call", "priority_paygo", "fallback_model", "fallback_client_factory"}
+        无可用凭证时返回 {"error": JSONResponse}（路由层直接返回该错误）。
+        """
+        express_key_manager_instance = fastapi_request.app.state.express_key_manager
+        if express_key_manager_instance.get_total_keys() == 0:
+            error_msg = "未配置 VERTEX_EXPRESS_API_KEY，无法调用 Gemini Express Mode。"
+            print(f"❌ [密钥配置] {error_msg}")
+            return {"error": JSONResponse(
+                status_code=401,
+                content=create_openai_error_response(401, error_msg, "authentication_error"))}
+
+        key_tuple = express_key_manager_instance.get_express_api_key()
+        if not key_tuple:
+            error_msg = "没有可用的 Express API Key。"
+            print(f"❌ [密钥配置] {error_msg}")
+            return {"error": JSONResponse(
+                status_code=401,
+                content=create_openai_error_response(401, error_msg, "authentication_error"))}
+
+        _, express_api_key = key_tuple
+        model_to_call = resolve_express_model_path(base_model_name, settings)
+        is_global = "/locations/global/" in model_to_call
+        headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
+        for w in warnings:
+            print(f"⚠️ [流量等级] {w}")
+        priority_paygo = bool(headers)
+        client_to_use = _get_cached_client(express_api_key, priority_paygo,
+                                           headers=headers, timeout=timeout)
+        fallback_model = base_model_name if model_to_call != base_model_name else None
+        fallback_client_factory = (
+            (lambda: _get_cached_client(express_api_key, False))
+            if priority_paygo else None
+        )
+        return {
+            "client": client_to_use,
+            "model_to_call": model_to_call,
+            "priority_paygo": priority_paygo,
+            "fallback_model": fallback_model,
+            "fallback_client_factory": fallback_client_factory,
+        }
+
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request,
                                failover_mode: bool = False):
         try:
@@ -282,8 +339,6 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(400, str(exc), "invalid_request_error"),
             )
 
-        express_key_manager_instance = fastapi_request.app.state.express_key_manager
-
         base_model_name, is_grounded_search, is_fake, model_error = _normalize_model_name(request_obj.model)
         if model_error:
             print(f"❌ [模型名称] {model_error} 收到的模型名：{request_obj.model}")
@@ -292,37 +347,24 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(400, model_error, "invalid_request_error"),
             )
 
-        if express_key_manager_instance.get_total_keys() == 0:
-            error_msg = "未配置 VERTEX_EXPRESS_API_KEY，无法调用 Gemini Express Mode。"
-            print(f"❌ [密钥配置] {error_msg}")
-            return JSONResponse(
-                status_code=401,
-                content=create_openai_error_response(401, error_msg, "authentication_error"),
-            )
-
-        key_tuple = express_key_manager_instance.get_express_api_key()
-        if not key_tuple:
-            error_msg = "没有可用的 Express API Key。"
-            print(f"❌ [密钥配置] {error_msg}")
-            return JSONResponse(
-                status_code=401,
-                content=create_openai_error_response(401, error_msg, "authentication_error"),
-            )
-
-        _, express_api_key = key_tuple
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
-        priority_paygo = should_use_priority_paygo(model_to_call)
+        resolved = self._resolve_client(fastapi_request, base_model_name, _inj_settings)
+        if "error" in resolved:
+            return resolved["error"]
+        client_to_use = resolved["client"]
+        model_to_call = resolved["model_to_call"]
+        priority_paygo = resolved["priority_paygo"]
+        fallback_model = resolved.get("fallback_model")
+        fallback_client_factory = resolved.get("fallback_client_factory")
 
-        client_to_use = _get_cached_client(express_api_key, priority_paygo)
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
             print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
         if priority_paygo:
-            print("🚦 [流量等级] global 请求已附加 Priority PayGo 请求头；实际是否命中以上游 traffic_type 为准。")
+            print("🚦 [流量等级] global 请求已附加 PayGo 层级请求头；实际是否命中以上游 traffic_type 为准。")
         else:
-            print("ℹ️ [流量等级] 当前未钉定 global，使用普通请求。")
+            print("ℹ️ [流量等级] 当前未钉定 global（或层级为 off），使用普通请求。")
 
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
@@ -403,9 +445,8 @@ class ExpressSDKUpstream(BaseUpstream):
             # fake- 前缀请求：强制假流式输出（该请求级别，不影响其它模型）
             force_fake_streaming=is_fake,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
-            # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
-            fallback_model=(base_model_name if model_to_call != base_model_name else None),
-            fallback_client_factory=(
-                lambda: _get_cached_client(express_api_key, False)
-            ) if priority_paygo else None,
+            # 自动退回裸模型名重试一次，并改用不带 PayGo 层级头的普通客户端。
+            fallback_model=fallback_model,
+            fallback_client_factory=fallback_client_factory,
+            channel_name=self.channel_name,
         )

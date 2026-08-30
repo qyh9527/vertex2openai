@@ -35,6 +35,7 @@
 | 9 | 日志落盘：按天轮转保留 7 天（`STATE_DIR/vertex2openai.log`） | 运维 | 本批 |
 | 10 | CI 镜像双 tag（`latest` + commit sha，可回滚） | 部署 | 本批 |
 | 11 | Express Client 复用防护：开关 + 连接级失败自动舍弃 / 硬错误立即舍弃 | 功能 | 本批 |
+| 12 | 第三通道：服务账号（Vertex SA）+ 四标签页通道管理 + 混合自动可配（3 通道开关/顺序/每通道重试）+ PayGo 层级融合 | 功能 | 本批 |
 
 ---
 
@@ -309,6 +310,50 @@ conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效）�
 
 ---
 
+### 3.11 第三通道：服务账号（Vertex SA）+ 四标签页通道管理 + 混合自动可配 + PayGo 层级融合
+
+**需求**：① 新增"服务账号 JSON 凭证"的第三条上游通道（区域/项目方案由调研定案）；② 上游调用通道改四个标签页切换；③ 混合自动可配置 3 个渠道的开关、优先级顺序与每通道独立重试次数；④ 评估 ST-Vertex-PayGo 系列能否融合。
+
+**调研结论（定案依据）**：
+- **服务账号认证走官方库，不重写 gproxy 的手动 JWT**：gproxy（Rust 反代）与 ST-Vertex-PayGo 的服务账号模式都是标准 OAuth2 JWT-bearer（RS256 断言 → `oauth2.googleapis.com/token` → Bearer token）。本项目直接复用 `google-genai` 的 `credentials=` 参数：`service_account.Credentials.from_service_account_info(sa_json)` → `genai.Client(vertexai=True, project=, location=, credentials=)`，SDK 内部 `get_token_from_credentials` 在 token 过期时自动刷新（约 1h，异步锁防并发重刷）——即 gproxy `needs_refresh + exchange_token` 的官方等价物。**整条请求管线（真流式/假流式/非流式、预填充、思考、工具、生图、重试、failover、Client 复用防护）全部复用**，第三通道 = 新 upstream 类 + 凭证管理。佐证：原仓库 commit `0b5f9df` 前就有同方案的 `credentials_manager.py`，后被上游 "Express Mode only" 重构删除，本次=现代化恢复。
+- **区域默认 `global`**（多数 Gemini 模型只在 global 提供，与 Express 钉定实测一致）；project 取 SA JSON 自带 `project_id`（可控制台覆盖）。SDK 原生按 Client 的 project/location 拼路径，无需 Express 那套模型路径透传 hack。
+- **ST-Vertex-PayGo 不是新通道，是"PayGo 流量等级"开关**：它俩是 SillyTavern 插件对，给标准 Vertex 请求注入官方"按量共享容量"层级头（Priority/Flex/PayGo-only），认证借宿主。本项目已有 Priority 头，净增量仅 **Flex 档**（`X-Vertex-AI-LLM-Shared-Request-Type: flex` + `X-Server-Timeout: 1800`，需放大 httpx 超时）、**paygo_only 单独开关**、模型名单提示。回环票据机制是浏览器插件特有需求，不搬。
+
+**核心改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `app/upstreams/service_account.py` | **新增**：SA Client 复用缓存（按 sa_json/project/location/层级头）、`validate_sa_credentials`、`ServiceAccountUpstream`（继承 ExpressSDKUpstream 仅覆写 `_resolve_client`，含 `[PAY]` 旧前缀兼容入口） |
+| `app/routes/chat_api.py` | `CHANNELS` 注册 `vertex`；`_channel_order` 支持 hybrid 可配顺序（`get_hybrid_channels()`）；`_available_channels` 加 SA 预检 |
+| `app/runtime_state.py` | `CHANNEL_STRATEGIES` 加 `vertex`；`sa_accounts` 持久化 + `get_current_sa_account()`（contextvar 请求级快照，复刻 cookie 模式）+ `_sa_env_fallback()`（VERTEX_SA_JSON/VERTEX_SA_FILE）；`get_hybrid_channels()` / `get_channel_retry()` |
+| `app/config.py` | `DEFAULT_SETTINGS` 加 `hybrid_channels`、`channel_retry_overrides`、`paygo_tier`、`paygo_only`；AppSettings 加 `VERTEX_SA_JSON`/`VERTEX_SA_FILE` |
+| `app/api_helpers.py` | `get_retry_settings(channel)` 支持每通道独立重试覆盖；`execute_gemini_call` / `gemini_fake_stream_generator` 加 `channel_name` 透传 |
+| `app/http_options.py` | `resolve_paygo_headers(tier, paygo_only, is_global)` 头矩阵 + `paygo_timeout`（flex=1800）+ `resolve_paygo_bundle`；`is_flex_supported` **自动化黑名单**（gemini-2.x 系不支持 flex，真机 400，降级告警）；`get_http_options` 支持 headers/timeout；**PROXY_URL/SSL_CERT_FILE 改走预构建 httpx client**（修复 genai 2.19 `client_args['proxy']` 被 mTLS SSLContext 污染导致代理隧道 ConnectTimeout 的真机问题） |
+| `app/upstreams/express_sdk.py` | `_resolve_client` 抽象点（通道客户端来源可覆写）；PayGo 头接入层级设置；Client 缓存键含层级头 |
+| `app/upstreams/cookie_proxy.py` | 重试读取改 `get_retry_settings("cookie")` |
+| `app/main.py` | 通道页改**四标签页**（Express/Cookie/服务账号/混合自动）；服务账号多账号编辑器（掩码回显，不回填 JSON）；混合自动页（3 通道开关+排序+每通道重试+PayGo 层级下拉）；`/api/sa-account` 增改删端点；`/api/settings/runtime` 回显新字段；mode 映射加 `vertex` |
+| `app/routes/models_api.py` | 放行条件加 `has_sa_account` |
+| `app/requirements.txt` | 显式加 `google-auth` |
+| `tests/` | 新增 `test_service_account.py` / `test_http_options.py`；扩展 `test_route_dispatch.py`（vertex 路由/3 通道 failover/每通道重试）；conftest 清 SA 快照 |
+
+**测试**：全量 **203 用例全绿**（原 146 + 新 57）+ `compileall` 绿 + 真实 uvicorn 冒烟 14/14
+（SA 增删改/掩码/vertex 策略/模型列表/hybrid 配置持久化）+ **真实服务账号端到端验证**：
+本机代理下 token 换发（JWT-bearer）→ 非流式/流式真实出文 → PayGo Priority 头被接受 → Flex 头对
+`gemini-2.5-flash` 返回 400（`Flex API is not supported for model`，对 `gemini-3.6-flash` 正常）——
+由此实现 `is_flex_supported` **自动化正则黑名单**（gemini-2.x 系打 flex 头自动降级+告警）。
+
+**已知边界**：
+- 服务账号需项目**开计费** + SA 有 `roles/aiplatform.user`，否则 403 `requires billing`（错误文案已规划，同 Cookie 通道的项目级排查指引）。
+- **Flex 头只支持 3.x 及更新模型**（2.5 返回 400）：已用 `is_flex_supported` 自动化正则黑名单处理——`gemini-2.x` 系请求自动降级为普通请求并告警，3.x/未来模型前向放行（无需维护静态名单）。
+- **Flex 档 1800s 排队超时可能拖长单请求**；默认 `auto` 不影响既有行为。
+- SA Client 复用走独立的 `_SA_CLIENT_CACHE`（与 Express `_CLIENT_CACHE` 同款防护语义：连接级失败阈值舍弃/硬错误立即舍弃）。
+- `[PAY]` 前缀只在 `vertex`/`hybrid` 策略下被剥离；`express` 策略下仍报"已移除"。
+- **PROXY_URL 真机修复**：genai 2.19 的 `client_args['proxy']` 会被 `_ensure_httpx_ssl_ctx` 注入 mTLS
+  SSLContext，走 HTTP 代理建 CONNECT 隧道时 `start_tls` ConnectTimeout；`get_http_options` 已改为预构建
+  httpx client（`httpx_client`/`httpx_async_client` 字段），VPS 直连不受影响。
+
+---
+
 ## 四、测试记录
 
 所有测试在本机 Python 3.11 venv（与项目 Docker 环境 `python:3.11-slim` 一致）中进行：
@@ -345,6 +390,16 @@ conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效）�
 | Client 复用：硬错误（安全拦截）→ 立即舍弃不等阈值 | ✅ |
 | Client 复用：阈值 0 = 不自动舍弃 | ✅ |
 | **回归：全量 pytest 146 用例全绿（原 142 + 新 4）** | ✅ |
+| 3.11 服务账号：SA JSON 校验（缺字段/坏 JSON/type 拒绝）、环境变量兜底（内联/文件/缺失） | ✅ |
+| 3.11 服务账号：多账号请求级快照不串号、轮询/随机、控制台清空回落环境变量 | ✅ |
+| 3.11 服务账号：SA Client 缓存键（sa_json/project/location/层级头）、无账号返回 401 | ✅ |
+| 3.11 服务账号：`[PAY]` 前缀在 vertex 通道被剥除 | ✅ |
+| 3.11 PayGo：头矩阵（auto/off/standard/flex/priority × paygo_only × global/非 global）、非 global 降级告警 | ✅ |
+| 3.11 路由：strategy=vertex 只走 SA；hybrid 三通道顺序可配；每通道重试覆盖生效 | ✅ |
+| 3.11 冒烟：真实 uvicorn 14/14（SA 增删改/掩码/vertex 策略/模型列表/hybrid 配置持久化） | ✅ |
+| 3.11 真机：真实服务账号 token 换发 + 非流式/流式出文 + PayGo Priority 头 + Flex 头(3.6-flash) 成功；Flex 头(2.5) 400 证实模型名单必要 | ✅ |
+| 3.11 Flex 黑名单：`is_flex_supported` 判定矩阵（2.x 拒 / 3.x+/未来放行 / 大小写）+ flex 自动降级告警 | ✅ |
+| **回归：全量 pytest 203 用例全绿（原 146 + 新 57）** | ✅ |
 
 ---
 
@@ -353,18 +408,20 @@ conftest 把 `STATE_DIR` 指向独立临时目录（模块导入时即生效）�
 ```
 app/
 ├── failover.py                  # 新增：UpstreamUnstartedError + ChannelBreaker 熔断器
-├── runtime_state.py             # channel_strategy 三档 + 旧数据迁移
-├── config.py                    # failover_threshold / failover_cooldown_seconds
+├── runtime_state.py             # channel_strategy 四档 + 旧数据迁移；sa_accounts / 混合自动可配
+├── config.py                    # failover_threshold / failover_cooldown_seconds / hybrid_channels / paygo_tier
 ├── api_helpers.py               # FAKE_PREFIX；execute_gemini_call(failover_mode, force_fake_streaming)；
-│                                #   真流式 has_yielded / prefill_sent 双标志修复
-├── main.py                      # 控制台三档通道 UI、假流式开关文案、mode API
+│                                #   get_retry_settings(channel) 每通道重试；真流式 has_yielded/prefill_sent
+├── http_options.py              # PayGo 层级头矩阵 resolve_paygo_headers / resolve_paygo_bundle / paygo_timeout
+├── main.py                      # 控制台四标签页通道 UI、mode API、/api/sa-account
 ├── routes/
-│   ├── chat_api.py              # 多通道路由、_dispatch、_stream_with_failover
-│   └── models_api.py            # fake- 变体注册、放行条件
+│   ├── chat_api.py              # 多通道路由、_dispatch、_stream_with_failover（三通道 + 可配顺序）
+│   └── models_api.py            # fake- 变体注册、放行条件（含服务账号）
 └── upstreams/
-    ├── express_sdk.py           # _normalize_model_name 4 元组、force_fake_streaming 透传、
+    ├── express_sdk.py           # _normalize_model_name 4 元组、_resolve_client 抽象点、
     │                            #   Client 复用防护（开关 + 连接级失败舍弃/硬错误立即舍弃）
-    └── cookie_proxy.py          # failover_mode 分支、fake- 前缀剥离
+    ├── cookie_proxy.py          # failover_mode 分支、fake- 前缀剥离
+    └── service_account.py       # 新增：SA Client 复用缓存、凭证校验、ServiceAccountUpstream（[PAY] 兼容）
 .github/workflows/docker-image.yml  # 上游自带 GHCR CI（自动构建 latest）
 ```
 
@@ -397,6 +454,8 @@ git fetch upstream && git merge upstream/main && git push   # 合并原作者更
 
 ## 七、已知边界与后续建议
 
+> 本文件是**自包含的项目状态文档**：开新会话时直接 @ 本文件即可获得完整背景、改造历史、当前能力、测试与部署说明。
+
 - **流式 failover 是"响应头之前"级**：已出流的失败只能如实收尾，无法切换。对 429（请求未开始就被拒）完全够用
 - **Cookie 通道假流式**：目前没有实现，`fake-` 前缀在 Cookie 通道被剥掉当普通模型处理（生图除外）。若需要可为 Cookie 通道补假流式实现
 - **熔断器是进程内存态**：重启后计数清零，属正常（冷却期最长 60s，影响极小）
@@ -406,4 +465,23 @@ git fetch upstream && git merge upstream/main && git push   # 合并原作者更
 - **多实例部署**：若未来多副本，需把熔断状态/会话/签名缓存迁移到 Redis 等共享存储（当前单实例够用）
 - **Express Mode 是 Pre-GA**：SDK 已锁 2.x、api_version 已钉 v1beta1，行为可复现；升级镜像/同步 upstream 前先看 google-genai CHANGELOG，升级后开「出站调试」核对 thinking 参数是否照旧
 - **「钉定 location」是未文档化用法**：官方 Express 端点格式不含 projects/locations，实测可用但 Pre-GA 下 Google 可能收紧；已有 `is_location_pin_failure` 兜底（失败自动退回裸模型名），真失效时不会更糟，只是回到后端自选路由
-- **后续可选**：① `labels` 请求体字段（仅计费报告用，一行级改动，可给请求打 `channel=express` 等标签方便看账单）；② `cachedContent` 显式上下文缓存（官方称可保证成本节省，酒馆长预设场景有价值，但需自己管缓存创建/过期/删除生命周期，工作量中）
+- **Flex 层级名单是自动化黑名单**（`is_flex_supported`）：只挡真机确认不支持的 `gemini-2.x`，3.x 及未来模型前向放行（不维护静态名单）；若某未来模型真不支持 flex 会收到明确 400 如实报错
+- **后续可选**：① `labels` 请求体字段（仅计费报告用，一行级改动，可给请求打 `channel=express` 等标签方便看账单）；② `cachedContent` 显式上下文缓存（官方称可保证成本节省，酒馆长预设场景有价值，但需自己管缓存创建/过期/删除生命周期，工作量中）；③ 若需把 Flex 名单升级为「只放行已知模型」的保守白名单（对照 ST 的 KNOWN_FLEX_MODELS），可加一个控制台可配置的名单覆盖项
+
+---
+
+## 八、本批次 TODO 收尾记录（原 TODO.md 已整合进本文档后删除）
+
+**任务**：第三通道（服务账号）+ 四标签页 + 混合自动可配 + PayGo 融合。状态 **✅ 完成并真机验证**。
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| A | 配置/状态层：config 新设置键 + runtime_state 的 sa_accounts / hybrid 可配 / 请求级快照 | ✅ |
+| B | 服务账号通道：`service_account.py`（SDK credentials= 认证、多账号、[PAY] 兼容） | ✅ |
+| C | 路由层：vertex 注册、hybrid 可配顺序、每通道重试、模型列表放行 | ✅ |
+| D | PayGo 融合：层级头矩阵、flex 超时、flex 模型黑名单、PROXY_URL 预构建 client 修复 | ✅ |
+| E | 控制台 UI：四标签页 + 服务账号编辑器 + 混合自动页 + PayGo 下拉 | ✅ |
+| F | 测试：`test_service_account.py` / `test_http_options.py` + 路由扩展，**203 用例全绿** | ✅ |
+| G | 文档：README + 本文件 + requirements 显式 google-auth | ✅ |
+
+**真机验证结论**：服务账号 OAuth2 JWT-bearer 认证、非流式/流式出文、PayGo Priority/Flex 头全部真实可用；Flex 对 2.x 模型 400 已由黑名单自动化降级；PROXY_URL 代理隧道 bug 已修复。VPS 部署后建议：控制台配好 SA JSON → 切 `vertex` 或 `hybrid` → 用 `debug_outbound` 核对出站头。**剩余可选增强**：`labels` 计费标签、`cachedContent` 上下文缓存、Flex 保守白名单（见上文"后续可选"）。

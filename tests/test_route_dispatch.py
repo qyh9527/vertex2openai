@@ -69,6 +69,14 @@ def _install(monkeypatch, express_behavior, cookie_behavior):
     return ex, ck
 
 
+def _install3(monkeypatch, express_behavior, cookie_behavior, vertex_behavior):
+    ex = FakeUpstream(express_behavior)
+    ck = FakeUpstream(cookie_behavior)
+    sa = FakeUpstream(vertex_behavior)
+    monkeypatch.setattr(chat_api, "CHANNELS", {"express": ex, "cookie": ck, "vertex": sa})
+    return ex, ck, sa
+
+
 class TestChannelOrder:
     def test_express_only(self):
         assert chat_api._channel_order("express") == ["express"]
@@ -257,3 +265,74 @@ class TestSuccessReporting:
         resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
         _ = [c async for c in resp.body_iterator]
         assert chat_api.breaker.status() == {}   # 主通道流式成功 → 计数清零
+
+
+class TestVertexChannel:
+    """第三通道（服务账号）路由：strategy=vertex / hybrid 可配顺序 / 预检剔除。"""
+
+    def test_channel_order_vertex_only(self):
+        assert chat_api._channel_order("vertex") == ["vertex"]
+
+    def test_hybrid_order_configurable(self, monkeypatch):
+        monkeypatch.setattr(app_state, "get_hybrid_channels",
+                            lambda: ["vertex", "express", "cookie"])
+        assert chat_api._channel_order("hybrid") == ["vertex", "express", "cookie"]
+
+    def test_available_vertex_removed_without_accounts(self, monkeypatch):
+        monkeypatch.setattr(app_config, "VERTEX_EXPRESS_API_KEY_VAL", [])
+        monkeypatch.setattr(app_state, "get_express_keys", lambda: None)
+        monkeypatch.setattr(app_state, "get_cookie_accounts", lambda: [])
+        monkeypatch.setattr(app_state, "get_sa_accounts", lambda: [])
+        assert chat_api._available_channels(["express", "cookie", "vertex"]) == []
+
+    def test_available_vertex_included_with_accounts(self, monkeypatch):
+        monkeypatch.setattr(app_config, "VERTEX_EXPRESS_API_KEY_VAL", [])
+        monkeypatch.setattr(app_state, "get_express_keys", lambda: None)
+        monkeypatch.setattr(app_state, "get_cookie_accounts", lambda: [])
+        monkeypatch.setattr(app_state, "get_sa_accounts", lambda: [{"sa_json": "{}"}])
+        assert chat_api._available_channels(["express", "cookie", "vertex"]) == ["vertex"]
+
+    async def test_vertex_only_dispatch(self, env, monkeypatch):
+        ex, ck, sa = _install3(
+            monkeypatch,
+            {"response": _json(200)}, {"response": _json(200)}, {"response": _json(200)})
+        resp = await chat_api._dispatch(["vertex"], _req(), None, failover_mode=False)
+        assert resp.status_code == 200
+        assert len(sa.calls) == 1 and len(ex.calls) == 0 and len(ck.calls) == 0
+
+    async def test_hybrid_three_channel_failover(self, env, monkeypatch):
+        """express 429 → cookie 429 → vertex 成功，按可配顺序兜底。"""
+        ex, ck, sa = _install3(
+            monkeypatch,
+            {"response": _json(429)}, {"response": _json(429)}, {"response": _json(200)})
+        resp = await chat_api._dispatch(["express", "cookie", "vertex"], _req(), None, failover_mode=True)
+        assert resp.status_code == 200
+        assert len(ex.calls) == 1 and len(ck.calls) == 1 and len(sa.calls) == 1
+
+    async def test_hybrid_vertex_second_in_order(self, env, monkeypatch):
+        """顺序 [express, vertex, cookie]：express 429 → vertex 成功，cookie 不被调用。"""
+        ex, ck, sa = _install3(
+            monkeypatch,
+            {"response": _json(429)}, {"response": _json(200)}, {"response": _json(200)})
+        resp = await chat_api._dispatch(["express", "vertex", "cookie"], _req(), None, failover_mode=True)
+        assert resp.status_code == 200
+        assert len(ex.calls) == 1 and len(sa.calls) == 1 and len(ck.calls) == 0
+
+
+class TestChannelRetryOverride:
+    """每通道独立重试次数（channel_retry_overrides，TODO C2 阶段）。"""
+
+    def test_channel_override_wins(self, monkeypatch):
+        from api_helpers import get_retry_settings
+        monkeypatch.setattr(app_state, "get_channel_retry", lambda ch: 7 if ch == "express" else None)
+        max_r, _ = get_retry_settings("express")
+        assert max_r == 7
+        max_r2, _ = get_retry_settings("cookie")
+        assert max_r2 == app_config.DEFAULT_SETTINGS["retry_max"]
+
+    def test_no_channel_uses_global(self, monkeypatch):
+        from api_helpers import get_retry_settings
+        monkeypatch.setattr(app_state, "get_channel_retry", lambda ch: None)
+        max_r, _ = get_retry_settings()
+        assert max_r == app_config.DEFAULT_SETTINGS["retry_max"]
+

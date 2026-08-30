@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import secrets
 import threading
@@ -20,6 +21,7 @@ import model_capabilities as mc
 from model_loader import get_express_models
 
 from cookie_auth import validate_cookie
+from upstreams.service_account import validate_sa_credentials
 
 express_key_manager = ExpressKeyManager()
 
@@ -168,6 +170,21 @@ def mask_key(key: str) -> str:
     if len(key) <= 8:
         return f"****（{len(key)} 字符）"
     return f"{key[:4]}…{key[-4:]}（{len(key)} 字符）"
+
+
+def mask_sa_account(a: dict, index: int) -> dict:
+    """服务账号掩码回显：只暴露 client_email（公开标识）+ project + location，绝不回填 SA JSON。"""
+    email = ""
+    try:
+        email = str(json.loads(a.get("sa_json", "")).get("client_email") or "")
+    except Exception:
+        pass
+    return {
+        "index": index,
+        "client_email": email,
+        "project_id": a.get("project_id", ""),
+        "location": a.get("location", "global"),
+    }
 
 
 async def require_auth(request: Request):
@@ -342,39 +359,89 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Channel -->
   <section id="view-channel" class="hidden">
     <div class="card p-5 mb-4">
-      <div class="lbl mb-3">上游调用通道</div>
-      <div class="flex flex-col sm:flex-row gap-3">
-        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-api">
-          <input type="radio" name="mode" value="api_key" class="mt-1" onchange="updateMode('api_key')">
-          <div><div class="font-medium text-sm">Express API Key（标准）</div><div class="text-xs text-neutral-500 mt-0.5">用 VERTEX_EXPRESS_API_KEY 调官方 SDK</div></div>
-        </label>
-        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-web">
-          <input type="radio" name="mode" value="web_proxy" class="mt-1" onchange="updateMode('web_proxy')">
-          <div><div class="font-medium text-sm">Cookie 直连反代</div><div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div></div>
-        </label>
-        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-hybrid">
-          <input type="radio" name="mode" value="hybrid" class="mt-1" onchange="updateMode('hybrid')">
-          <div><div class="font-medium text-sm">混合自动（推荐）</div><div class="text-xs text-neutral-500 mt-0.5">Express 优先，限流/故障自动切 Cookie 兜底，含熔断保护</div></div>
-        </label>
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <div class="lbl mb-0">上游调用通道</div>
+        <span class="pill pill-accent" id="chan-status" style="text-transform:none">—</span>
       </div>
-    </div>
-    <div id="express-key-box" class="card p-5 hidden">
-      <div class="lbl mb-2">Express API Key（控制台管理，可多个）</div>
-      <div id="express-keys-summary" class="text-xs text-neutral-500 mb-2"></div>
-      <textarea id="express-keys-input" rows="3" class="inp log mb-3" placeholder="每行一个 Key；留空 = 保持不变；填写 = 整表覆盖当前列表（多 Key 轮询/随机摊薄限流）"></textarea>
-      <div class="flex items-center justify-between flex-wrap gap-2">
-        <button class="text-xs text-neutral-500 underline" onclick="clearExpressKeys()">清除控制台 Key（回落环境变量）</button>
-        <button class="btn px-4 py-2 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
+      <div class="flex gap-4 border-b border-neutral-200 mb-4 overflow-x-auto">
+        <div class="tab active" data-ctab="express" onclick="switchChanTab('express')">Express API Key</div>
+        <div class="tab" data-ctab="cookie" onclick="switchChanTab('cookie')">Cookie 直连</div>
+        <div class="tab" data-ctab="vertex" onclick="switchChanTab('vertex')">服务账号</div>
+        <div class="tab" data-ctab="hybrid" onclick="switchChanTab('hybrid')">混合自动</div>
       </div>
-    </div>
-    <div id="cookie-box" class="card p-5 hidden">
-      <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
-        <div class="lbl">Google Cookie 账号（可配多个，按轮询/随机选择使用）</div>
-        <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addCookieAccount()">+ 添加账号</button>
+
+      <!-- Express 标签页 -->
+      <div id="ctab-express" class="ctab-pane">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用 <code>VERTEX_EXPRESS_API_KEY</code> 调官方 SDK（可多个，按「多 Key 轮询」开关轮询/随机摊薄限流）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('express')">设为当前策略</button>
+        </div>
+        <div class="lbl mb-2">Express API Key（控制台管理，可多个）</div>
+        <div id="express-keys-summary" class="text-xs text-neutral-500 mb-2"></div>
+        <textarea id="express-keys-input" rows="3" class="inp log mb-3" placeholder="每行一个 Key；留空 = 保持不变；填写 = 整表覆盖当前列表（多 Key 轮询/随机摊薄限流）"></textarea>
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <button class="text-xs text-neutral-500 underline" onclick="clearExpressKeys()">清除控制台 Key（回落环境变量）</button>
+          <button class="btn px-4 py-2 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
+        </div>
       </div>
-      <div id="cookie-accounts"></div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个 Google 账号：粘贴完整 Cookie（含 HttpOnly 字段，支持 Cookie-Editor 导出的 JSON / Header String，自动解析）+ 对应 Project ID。<b>Cookie 输入框留空 = 保持该账号原值不变</b>，只更新 Project ID。多账号时按「多 Key 轮询」开关轮询或随机选号，单账号行为与原来一致。Cookie 过期会自动切换其它可用账号/通道（hybrid 模式）。</p>
-      <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+
+      <!-- Cookie 标签页 -->
+      <div id="ctab-cookie" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用控制台 Cookie 直连 <code>batchGraphql</code>（走网页端配额，可规避 429；见下方风险提示）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('cookie')">设为当前策略</button>
+        </div>
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <div class="lbl">Google Cookie 账号（可配多个，按轮询/随机选择使用）</div>
+          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addCookieAccount()">+ 添加账号</button>
+        </div>
+        <div id="cookie-accounts"></div>
+        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个 Google 账号：粘贴完整 Cookie（含 HttpOnly 字段，支持 Cookie-Editor 导出的 JSON / Header String，自动解析）+ 对应 Project ID。<b>Cookie 输入框留空 = 保持该账号原值不变</b>，只更新 Project ID。多账号时按「多 Key 轮询」开关轮询或随机选号，单账号行为与原来一致。Cookie 过期会自动切换其它可用账号/通道（hybrid 模式）。</p>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+      </div>
+
+      <!-- 服务账号标签页 -->
+      <div id="ctab-vertex" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用 Google Cloud <b>服务账号 JSON</b> 走标准 Vertex AI 认证（Bearer token，OAuth2 JWT-bearer）。项目须<b>开启计费</b>且该服务账号有 <code>aiplatform.user</code> 权限。可配多个账号，按轮询/随机选号。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('vertex')">设为当前策略</button>
+        </div>
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <div class="lbl">服务账号（可配多个，按轮询/随机选择使用）</div>
+          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addSaAccount()">+ 添加账号</button>
+        </div>
+        <div id="sa-accounts"></div>
+        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个服务账号：粘贴完整 <b>SA JSON</b>（含 <code>client_email</code> / <code>private_key</code> / <code>project_id</code>）+ 可选 Project ID 覆盖 + 区域。SA JSON 输入框留空 = 保持该账号原值不变。<b>凭证只回显掩码</b>（client_email + project + location），永不回填 JSON。</p>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限：请妥善保管、只用于本项目、必要时轮换。区域默认 <code>global</code>（多数 Gemini 模型只在 global 提供）。</p>
+      </div>
+
+      <!-- 混合自动标签页 -->
+      <div id="ctab-hybrid" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">混合自动：按下面的优先级顺序尝试，<b>限流/5xx/未出流失败</b>自动切换下一通道；400/401/403 如实报错不切换；任一通道连续失败自动熔断冷却（阈值/冷却见模型参数页）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('hybrid')">设为当前策略</button>
+        </div>
+        <div class="lbl mb-2">参与通道与优先级顺序</div>
+        <div id="hybrid-channels"></div>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">勾选 = 参与混合自动；↑↓ 调整优先级（越靠上越先尝试）；「重试次数」为该通道<b>内部</b>重试上限（留空 = 用全局 <code>retry_max</code>）。熔断在每通道内独立计数。</p>
+
+        <div class="mt-5 border-t border-neutral-100 pt-4">
+          <div class="lbl mb-2">PayGo 流量等级（Express / 服务账号通道）</div>
+          <select id="paygo_tier" class="inp" style="min-width:260px">
+            <option value="auto">auto · global 请求自动 Priority（默认，保持现状）</option>
+            <option value="off">off · 不打层级头</option>
+            <option value="standard">standard · 仅 paygo_only 时打 shared 标记</option>
+            <option value="flex">flex · 允许排队至 30 分钟（仅 global）</option>
+            <option value="priority">priority · 优先调度（仅 global）</option>
+          </select>
+          <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="paygo_only"><span>paygo_only（标准档绕过预配吞吐、纯按量；flex/priority 自带该语义）</span></label>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">这是 ST-Vertex-PayGo 方案融合出的官方「按量共享容量」层级头。Flex/Priority 仅对 <code>location=global</code> 生效，非 global 自动降级并告警；Cookie 通道走 batchGraphql，不受此设置影响。</p>
+        </div>
+
+        <div class="flex justify-end mt-5">
+          <button class="btn px-5 py-2 text-sm" onclick="saveHybridConfig()">💾 保存混合自动配置</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -710,13 +777,22 @@ async function fetchStats(){
 }
 
 /* ---------- Channel ---------- */
-async function updateMode(m){
-  const showKey=(m==='api_key'||m==='express'||m==='hybrid');
-  const showCookie=(m==='web_proxy'||m==='cookie'||m==='hybrid');
-  $('express-key-box').classList.toggle('hidden', !showKey);
-  $('cookie-box').classList.toggle('hidden', !showCookie);
-  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
-  await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+let CHAN_TAB='express';
+function strategyName(s){
+  return s==='vertex' ? '通道 服务账号' : (s==='hybrid' ? '通道 混合自动' : (s==='cookie' ? '通道 Cookie 直连' : '通道 Express API'));
+}
+function switchChanTab(t){
+  CHAN_TAB=t;
+  document.querySelectorAll('[data-ctab]').forEach(e=>e.classList.toggle('active', e.dataset.ctab===t));
+  ['express','cookie','vertex','hybrid'].forEach(v=>$('ctab-'+v).classList.toggle('hidden', v!==t));
+}
+async function setStrategy(s){
+  try{
+    const r=await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:s})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已切换通道策略：'+strategyName(s)); loadRuntime(); }
+    else toast('❌ '+(d.error||'切换失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
 }
 function parseCookies(str){
   str=(str||'').trim();
@@ -796,14 +872,9 @@ async function delCookieAccount(idx){
 async function loadRuntime(){
   try{
     const s=await (await fetch('/api/settings/runtime')).json();
-    const m=s.channel_strategy || (s.use_web_proxy?'web_proxy':'api_key');
-    const radio=document.querySelector(`input[name=mode][value="${m}"]`);
-    if(radio) radio.checked=true;
-    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : (m==='hybrid' ? '通道 混合自动' : '通道 Express API');
-    const showKey=(m==='api_key'||m==='express'||m==='hybrid');
-    const showCookie=(m==='web_proxy'||m==='cookie'||m==='hybrid');
-    $('express-key-box').classList.toggle('hidden', !showKey);
-    $('cookie-box').classList.toggle('hidden', !showCookie);
+    const m=s.channel_strategy || 'express';
+    $('mode-pill').textContent = strategyName(m);
+    $('chan-status').textContent = '当前：'+strategyName(m);
     /* 凭证只回显掩码，绝不回填到输入框（否则保存时会把真实值覆盖成掩码）。
        输入框留空 = 保持现有值；填了才更新。 */
     const keys=s.express_keys||[];
@@ -812,7 +883,122 @@ async function loadRuntime(){
     $('express-keys-summary').textContent='当前生效 '+(keys.length||0)+' 个：'+(keys.join('、')||'（未配置）')+
       (ctrl?'　[控制台管理]':(envN?'　[来自环境变量]':''));
     renderCookieAccounts(s.cookie_accounts||[]);
+    renderSaAccounts(s.sa_accounts||[]);
+    renderHybridConfig(s.hybrid_channels||[], s.channel_retry_overrides||{});
+    if($('paygo_tier')) $('paygo_tier').value=s.paygo_tier||'auto';
+    if($('paygo_only')) $('paygo_only').checked=!!s.paygo_only;
   }catch(e){}
+}
+
+/* ---- 服务账号（第三通道）---- */
+const SA_LOCATIONS=['global','us-central1','us-east1','us-east4','us-west1','us-west4','northamerica-northeast1','southamerica-east1','europe-west1','europe-west4','europe-west8','europe-west9','asia-east1','asia-east2','asia-northeast1','asia-northeast3','asia-southeast1','australia-southeast1'];
+function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function saRowHtml(acc, isNew){
+  const idx=acc?acc.index:-1;
+  const row=document.createElement('div');
+  row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
+  const head=acc
+    ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
+    : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
+  row.innerHTML=head+
+    `<textarea class="inp log mb-2 acc-sa-json" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
+    `<div class="flex flex-wrap gap-2 mb-2">`+
+      `<input class="inp acc-sa-project" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:180px">`+
+      `<select class="inp acc-sa-location">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${acc&&acc.location===l?'selected':''}>${l}</option>`).join('')+`</select>`+
+    `</div>`+
+    `<div class="flex justify-end gap-2">`+
+    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delSaAccount(${idx})">删除</button>`:'')+
+    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveSaRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
+    `</div>`;
+  return row;
+}
+function addSaAccount(){ $('sa-accounts').appendChild(saRowHtml(null,true)); }
+function renderSaAccounts(accounts){
+  const box=$('sa-accounts'); box.innerHTML='';
+  (accounts||[]).forEach(a=>box.appendChild(saRowHtml(a,false)));
+}
+async function saveSaRow(btn, idx){
+  const row=btn.closest('.account-row');
+  const sa=row.querySelector('.acc-sa-json').value.trim();
+  const pid=extractProject(row.querySelector('.acc-sa-project').value);
+  const loc=row.querySelector('.acc-sa-location').value;
+  if(!sa && !pid && idx<0){ toast('新增账号必须粘贴服务账号 JSON'); return; }
+  try{
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,sa_json:sa,project_id:pid,location:loc,delete:false})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存服务账号（当前共 '+d.count+' 个）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function delSaAccount(idx){
+  if(!confirm('确认删除该服务账号？')) return;
+  try{
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,delete:true})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已删除（当前共 '+d.count+' 个）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'删除失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---- 混合自动（3 通道开关 + 优先级 + 每通道重试 + PayGo 层级）---- */
+const CHAN_META={express:'Express API Key',cookie:'Cookie 直连',vertex:'服务账号'};
+function renderHybridConfig(channels, retries){
+  const box=$('hybrid-channels'); if(!box) return;
+  box.innerHTML='';
+  ['express','cookie','vertex'].forEach(c=>{
+    const enabled=(channels||[]).includes(c);
+    const row=document.createElement('div');
+    row.className='account-row border border-neutral-200 rounded-lg p-3 mb-2 flex flex-wrap items-center gap-3';
+    row.innerHTML=
+      `<label class="flex items-center gap-2 text-sm" style="min-width:130px"><input type="checkbox" class="hyb-enable" ${enabled?'checked':''} data-chan="${c}"><span class="font-medium">${CHAN_META[c]}</span></label>`+
+      `<div class="flex items-center gap-1">`+
+        `<button class="px-2 py-1 text-xs rounded border border-neutral-300 hover:bg-neutral-50" onclick="moveChan('${c}',-1)" title="上移优先级">↑</button>`+
+        `<button class="px-2 py-1 text-xs rounded border border-neutral-300 hover:bg-neutral-50" onclick="moveChan('${c}',1)" title="下移优先级">↓</button>`+
+      `</div>`+
+      `<div class="flex items-center gap-2 text-xs text-neutral-500"><span>重试次数</span><input class="inp hyb-retry" data-chan="${c}" placeholder="全局" style="width:72px" value="${(retries||{})[c]!=null?(retries||{})[c]:''}"></div>`+
+      `<span class="text-xs text-neutral-400">${enabled?('第 '+(channels.indexOf(c)+1)+' 位'):'未参与'}</span>`;
+    box.appendChild(row);
+  });
+}
+function _currentHybridOrder(){
+  const out=[];
+  document.querySelectorAll('#hybrid-channels .account-row').forEach(r=>{
+    const cb=r.querySelector('.hyb-enable'); if(cb.checked) out.push(cb.dataset.chan);
+  });
+  return out;
+}
+function moveChan(c, dir){
+  const box=$('hybrid-channels');
+  const rows=[...box.querySelectorAll('.account-row')];
+  const i=rows.findIndex(r=>r.querySelector('.hyb-enable').dataset.chan===c);
+  const j=i+dir;
+  if(i<0||j<0||j>=rows.length) return;
+  box.insertBefore(rows[i], j>i?rows[j].nextSibling:rows[j]);
+  const order=_currentHybridOrder();
+  box.querySelectorAll('.account-row').forEach(r=>{
+    const cb=r.querySelector('.hyb-enable'); const badge=r.querySelector('.text-neutral-400');
+    badge.textContent=cb.checked?('第 '+(order.indexOf(cb.dataset.chan)+1)+' 位'):'未参与';
+  });
+}
+async function saveHybridConfig(){
+  const channels=_currentHybridOrder();
+  if(channels.length===0){ toast('❌ 至少要勾选一个参与通道'); return; }
+  const retries={};
+  document.querySelectorAll('.hyb-retry').forEach(inp=>{
+    const v=inp.value.trim();
+    retries[inp.dataset.chan]= v==='' ? null : Math.max(0,Math.min(50,parseInt(v)||0));
+  });
+  const patch={
+    hybrid_channels:channels,
+    channel_retry_overrides:retries,
+    paygo_tier:$('paygo_tier').value,
+    paygo_only:$('paygo_only').checked,
+  };
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    if(r.ok){ toast('✅ 混合自动配置已保存'); loadRuntime(); }
+    else toast('保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
 }
 
 /* ---------- Params ---------- */
@@ -1115,6 +1301,7 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     cookie = app_state.get_google_cookie()
     accounts = app_state.get_cookie_accounts()
     keys = express_key_manager.express_keys
+    sa_accounts = app_state.get_sa_accounts()
     return JSONResponse(content={
         "channel_strategy": app_state.get_channel_strategy(),
         # 旧前端兼容：布尔开关仍回显
@@ -1133,6 +1320,17 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
              "project_id": a.get("project_id", "")}
             for i, a in enumerate(accounts)
         ],
+        # 服务账号（第三通道）掩码回显：只暴露 client_email + project + location
+        "sa_accounts": [mask_sa_account(a, i) for i, a in enumerate(sa_accounts)],
+        "sa_accounts_controlled": app_state.get_sa_accounts_console() != [],
+        "sa_env_configured": bool(config.VERTEX_SA_JSON or config.VERTEX_SA_FILE),
+        # 混合自动可配置项（hybrid 通道顺序 / 每通道重试覆盖）
+        "hybrid_channels": app_state.get_hybrid_channels(),
+        "channel_retry_overrides": app_state.get_setting(
+            "channel_retry_overrides", config.DEFAULT_SETTINGS["channel_retry_overrides"]),
+        # PayGo 流量等级
+        "paygo_tier": app_state.get_setting("paygo_tier", config.DEFAULT_SETTINGS["paygo_tier"]),
+        "paygo_only": app_state.get_setting("paygo_only", config.DEFAULT_SETTINGS["paygo_only"]),
     })
 
 
@@ -1195,20 +1393,72 @@ async def save_cookie_account(item: CookieAccountItem, _auth: bool = Depends(req
     return JSONResponse(content={"status": "success", "count": len(accounts)})
 
 
+class ServiceAccountItem(BaseModel):
+    index: int = -1          # >=0 更新已有账号；-1 新增
+    sa_json: str = ""        # 留空 = 保持该账号原 SA JSON 不变
+    project_id: str = ""     # 留空 = 取 SA JSON 自身 project_id
+    location: str = "global"
+    delete: bool = False
+
+
+@app.post("/api/sa-account")
+async def save_sa_account(item: ServiceAccountItem, _auth: bool = Depends(require_auth)):
+    """服务账号（第三通道）单行增/改/删（凭证永不明文回显）。"""
+    accounts = app_state.get_sa_accounts_console()
+    loc = (item.location or "global").strip() or "global"
+    new_sa = (item.sa_json or "").strip()
+    pid = (item.project_id or "").strip()
+
+    if item.delete:
+        if 0 <= item.index < len(accounts):
+            removed = accounts.pop(item.index)
+            app_state.set_sa_accounts(accounts)
+            print(f"🔑 [账号管理] 已删除服务账号 #{item.index + 1}。")
+            return JSONResponse(content={"status": "success", "count": len(accounts)})
+        return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
+
+    if 0 <= item.index < len(accounts):
+        if new_sa:
+            v = validate_sa_credentials(new_sa)
+            if not v["valid"]:
+                return JSONResponse(status_code=400, content={"error": v["message"]})
+            accounts[item.index] = {"project_id": pid or v["project_id"], "location": loc, "sa_json": new_sa}
+        else:
+            accounts[item.index] = {
+                **accounts[item.index],
+                "project_id": pid or accounts[item.index].get("project_id", ""),
+                "location": loc,
+            }
+        app_state.set_sa_accounts(accounts)
+        print(f"🔑 [账号管理] 已更新服务账号 #{item.index + 1}（location={loc}）。")
+        return JSONResponse(content={"status": "success", "count": len(accounts)})
+
+    if not new_sa:
+        return JSONResponse(status_code=400, content={"error": "新增账号必须填写服务账号 JSON。"})
+    v = validate_sa_credentials(new_sa)
+    if not v["valid"]:
+        return JSONResponse(status_code=400, content={"error": v["message"]})
+    accounts.append({"project_id": pid or v["project_id"], "location": loc, "sa_json": new_sa})
+    app_state.set_sa_accounts(accounts)
+    print(f"🔑 [账号管理] 已新增服务账号（当前共 {len(accounts)} 个，location={loc}）。")
+    return JSONResponse(content={"status": "success", "count": len(accounts)})
+
+
 @app.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
-    # 前端取值：api_key|web_proxy（旧）/ express|cookie|hybrid（新），统一映射到三档策略
+    # 前端取值：api_key|web_proxy（旧）/ express|cookie|vertex|hybrid（新），统一映射到四档策略
     raw = (setting.mode or "").strip().lower()
     mapping = {
         "api_key": "express",
         "web_proxy": "cookie",
         "express": "express",
         "cookie": "cookie",
+        "vertex": "vertex",
         "hybrid": "hybrid",
     }
     strategy = mapping.get(raw)
     if strategy is None:
-        return JSONResponse(status_code=400, content={"error": "无效的通道模式，应为 express / cookie / hybrid。"})
+        return JSONResponse(status_code=400, content={"error": "无效的通道模式，应为 express / cookie / vertex / hybrid。"})
     if not app_state.set_channel_strategy(strategy):
         return JSONResponse(status_code=400, content={"error": "设置通道策略失败。"})
     return JSONResponse(content={"status": "success", "channel_strategy": strategy})
