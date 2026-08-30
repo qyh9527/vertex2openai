@@ -23,6 +23,7 @@ from config import VERTEX_REASONING_TAG
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
+from anti_truncation import strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk
 
 # 引入报错重试统计器
 from logger import stats
@@ -802,6 +803,7 @@ async def gemini_fake_stream_generator(
     fastapi_request: Optional[Any] = None,
     failover_mode: bool = False,
     channel_name: Optional[str] = None,
+    synthetic_tool_name: Optional[str] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -888,6 +890,9 @@ async def gemini_fake_stream_generator(
         _record_usage(raw_gemini_response)
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
+        if synthetic_tool_name:
+            openai_response_dict = strip_synthetic_from_openai_dict(
+                openai_response_dict, synthetic_tool_name)
         _prepend_prefill(openai_response_dict, prefill_text)
 
         if hasattr(raw_gemini_response, "prompt_feedback") and \
@@ -961,6 +966,7 @@ async def execute_gemini_call(
     failover_mode: bool = False,
     force_fake_streaming: bool = False,
     channel_name: Optional[str] = None,
+    synthetic_tool_name: Optional[str] = None,
 ):
     fallback_client = None
 
@@ -1000,7 +1006,7 @@ async def execute_gemini_call(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
-                    channel_name=channel_name,
+                    channel_name=channel_name, synthetic_tool_name=synthetic_tool_name,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -1043,6 +1049,20 @@ async def execute_gemini_call(
                         async for chunk_item_call in stream_gen_obj:
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
+
+                            # 防截断：剥离合成工具 part，把 content 作为正文 delta 直接输出。
+                            # 合成调用不进入 ToolCallIndexer，finish_reason 判定只反映真实工具；
+                            # 输出过合成正文即置 has_yielded（后续重试/故障转移以此为出流依据）。
+                            if synthetic_tool_name:
+                                chunk_item_call, _syn_contents = strip_synthetic_from_stream_chunk(
+                                    chunk_item_call, 0, synthetic_tool_name)
+                                if _syn_contents:
+                                    has_yielded = True
+                                    for _sc in _syn_contents:
+                                        _syn_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
+                                        yield f"data: {json.dumps(_syn_payload, ensure_ascii=False)}\n\n"
+                            if chunk_item_call is None:
+                                continue
 
                             # 支持 n>1：按候选序号逐个输出
                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
@@ -1241,5 +1261,8 @@ async def execute_gemini_call(
         _record_usage(response_obj_call)
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
+        if synthetic_tool_name:
+            openai_response_content = strip_synthetic_from_openai_dict(
+                openai_response_content, synthetic_tool_name)
         _prepend_prefill(openai_response_content, prefill_text)
         return JSONResponse(content=openai_response_content)

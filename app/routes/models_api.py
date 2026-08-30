@@ -2,22 +2,16 @@ import time
 from fastapi import APIRouter, Depends, Request
 from typing import List, Dict, Any, Set
 from auth import get_api_key
-from model_loader import get_express_models, refresh_models_config_cache
+from model_loader import get_express_models
 from runtime_state import app_state
 
 router = APIRouter()
-_last_model_fetch_time = 0
 
 
 @router.get("/v1/models")
 async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_key)):
-    global _last_model_fetch_time
-
-    current_time = time.time()
-    if current_time - _last_model_fetch_time > 3600:
-        await refresh_models_config_cache()
-        _last_model_fetch_time = current_time
-
+    # 不再自动从远程刷新模型配置（曾每 3600s 自动拉取）——远程获取改为控制台
+    # 「获取远程模型」按钮手动触发；这里用磁盘缓存 + 控制台自定义模型列表。
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
     
     # 动态放行：开启 Cookie 直连 / 服务账号 / 混合策略，或配置有 Express API Key，

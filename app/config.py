@@ -98,6 +98,11 @@ DEFAULT_SETTINGS = {
     # 不含 429 限流——连接本身健康）≥ 该值即自动舍弃，下次请求重建连接池；0 = 永不自动舍弃。
     "client_reuse": True,
     "client_reuse_evict_threshold": 5,
+    # ===== 防截断合成传输协议（可选，见 anti_truncation.py）=====
+    # anti_truncation_field：下游请求体启用字段名（默认 "anti_truncation"）。
+    # 请求体带该字段且为 true 即对本请求启用防截断包装（模型回答改走合成工具参数输出，
+    # 绕开重提示词场景下的截断）。字段名可自定义以兼容不同客户端/避免撞名。
+    "anti_truncation_field": "anti_truncation",
     # ===== 第三通道：服务账号（Vertex SA，标准 Vertex AI 认证）=====
     # 混合自动的可配置行为（hybrid 策略下生效）：
     #   hybrid_channels          参与混合自动的通道及优先级顺序（有序列表，只取存在的通道键）

@@ -14,7 +14,7 @@ from auth import get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 
-from logger import rt_logger, stats
+from logger import rt_logger, stats, read_recent_log_lines
 import config
 from runtime_state import app_state
 import model_capabilities as mc
@@ -28,7 +28,6 @@ express_key_manager = ExpressKeyManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from model_loader import refresh_models_config_cache
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
@@ -46,7 +45,6 @@ async def lifespan(app: FastAPI):
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
         print("⚠️ [密钥配置] 未检测到 VERTEX_EXPRESS_API_KEY。若不启用 Cookie 直连模式，聊天请求将会报错。")
-    await refresh_models_config_cache()
     yield
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
@@ -273,6 +271,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#dcdce3;border-radius:8px}
   ::-webkit-scrollbar-thumb:hover{background:#c0c0ca}
   .toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--fg); color:#fff; padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:.25s; pointer-events:none; z-index:50; }
+  .modal-mask{position:fixed;inset:0;background:rgba(15,15,20,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
+  .modal-card{background:#fff;border-radius:14px;width:min(560px,94vw);max-height:82vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.2)}
   .toast.show { opacity:1; }
   .switch { position:relative; width:40px; height:22px; }
   .switch input{opacity:0;width:0;height:0}
@@ -346,11 +346,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="w-36 h-36"><canvas id="donut"></canvas></div>
       </div>
       <div class="card p-5 md:col-span-2">
-        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 已持久化（重建容器不丢）· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
         <div class="space-y-4">
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
           <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
+          <div class="pt-3 border-t border-neutral-100">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs text-neutral-500">每日 Token 趋势</span>
+              <div class="flex gap-1 text-xs">
+                <button class="px-2 py-0.5 rounded border border-neutral-200" id="range7" onclick="renderTrend(7)">7 天</button>
+                <button class="px-2 py-0.5 rounded border border-neutral-200" id="range30" onclick="renderTrend(30)">30 天</button>
+              </div>
+            </div>
+            <div id="trend-chart" class="flex items-end gap-1 h-24"></div>
+            <div id="trend-empty" class="text-xs text-neutral-400 py-1">暂无历史数据</div>
+          </div>
         </div>
       </div>
     </div>
@@ -462,6 +473,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="flex items-center gap-2 mt-3 flex-wrap">
         <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
         <button id="btn-scope-clear" class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
+        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="refreshRemoteModels(event)">🌐 获取远程模型</button>
+        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="openModelEditor()">📝 编辑模型</button>
         <span id="ov-hint" class="text-xs text-neutral-500"></span>
       </div>
     </div>
@@ -666,6 +679,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- 防截断合成传输协议 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">防截断（Anti-Truncation）</div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between"><span class="text-sm">启用字段名<span class="helpq" onclick="hlp(this,'h_ant')">?</span></span><input id="anti_truncation_field" type="text" class="inp" style="width:190px"></div>
+          <div id="h_ant" class="helpbox"><b>是什么</b>：重提示词场景（酒馆复杂预设/角色卡/超长历史）下模型回答经常被 <code>max_output_tokens</code> 提前截断、丢尾巴坏格式。开启后，代理给请求注入一个请求级唯一的<b>合成传输工具</b>（<code>v2o_emit_&lt;随机数&gt;</code>），指示模型把<b>最终可见回答放进该工具调用的 content 参数输出</b>（Function Call 通道），从而绕开普通文本生成通道的截断；代理收到响应后<b>解构还原为标准 assistant.content</b>，对客户端完全透明，真实工具调用原样保留。<br><br><b>怎么用</b>：下游请求体加「启用字段名」字段（默认 <code>anti_truncation</code>）置 <code>true</code>，即对该请求启用；不启用时完全不影响。字段名可改成客户端不冲突的名字。<br><br><b>注意事项</b>：仅对文本/Chat 模型生效（生图/音频等自动忽略）；需要模型支持工具调用；与 <code>tool_choice=none</code> 冲突时以 <code>auto</code> 覆盖（否则合成工具不会被调用、防截断失效）；回答以工具参数整体输出、首字比普通流式略慢；不同模型对"工具输出"的截断保护效果不同，若发现仍被截断可配合调大「默认输出上限」。</div>
+        </div>
+      </div>
+
       <!-- 开关 -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
@@ -733,12 +755,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
         <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
         <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
+        <button id="autoscroll-btn" onclick="toggleAutoScroll()" class="ml-auto text-xs px-2 py-1 rounded border border-neutral-200">📌 自动滚动</button>
       </div>
       <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
     </div>
   </section>
 </div>
 <div id="toast" class="toast"></div>
+
+<!-- 编辑模型列表弹窗 -->
+<div id="model-editor" class="modal-mask hidden" onclick="if(event.target===this)closeModelEditor()">
+  <div class="modal-card">
+    <div class="px-5 py-3 border-b border-neutral-200 flex items-center justify-between">
+      <div class="font-semibold text-sm">编辑模型列表</div>
+      <button class="text-neutral-400 hover:text-neutral-700 text-lg leading-none" onclick="closeModelEditor()">×</button>
+    </div>
+    <div class="p-4 overflow-y-auto space-y-3">
+      <div class="flex gap-2">
+        <input id="me-new-model" type="text" class="inp" placeholder="输入模型名，如 gemini-2.5-flash" style="flex:1" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <button class="btn px-4 py-2 text-sm" onclick="addCustomModel()">添加</button>
+      </div>
+      <div class="text-xs text-neutral-500 leading-relaxed">自定义模型会出现在 <code>/v1/models</code> 与下方模型下拉里，本机持久化（重建容器不丢）。<b>远程/本地模型</b>来自配置缓存，用「获取远程模型」按钮刷新。</div>
+      <div id="me-list" class="space-y-1"></div>
+    </div>
+    <div class="px-5 py-3 border-t border-neutral-200 flex justify-end">
+      <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300" onclick="closeModelEditor()">关闭</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -764,6 +808,27 @@ function renderChart(s,e,r){
   if(chart){ chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors; chart.update(); return; }
   chart=new Chart(ctx,{type:'doughnut',data:{labels:['成功','错误','重试'],datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff'}]},options:{cutout:'72%',plugins:{legend:{display:false}}}});
 }
+let DAILY=[]; let TREND_RANGE=7;
+function setTrendBtn(){
+  ['range7','range30'].forEach(id=>{ const b=$(id); if(!b) return; const on=(id==='range'+TREND_RANGE); b.style.background=on?'#111':''; b.style.color=on?'#fff':''; });
+}
+function renderTrend(days){
+  if(days) TREND_RANGE=days;
+  const c=$('trend-chart'); if(!c) return;
+  setTrendBtn();
+  const last=DAILY.slice(-TREND_RANGE);
+  const maxV=Math.max(1,...last.map(d=>(d.prompt_tokens||0)+(d.completion_tokens||0)));
+  c.innerHTML='';
+  const empty=$('trend-empty'); if(empty) empty.style.display=last.length?'none':'block';
+  last.forEach(d=>{
+    const v=(d.prompt_tokens||0)+(d.completion_tokens||0);
+    const hgt=Math.max(3,Math.round(v/maxV*88));
+    const cell=document.createElement('div');
+    cell.className='flex-1 flex flex-col items-center gap-1 min-w-0';
+    cell.innerHTML=`<div class="w-full bg-neutral-800 rounded-t" style="height:${hgt}px" title="${d.date} · ${fmt(v)} tokens · ${d.requests||0} 请求"></div><div class="text-[9px] text-neutral-400 truncate w-full text-center">${d.date.slice(5)}</div>`;
+    c.appendChild(cell);
+  });
+}
 async function fetchStats(){
   try{
     const d=await (await fetch('/api/stats')).json();
@@ -772,6 +837,7 @@ async function fetchStats(){
     $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
     $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
+    DAILY=d.daily||[]; renderTrend();
     renderChart(d.success,d.error,d.retries);
   }catch(e){}
 }
@@ -1008,7 +1074,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -1024,6 +1090,54 @@ async function loadParams(){
       + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
     renderCaps();
   }catch(e){}
+}
+// ---------- 模型管理：获取远程 / 编辑弹窗 ----------
+let ME_CUSTOM=[];
+async function refreshRemoteModels(ev){
+  const btn=ev.target; const old=btn.textContent; btn.disabled=true; btn.textContent='获取中…';
+  try{
+    const r=await fetch('/api/models/refresh',{method:'POST'});
+    const d=await r.json();
+    toast(d.ok?`🌐 已获取 ${(d.models||[]).length} 个模型`:'⚠️ 远程获取失败（已回退本地/磁盘配置）');
+    await loadParams();
+  }catch(e){ toast('❌ 网络请求失败'); }
+  btn.disabled=false; btn.textContent=old;
+}
+async function openModelEditor(){
+  try{
+    const d=await (await fetch('/api/models/manage')).json();
+    ME_CUSTOM=d.custom||[];
+    const custom=new Set(ME_CUSTOM);
+    const list=$('me-list');
+    list.innerHTML=(d.models||[]).map(m=>{
+      const isCustom=custom.has(m);
+      const del=isCustom?`<button class="text-xs px-2 py-0.5 rounded border border-neutral-200 text-rose-600 hover:bg-rose-50" data-m="${m}" onclick="delCustomModel(this)">删除</button>`:'';
+      return `<div class="flex items-center justify-between gap-2 px-3 py-1.5 rounded border border-neutral-100 bg-neutral-50/60"><span class="text-sm truncate">${m}${isCustom?' <span class="text-[10px] text-neutral-400">自定义</span>':''}</span>${del}</div>`;
+    }).join('')||'<div class="text-xs text-neutral-400 py-2">暂无模型</div>';
+    $('me-new-model').value='';
+    $('model-editor').classList.remove('hidden');
+  }catch(e){ toast('❌ 加载模型列表失败'); }
+}
+function closeModelEditor(){ $('model-editor').classList.add('hidden'); }
+async function saveCustomModels(){
+  try{
+    const r=await fetch('/api/models/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:ME_CUSTOM})});
+    if(!r.ok) throw new Error('bad');
+    await loadParams();
+    return true;
+  }catch(e){ toast('❌ 保存失败'); return false; }
+}
+async function addCustomModel(){
+  const v=$('me-new-model').value.trim();
+  if(!v){ toast('请输入模型名'); return; }
+  if(ME_CUSTOM.includes(v)){ toast('该模型已存在'); return; }
+  ME_CUSTOM.push(v);
+  if(await saveCustomModels()){ $('me-new-model').value=''; openModelEditor(); }
+}
+async function delCustomModel(btn){
+  const name=btn.dataset.m;
+  ME_CUSTOM=ME_CUSTOM.filter(m=>m!==name);
+  if(await saveCustomModels()) openModelEditor();
 }
 // 按所选模型把“可覆盖的 7 个参数字段”填成：有专属值用专属，否则回退全局
 function applyModelParamFields(model){
@@ -1175,6 +1289,7 @@ async function saveSettings(){
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
     client_reuse:$('client_reuse').checked,
     client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
+    anti_truncation_field:($('anti_truncation_field').value||'').trim() || 'anti_truncation',
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
@@ -1206,7 +1321,13 @@ async function saveSettings(){
 
 /* ---------- Logs ---------- */
 const logwin=$('logwin'); let autoscroll=true;
-logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
+logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; syncAutoBtn(); });
+function syncAutoBtn(){ const b=$('autoscroll-btn'); if(b){ b.style.background=autoscroll?'#111':''; b.style.color=autoscroll?'#fff':''; } }
+function toggleAutoScroll(){
+  autoscroll=!autoscroll; syncAutoBtn();
+  if(autoscroll && logwin) logwin.scrollTop=logwin.scrollHeight;
+}
+syncAutoBtn();
 function logLine(t){
   let c='#525252',bg='transparent',bl='2px solid transparent';
   if(t.includes('✅')||t.includes('🎉')){c='#0369a1';bl='2px solid #38bdf8';}
@@ -1494,6 +1615,32 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
 
 
+@app.post("/api/models/refresh")
+async def refresh_models_manual_api(_auth: bool = Depends(require_auth)):
+    """控制台「获取远程模型」：手动拉取远程模型配置并持久化到磁盘（不再自动获取）。"""
+    from model_loader import refresh_models_config_cache, get_express_models
+    ok = await refresh_models_config_cache()
+    models = await get_express_models()
+    return JSONResponse(content={"ok": ok, "models": models})
+
+
+@app.get("/api/models/manage")
+async def list_models_manage_api(_auth: bool = Depends(require_auth)):
+    """模型管理数据：全部模型（含自定义）+ 自定义列表（供「编辑模型」弹窗）。"""
+    models = await get_express_models()
+    return JSONResponse(content={"models": models, "custom": app_state.get_custom_models()})
+
+
+class CustomModelsBody(BaseModel):
+    models: list = []
+
+
+@app.post("/api/models/custom")
+async def set_custom_models_api(body: CustomModelsBody, _auth: bool = Depends(require_auth)):
+    app_state.set_custom_models(body.models)
+    return JSONResponse(content={"custom": app_state.get_custom_models()})
+
+
 # ==========================================
 # 按模型参数覆盖（per-model overrides）
 # ==========================================
@@ -1555,6 +1702,9 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
     async def log_generator():
+        # 先补发持久化日志的历史尾部，重建容器后前端也能看到此前的日志；再走实时流。
+        for msg in read_recent_log_lines(200):
+            yield f"data: {msg}\n\n"
         q = rt_logger.subscribe()
         try:
             for msg in rt_logger.snapshot_history():

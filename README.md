@@ -32,7 +32,9 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - 标准模式 / Cookie 直连 / 服务账号 / **混合自动（三通道故障转移）** 在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
-  - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（Cookie 私有接口通常不返回可靠用量）。
+  - **实时监控**：运行日志推流（含**持久化历史回放** + 「📌 自动滚动」开关）、健康度图表（成功/错误/拥堵重试）、**Token 用量统计已持久化**（`STATE_DIR/stats.json`，重建容器不丢）+ **每日趋势柱状图**（7/30 天切换）。Cookie 私有接口通常不返回可靠用量，token 统计仅标准 Express / 服务账号通道计入。
+  - **防截断（Anti-Truncation）**：下游请求体加 `"anti_truncation": true`（字段名可在控制台自定义）即对**该请求**启用"合成传输工具"包装——指示模型把最终回答放进工具参数输出，绕开重提示词场景（酒馆复杂预设/长历史）下的回答截断，代理透明还原为 `assistant.content`，真实工具调用不受影响（仅文本/Chat 模型适用）。
+  - **模型列表手动管理**：模型列表**不再自动拉取**远程配置（曾启动时 + `/v1/models` 每 3600s 自动刷新）；控制台「🌐 获取远程模型」手动刷新（结果持久化到磁盘）、「📝 编辑模型」弹窗添加/删除**自定义模型**（持久化，合并进 `/v1/models`）。
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
@@ -338,12 +340,13 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 模型列表配置
 
-> ⚠️ **先看这条**：模型列表**默认从远程拉取** —— `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json`，只有远程全部地址都不可用时才回退到镜像里的本地 `vertexModels.json`。
-> 所以**只改本地文件（或只更新镜像）通常看不到新模型**，必须二选一：
-> 1. 把更新后的 `vertexModels.json` 推到 GitHub `main`（推荐，改远程即可全部部署生效、无需重部署）；
-> 2. 或设环境变量 `MODELS_CONFIG_URL` 指向你自己维护的地址。
+> ⚠️ **行为变更（2026-08 起）**：模型列表**不再自动从远程拉取**（曾于启动时与 `/v1/models` 每 3600s 自动刷新）。加载顺序为 **内存缓存 → 磁盘缓存 `STATE_DIR/models.json` → 本地 `vertexModels.json` → 空**。
+>
+> - **升级后首次使用**：在控制台「选择模型」区点 **🌐 获取远程模型**（拉取远程配置并持久化到磁盘），或点 **📝 编辑模型** 手动添加自定义模型。
+> - **自定义模型**持久化在 `web_state.json`，重建容器不丢，会合并进 `/v1/models` 与模型下拉（`fake-` / `-search` 变体自动生成）。
+> - 远程地址仍为 `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json`（可设环境变量 `MODELS_CONFIG_URL` 覆盖）；**只有手动点击「获取远程模型」时才会访问远程**。
 
-默认模型列表在远程 `MODELS_CONFIG_URL` 或本地 `vertexModels.json`：
+默认模型列表（本地 `vertexModels.json` 或远程配置）：
 
 ```json
 {
@@ -367,7 +370,7 @@ curl http://localhost:8050/v1/chat/completions \
 > - `gemini-3-flash-preview`：官方推荐替代为 `gemini-3.5-flash`，但**该模型目前仍可正常调用**（2026-07-26 用 Express Key 实机验证通过），因此**保留在默认清单中**；待官方正式停用后再移除。
 > - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
-`/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型只需把 ID 加进此列表即可（能力自动归类，无需改代码）。
+`/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型在控制台「📝 编辑模型」添加即可（能力自动归类，无需改代码）。
 
 ---
 
@@ -482,7 +485,7 @@ git push origin main         # 推送后 GHCR CI 自动重新构建镜像
 
 ## 后续升级与扩展
 
-- **新增模型**：把模型 ID 加入 `vertexModels.json`（或远程 `MODELS_CONFIG_URL`）。`model_capabilities.py` 按**家族/版本模式**自动归类（思考方式、采样裁剪、生图比例/分辨率、预填充），**未知/未来型号按"最新代"前向安全处理**。基本即插即用。
+- **新增模型**：控制台「📝 编辑模型」弹窗直接添加（持久化、即时生效），或改本地 `vertexModels.json` / 远程 `MODELS_CONFIG_URL` 后在控制台「🌐 获取远程模型」刷新。`model_capabilities.py` 按**家族/版本模式**自动归类（思考方式、采样裁剪、生图比例/分辨率、预填充），**未知/未来型号按"最新代"前向安全处理**。基本即插即用。
 - **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均可复用），新增一个 `InteractionsUpstream` 并在路由层接入即可。
 
   现状（核对于 2026-07-26）：

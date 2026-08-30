@@ -148,3 +148,5 @@ pids/
 # Project-specific planning files
 refactoring_plan.md
 multiple_credentials_implementation.md
+# 本地自用状态文档（会话交接用），不入库
+PROJECT_SUMMARY.md

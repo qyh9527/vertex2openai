@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -18,6 +19,8 @@ _LOCAL_MODEL_FILE_CANDIDATES = [
     Path(__file__).resolve().parent / "vertexModels.json",
     Path(__file__).resolve().parent.parent / "vertexModels.json",
 ]
+
+_MODELS_DISK_FILE = os.path.join(os.environ.get("STATE_DIR", "."), "models.json")
 
 
 def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
@@ -92,30 +95,78 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
 
 
 async def get_models_config() -> Dict[str, List[str]]:
+    """模型配置：内存缓存 → 磁盘缓存（STATE_DIR/models.json）→ 本地 vertexModels.json → 空。
+
+    不再自动从远程拉取（曾于启动时与 /v1/models 每 3600s 自动刷新）；远程获取改为
+    控制台「获取远程模型」按钮手动触发（refresh_models_config_cache，结果持久化到磁盘）。
+    """
     global _model_cache
     async with _cache_lock:
         if _model_cache is None:
-            print("📦 [模型配置] 缓存为空，正在初始化模型列表。")
-            _model_cache = await fetch_and_parse_models_config()
+            _model_cache = _load_disk_cache()
             if _model_cache is None:
-                print("⚠️ [模型配置] 模型配置初始化失败，当前模型列表为空。")
+                print("📦 [模型配置] 磁盘缓存为空，回退本地 vertexModels.json。")
+                _model_cache = _load_local_models_config()
+            if _model_cache is None:
                 _model_cache = {"models": []}
     return _model_cache
 
 
 async def get_express_models() -> List[str]:
+    """远程/本地配置模型 + 控制台自定义模型合并（去重保序）。"""
     config = await get_models_config()
-    return config.get("models", [])
+    remote = config.get("models", [])
+    try:
+        from runtime_state import app_state
+        custom = app_state.get_custom_models()
+    except Exception:
+        custom = []
+    seen = set()
+    merged = []
+    for name in list(remote) + list(custom):
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return merged
 
 
 async def refresh_models_config_cache() -> bool:
+    """手动从远程获取模型配置（控制台按钮触发）并持久化到磁盘。"""
     global _model_cache
-    print("🔄 [模型配置] 正在刷新模型配置缓存。")
+    print("🔄 [模型配置] 正在从远程获取模型配置（控制台手动触发）。")
     async with _cache_lock:
         new_config = await fetch_and_parse_models_config()
         if new_config is not None:
             _model_cache = new_config
-            print("✅ [模型配置] 模型配置缓存刷新成功。")
+            _save_disk_cache(new_config)
+            print(f"✅ [模型配置] 模型配置已刷新并持久化，共 {len(new_config.get('models', []))} 个模型。")
             return True
-        print("❌ [模型配置] 模型配置缓存刷新失败。")
+        print("❌ [模型配置] 模型配置刷新失败。")
         return False
+
+
+def _load_disk_cache() -> Optional[Dict[str, List[str]]]:
+    """从 STATE_DIR/models.json 读取上次手动获取的模型配置。"""
+    try:
+        if os.path.exists(_MODELS_DISK_FILE):
+            with open(_MODELS_DISK_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            normalized = _normalize_models_config(data)
+            if normalized is not None:
+                print(f"📦 [模型配置] 已从磁盘缓存加载 {len(normalized['models'])} 个模型：{_MODELS_DISK_FILE}")
+                return normalized
+            print(f"⚠️ [模型配置] 磁盘缓存结构无效：{_MODELS_DISK_FILE}")
+    except Exception as exc:
+        print(f"⚠️ [模型配置] 磁盘缓存读取失败：{exc}")
+    return None
+
+
+def _save_disk_cache(config: Dict[str, List[str]]) -> None:
+    """原子写模型配置到 STATE_DIR/models.json（临时文件 + rename）。"""
+    try:
+        tmp = _MODELS_DISK_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _MODELS_DISK_FILE)
+    except Exception as exc:
+        print(f"⚠️ [模型配置] 磁盘缓存写入失败：{exc}")

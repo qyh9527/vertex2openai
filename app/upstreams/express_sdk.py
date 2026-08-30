@@ -23,6 +23,7 @@ from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
+from anti_truncation import is_enabled_for_request, inject_request
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -412,6 +413,17 @@ class ExpressSDKUpstream(BaseUpstream):
             if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
+        # 防截断合成传输协议（可选单请求启用）：请求体带启用字段即注入合成工具 + 控制消息。
+        # 注入必须在 create_generation_config 之前（合成工具声明要进 generationConfig）、
+        # 在预填充处理之后（控制消息作为末尾 user，不与预填充兼容逻辑打架）。
+        synthetic_tool_name = None
+        if is_enabled_for_request(request_obj):
+            if is_image_model:
+                print("ℹ️ [防截断] 生图/非文本模型不支持，已忽略该请求的启用字段。")
+            else:
+                request_obj, synthetic_tool_name = inject_request(request_obj)
+                print(f"🔧 [防截断] 已注入合成传输工具 {synthetic_tool_name}（回答改走工具参数输出，绕开截断）。")
+
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
                                                  prefill_active=prefill_active)
@@ -449,4 +461,5 @@ class ExpressSDKUpstream(BaseUpstream):
             fallback_model=fallback_model,
             fallback_client_factory=fallback_client_factory,
             channel_name=self.channel_name,
+            synthetic_tool_name=synthetic_tool_name,
         )

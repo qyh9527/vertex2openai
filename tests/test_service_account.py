@@ -269,3 +269,27 @@ class TestResolveClient:
                              messages=[{"role": "user", "content": "hi"}])
         await up.chat_completions(req2, object())
         assert captured["model"] == "gemini-3.6-flash"
+
+    async def test_fake_prefix_passed_to_parent(self, monkeypatch):
+        """fake- 前缀在服务账号通道不被吞：原样透传给父类管线（父类剥前缀并强制假流式）。
+
+        ServiceAccountUpstream 只处理 [PAY] 旧前缀，其余模型名（含 fake-）完整交给
+        ExpressSDKUpstream.chat_completions——_normalize_model_name 在那里剥 fake- 并置
+        is_fake → execute_gemini_call(force_fake_streaming=True)。fake 兼容服务账号由此成立。
+        """
+        from models import OpenAIRequest
+        from upstreams.express_sdk import ExpressSDKUpstream
+        captured = {}
+
+        async def fake_super(self, request_obj, fastapi_request, failover_mode=False):
+            captured["model"] = request_obj.model
+            return "ok"
+
+        monkeypatch.setattr(ExpressSDKUpstream, "chat_completions", fake_super)
+        up = ServiceAccountUpstream()
+        req = OpenAIRequest(model="fake-gemini-3.6-flash",
+                            messages=[{"role": "user", "content": "hi"}])
+        result = await up.chat_completions(req, object())
+        assert result == "ok"
+        # 到达父类时仍是完整 fake- 模型名，前缀剥离与假流式判定由父类统一负责
+        assert captured["model"] == "fake-gemini-3.6-flash"

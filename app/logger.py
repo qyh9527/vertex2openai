@@ -1,4 +1,5 @@
 import builtins
+import json
 import logging
 import os
 import time
@@ -41,6 +42,14 @@ file_logger = _setup_file_logger()
 
 
 class ProxyStats:
+    """算力消耗统计：内存累计 + 持久化到 STATE_DIR/stats.json（重建容器不丢）。
+
+    设计（参考 new-api / one-api / LiteLLM 等网关的用量追踪做法，适配单实例 JSON 落盘）：
+      - 每次请求把 prompt/completion tokens 与请求数累加到内存，并写入"当天"的按天聚合；
+      - 写盘节流（默认 30s 一次，原子写临时文件 + rename），启动时从磁盘恢复历史；
+      - 前端展示累计数字 + 最近 7/30 天趋势柱状图。
+    """
+
     def __init__(self):
         self.start_time = time.time()
         self.total_requests = 0
@@ -49,38 +58,129 @@ class ProxyStats:
         self.retry_counts = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._daily = {}          # "YYYY-MM-DD" -> {requests, success, prompt_tokens, completion_tokens}
+        self._last_save = 0.0
         self.lock = threading.Lock()
+        self._load_from_disk()
+
+    # ---------- 持久化 ----------
+
+    def _today_key(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
+    def _load_from_disk(self):
+        """启动时恢复历史统计（与 web_state.json 同目录、同在挂载卷内）。"""
+        try:
+            if not os.path.exists(STATS_FILE):
+                return
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            t = data.get("total") or {}
+            self.total_requests = int(t.get("requests", 0))
+            self.success_requests = int(t.get("success", 0))
+            self.error_requests = int(t.get("error", 0))
+            self.retry_counts = int(t.get("retries", 0))
+            self.prompt_tokens = int(t.get("prompt_tokens", 0))
+            self.completion_tokens = int(t.get("completion_tokens", 0))
+            daily = data.get("daily") or {}
+            if isinstance(daily, dict):
+                self._daily = {k: dict(v) for k, v in daily.items() if isinstance(v, dict)}
+            print(f"📊 [用量统计] 已恢复历史：请求 {self.total_requests} 次，"
+                  f"累计 {self.prompt_tokens + self.completion_tokens} tokens，"
+                  f"按天记录 {len(self._daily)} 天。")
+        except Exception as e:
+            print(f"⚠️ [用量统计] 历史统计加载失败（不影响运行）：{e}")
+
+    def _save(self):
+        """原子写 stats.json（临时文件 + rename）。"""
+        try:
+            payload = {
+                "version": 1,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total": {
+                    "requests": self.total_requests,
+                    "success": self.success_requests,
+                    "error": self.error_requests,
+                    "retries": self.retry_counts,
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": self.completion_tokens,
+                },
+                "daily": self._daily,
+            }
+            tmp = STATS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATS_FILE)
+            try:
+                os.chmod(STATS_FILE, 0o600)
+            except OSError:
+                pass
+        except Exception as e:
+            print(f"⚠️ [用量统计] 落盘失败（不影响运行）：{e}")
+
+    def _touch_daily(self, prompt=0, completion=0, success=0, request=0):
+        key = self._today_key()
+        day = self._daily.setdefault(
+            key, {"requests": 0, "success": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        day["requests"] += request
+        day["success"] += success
+        day["prompt_tokens"] += prompt
+        day["completion_tokens"] += completion
+        # 只保留最近 180 天，防止无界增长
+        if len(self._daily) > 180:
+            for k in sorted(self._daily)[:len(self._daily) - 180]:
+                self._daily.pop(k, None)
+
+    def _maybe_save(self):
+        """节流写盘（默认 30s 一次），避免每个请求都做一次磁盘 IO。"""
+        now = time.time()
+        if now - self._last_save < STATS_SAVE_INTERVAL:
+            return
+        self._last_save = now
+        self._save()
+
+    def _flush(self):
+        """立即落盘（进程退出/测试用）。"""
+        with self.lock:
+            self._last_save = time.time()
+            self._save()
+
+    # ---------- 累加 ----------
 
     def increment_total(self):
         with self.lock:
             self.total_requests += 1
+            self._touch_daily(request=1)
+            self._maybe_save()
 
     def add_error(self):
         with self.lock:
             self.error_requests += 1
-
-    def add_request(self, success=True, is_error=False):
-        with self.lock:
-            if is_error:
-                self.error_requests += 1
+            self._maybe_save()
 
     def add_retry(self):
         with self.lock:
             self.retry_counts += 1
+            self._maybe_save()
 
     def add_success(self):
         """直接计一次成功请求（Cookie 通道不产生 token 统计行，成功数单独计入）。"""
         with self.lock:
             self.success_requests += 1
+            self._touch_daily(success=1)
+            self._maybe_save()
 
     def add_tokens(self, p_tokens, c_tokens):
         with self.lock:
             self.prompt_tokens += p_tokens
             self.completion_tokens += c_tokens
             self.success_requests += 1
+            self._touch_daily(prompt=p_tokens, completion=c_tokens, success=1)
+            self._maybe_save()
 
     def get_json_stats(self):
         with self.lock:
+            daily = [{"date": d, **(self._daily[d] or {})} for d in sorted(self._daily)]
             return {
                 "uptime": round(time.time() - self.start_time, 2),
                 "total": self.total_requests,
@@ -89,7 +189,13 @@ class ProxyStats:
                 "retries": self.retry_counts,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
+                "daily": daily,
             }
+
+
+# 用量统计持久化文件（与 web_state.json 同目录、同在挂载卷内，重建容器不丢）
+STATS_FILE = os.path.join(os.environ.get("STATE_DIR", "."), "stats.json")
+STATS_SAVE_INTERVAL = 30   # 秒：统计落盘节流间隔
 
 
 stats = ProxyStats()
@@ -164,6 +270,31 @@ class SSELogger:
 
 
 rt_logger = SSELogger()
+
+
+def read_recent_log_lines(n: int = 200) -> List[str]:
+    """读取持久化日志文件（STATE_DIR/vertex2openai.log）尾部 n 行。
+
+    前端「运行日志」页初始加载时用它展示历史（重建容器后也能看到此前落盘的日志），
+    之后再订阅实时流。文件不存在/读取失败时返回空列表，不影响运行。
+    """
+    path = os.path.join(os.environ.get("STATE_DIR", "."), "vertex2openai.log")
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = min(size, 256 * 1024)
+            f.seek(size - block)
+            tail = f.read(block)
+            lines = tail.splitlines()
+            if len(lines) < n and size > block:
+                f.seek(max(0, size - 2 * block))
+                lines = f.read().splitlines()
+            return lines[-n:]
+    except Exception:
+        return []
 
 # 防止 print 钩子内部再触发 print 导致递归
 _in_hook = threading.local()

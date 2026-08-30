@@ -326,6 +326,32 @@ class AppState:
         print(f"🔑 [状态管理器] 已保存 {len(clean)} 个服务账号。")
         return clean
 
+    # ---------- 自定义模型列表（控制台可编辑，合并进模型列表） ----------
+
+    def get_custom_models(self) -> list:
+        """控制台添加的自定义模型名（持久化；合并进 /v1/models 与控制台模型下拉）。"""
+        with self._lock:
+            models = self._state.get("custom_models")
+            if isinstance(models, list):
+                return [str(m).strip() for m in models if str(m).strip()]
+        return []
+
+    def set_custom_models(self, models: list) -> list:
+        """整表覆盖保存自定义模型列表（去空、去重）。"""
+        clean = []
+        seen = set()
+        for m in (models or []):
+            name = str(m).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            clean.append(name)
+        with self._lock:
+            self._state["custom_models"] = clean
+            self._save()
+        print(f"🔧 [状态管理器] 已保存 {len(clean)} 个自定义模型。")
+        return clean
+
     def get_current_sa_account(self) -> tuple:
         """取本次请求使用的服务账号（请求级快照，同 Cookie 账号机制）。
 
