@@ -805,7 +805,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
         <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
         <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
-        <button id="autoscroll-btn" onclick="toggleAutoScroll()" class="ml-auto text-xs px-2 py-1 rounded border border-neutral-200">📌 自动滚动</button>
+        <button id="clear-log-btn" onclick="clearLogView()" class="ml-auto text-xs px-2 py-1 rounded border border-neutral-200" title="清空当前界面显示（不影响磁盘日志与实时流）">🧹 清空</button>
+        <button id="autoscroll-btn" onclick="toggleAutoScroll()" class="text-xs px-2 py-1 rounded border border-neutral-200">📌 自动滚动</button>
+      </div>
+      <div class="px-3 py-2 border-b border-neutral-200 flex items-center gap-2 flex-wrap">
+        <input id="log-filter" class="inp" style="width:150px" placeholder="🔍 关键字过滤…">
+        <div id="log-chips" class="flex gap-1 flex-wrap"></div>
       </div>
       <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
     </div>
@@ -1438,6 +1443,9 @@ async function saveSettings(){
 
 /* ---------- Logs ---------- */
 const logwin=$('logwin'); let autoscroll=true;
+const MAX_LOG_LINES=2000;                     // 缓冲上限：超出丢最旧，防 DOM 无限膨胀
+const LOG_LEVELS=[['all','全部'],['ok','✅ 成功'],['warn','⚠️ 警告'],['err','❌ 错误'],['cost','💰 计费']];
+let curLevel='all'; let filterQ='';
 logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; syncAutoBtn(); });
 function syncAutoBtn(){ const b=$('autoscroll-btn'); if(b){ b.style.background=autoscroll?'#111':''; b.style.color=autoscroll?'#fff':''; } }
 function toggleAutoScroll(){
@@ -1445,18 +1453,56 @@ function toggleAutoScroll(){
   if(autoscroll && logwin) logwin.scrollTop=logwin.scrollHeight;
 }
 syncAutoBtn();
+function logLevel(t){
+  if(t.includes('✅')||t.includes('🎉')) return 'ok';
+  if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')) return 'warn';
+  if(t.includes('❌')||t.includes('ERROR')) return 'err';
+  if(t.includes('💰')) return 'cost';
+  return 'other';
+}
 function logLine(t){
   let c='#525252',bg='transparent',bl='2px solid transparent';
-  if(t.includes('✅')||t.includes('🎉')){c='#0369a1';bl='2px solid #38bdf8';}
-  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
-  else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
-  else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
+  const lv=logLevel(t);
+  if(lv==='ok'){c='#0369a1';bl='2px solid #38bdf8';}
+  else if(lv==='warn'){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
+  else if(lv==='err'){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
+  else if(lv==='cost'){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
   let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
-  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+  return `<div data-level="${lv}" style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
 }
+function isLogVisible(row){
+  if(curLevel!=='all' && row.dataset.level!==curLevel) return false;
+  if(filterQ && !row.textContent.toLowerCase().includes(filterQ)) return false;
+  return true;
+}
+function applyLogFilters(){ for(const row of logwin.children) row.style.display=isLogVisible(row)?'':'none'; }
+function appendLogLine(html){
+  const wrap=document.createElement('div');
+  wrap.innerHTML=html;
+  const row=wrap.firstElementChild;
+  logwin.appendChild(row);
+  row.style.display=isLogVisible(row)?'':'none';
+  while(logwin.children.length>MAX_LOG_LINES) logwin.firstElementChild.remove();
+  if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+}
+function clearLogView(){ logwin.innerHTML=''; }
+function renderLogChips(){
+  const box=$('log-chips'); if(!box) return;
+  box.innerHTML='';
+  for(const [lv,label] of LOG_LEVELS){
+    const b=document.createElement('button');
+    b.textContent=label;
+    b.className='text-xs px-2 py-0.5 rounded border border-neutral-200 '+(curLevel===lv?'bg-neutral-900 text-white':'');
+    b.onclick=()=>{ curLevel=lv; renderLogChips(); applyLogFilters(); };
+    box.appendChild(b);
+  }
+}
+renderLogChips();
+$('log-filter').addEventListener('input',e=>{ filterQ=e.target.value.trim().toLowerCase(); applyLogFilters(); });
+$('log-filter').addEventListener('keydown',e=>{ if(e.key==='Escape'){ e.target.value=''; filterQ=''; applyLogFilters(); } });
 try{
   const es=new EventSource('/stream-logs');
-  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
+  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; appendLogLine(logLine(e.data)); };
 }catch(e){}
 
 /* ---------- Project ID auto-extract（按行内 input 冒泡委托，兼容动态添加的账号行） ---------- */
