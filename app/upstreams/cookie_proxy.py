@@ -43,6 +43,7 @@ from message_processing import (
 )
 from logger import stats
 from api_helpers import get_retry_settings, FAKE_PREFIX
+from anti_truncation import is_enabled_for_request, get_enabled_field
 from failover import UpstreamUnstartedError
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -1334,6 +1335,13 @@ class CookieProxyUpstream(BaseUpstream):
         if _tool_info["custom_names"] and not _forced_search:
             print(f"🛠️ [Studio] 原生函数调用：{'、'.join(_tool_info['custom_names'][:5])}"
                   f"{' 等' if len(_tool_info['custom_names']) > 5 else ''}。")
+
+        # ===== 2.6 防截断状态提示 =====
+        # Cookie 通道走 batchGraphql，无工具参数传输机制（内建搜索除外），不支持防截断协议。
+        # 若下游请求体带了启用字段，明确提示已忽略，避免"开了防截断却静默失效"的困惑。
+        if is_enabled_for_request(request_obj):
+            print(f"⛔ [防截断] 本次调用下游已启用（字段「{get_enabled_field()}」=true），"
+                  "但 Cookie 通道无工具参数传输机制、不支持防截断，已忽略启用字段（走普通通道）。")
 
         # ===== 3. 解析模型名 =====
         model_display = request_obj.model

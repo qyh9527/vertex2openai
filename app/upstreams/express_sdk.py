@@ -23,7 +23,7 @@ from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
-from anti_truncation import is_enabled_for_request, inject_request
+from anti_truncation import is_enabled_for_request, inject_request, get_enabled_field
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -416,13 +416,21 @@ class ExpressSDKUpstream(BaseUpstream):
         # 防截断合成传输协议（可选单请求启用）：请求体带启用字段即注入合成工具 + 控制消息。
         # 注入必须在 create_generation_config 之前（合成工具声明要进 generationConfig）、
         # 在预填充处理之后（控制消息作为末尾 user，不与预填充兼容逻辑打架）。
+        # 每次调用都打一行显眼日志（✅ 已启用 / ⛔ 未启用或被忽略），标注下游启用字段名
+        # 与具体情况，滚动日志里一眼分辨哪些请求有防截断保护。
         synthetic_tool_name = None
-        if is_enabled_for_request(request_obj):
+        at_field = get_enabled_field()
+        if is_enabled_for_request(request_obj, {"value": at_field}):
             if is_image_model:
-                print("ℹ️ [防截断] 生图/非文本模型不支持，已忽略该请求的启用字段。")
+                print(f"⛔ [防截断] 本次调用下游已启用（字段「{at_field}」=true），"
+                      "但生图/非文本模型不支持工具参数输出，已忽略启用字段（走普通通道）。")
             else:
                 request_obj, synthetic_tool_name = inject_request(request_obj)
-                print(f"🔧 [防截断] 已注入合成传输工具 {synthetic_tool_name}（回答改走工具参数输出，绕开截断）。")
+                print(f"✅ [防截断] 本次调用下游已启用（字段「{at_field}」=true）→ "
+                      f"已注入合成传输工具 {synthetic_tool_name}，回答改走工具参数输出绕开截断。")
+        else:
+            print(f"⛔ [防截断] 本次调用下游未启用（请求体无「{at_field}」字段或值非 true）→ "
+                  "走普通文本生成，重提示词场景存在 max_output_tokens 截断风险。")
 
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
