@@ -1,5 +1,12 @@
 FROM python:3.11-slim
 
+# 日志时区：装 tzdata 并设 TZ=Asia/Shanghai（Python time.tzset 依赖系统时区数据库，
+# slim 镜像默认不含）；logger.py 的 time.tzset() 由此生效——文件日志/SSE 时间戳/
+# 按天轮转与 stats.json 日期 key 全部走北京时间。LOG_TZ 环境变量可覆盖。
+ENV TZ=Asia/Shanghai
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install dependencies

@@ -12,6 +12,17 @@ from typing import List, Optional
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
+# 日志/统计时间统一时区：默认北京（Asia/Shanghai），LOG_TZ 环境变量可覆盖。
+# 覆盖范围：文件日志时间戳（logging asctime）、按天轮转（midnight）、SSE 控制台时间戳、
+# stats.json 按天聚合的日期 key——全部走 time.localtime，改 TZ 一次全部生效。
+# tzset 仅 Unix 存在（Docker 为 Linux，生产环境生效）；Windows 本机开发不生效，
+# 仅本地显示差 8 小时，不影响容器行为。
+if hasattr(time, "tzset"):
+    _tz = os.environ.get("LOG_TZ", "Asia/Shanghai")
+    if _tz:
+        os.environ["TZ"] = _tz
+        time.tzset()
+
 
 def _setup_file_logger():
     """日志落盘：按天轮转，保留 7 天，与 STATE_DIR 同目录（挂载卷内，重建容器不丢）。
