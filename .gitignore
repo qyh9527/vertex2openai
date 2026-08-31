@@ -150,3 +150,9 @@ refactoring_plan.md
 multiple_credentials_implementation.md
 # 本地自用状态文档（会话交接用），不入库
 PROJECT_SUMMARY.md
+# 本地真机验证用服务账号凭证（下载目录复制，严禁入库）
+sa_real_test.json
+
+# 本地真机验证用 Express 快速模式密钥与浏览器 Cookie（严禁入库）
+快速模式密钥.txt
+cookies.txt

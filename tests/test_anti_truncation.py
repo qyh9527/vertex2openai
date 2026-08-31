@@ -13,7 +13,32 @@ from anti_truncation import (
     has_synthetic_tool_call, strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk,
     TOOL_PREFIX,
 )
+from fastapi.responses import StreamingResponse
+from google.genai import types
+from message_processing import create_gemini_prompt
 from models import OpenAIRequest, OpenAIMessage
+
+
+class FakeModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, model, contents, config):
+        async def _gen():
+            for chunk in self.owner.stream_chunks:
+                yield chunk
+        return _gen()
+
+
+class FakeAio:
+    def __init__(self, owner):
+        self.models = FakeModels(owner)
+
+
+class FakeClient:
+    def __init__(self, stream_chunks=()):
+        self.aio = FakeAio(self)
+        self.stream_chunks = list(stream_chunks)
 
 
 def _req(**kw):
@@ -41,6 +66,8 @@ class TestBuilders:
         fn = t["function"]
         assert fn["name"] == "v2o_emit_x"
         assert fn["parameters"]["required"] == ["content"]
+        # strict 约束：禁止模型在参数里加额外字段
+        assert fn["parameters"]["additionalProperties"] is False
 
     def test_control_message_is_user(self):
         m = build_control_message("v2o_emit_x")
@@ -90,6 +117,29 @@ class TestExtractContent:
         assert extract_content_from_args({"content": ""}) is None
         assert extract_content_from_args(None) is None
         assert extract_content_from_args("not json") is None
+
+    def test_markdown_code_fences_stripped(self):
+        """模型把参数包进 ```json 围栏：剥围栏后仍能提取。"""
+        assert extract_content_from_args(
+            '```json\n{"content": "围栏里的回答"}\n```') == "围栏里的回答"
+
+    def test_nested_content_fallback(self):
+        """content 被塞进嵌套对象（shape 写错）：递归兜底提取。"""
+        assert extract_content_from_args(
+            {"result": {"content": "嵌套里的回答"}}) == "嵌套里的回答"
+        assert extract_content_from_args(
+            {"a": {"b": {"c": {"d": {"content": "深层回答"}}}}}) == "深层回答"
+
+    def test_nested_depth_bounded(self):
+        """递归兜底有界（depth ≤ 4）：过深嵌套不无限下钻。"""
+        deep = {"content": "太深了"}
+        for _ in range(8):
+            deep = {"x": deep}
+        assert extract_content_from_args(deep) is None
+
+    def test_non_string_content_rejected(self):
+        assert extract_content_from_args({"content": 123}) is None
+        assert extract_content_from_args({"content": {"text": "x"}}) is None
 
 
 class TestStripOpenaiDict:
@@ -272,7 +322,86 @@ class TestPersistence:
         assert st2.get_setting("bogus_field", "fallback") == "fallback"
 
 
-class TestFakeStreamCompatibility:
+class TestStreamSideBuffer:
+    """真流式 side-buffer（参考 Antigravity-gateway stream.go）：
+    - 合成调用出现前的普通文本先入缓冲，命中合成调用即丢弃（单来源原则）；
+    - 全程未命中合成调用则流末 flush 兜底（防截断未生效时正文不丢）；
+    - 未启用防截断（无 synthetic_tool_name）时零行为变化，正文直接透传。
+    """
+
+    def _make_stream(self, stream_chunks):
+        from api_helpers import execute_gemini_call
+        req = OpenAIRequest(model="gemini-3.6-flash",
+                            messages=[{"role": "user", "content": "hi"}], stream=True)
+        client = FakeClient(stream_chunks=stream_chunks)
+        prompt = create_gemini_prompt(req.messages)
+        return client, req, prompt
+
+    async def _run(self, client, req, prompt, synthetic_tool_name):
+        from api_helpers import execute_gemini_call
+        resp = await execute_gemini_call(
+            client, "gemini-3.6-flash", lambda m: prompt, {}, req,
+            synthetic_tool_name=synthetic_tool_name)
+        assert isinstance(resp, StreamingResponse)
+        return "".join([c async for c in resp.body_iterator])
+
+    def _collect_content(self, sse_text):
+        out = []
+        for line in sse_text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            for choice in json.loads(payload).get("choices", []):
+                c = (choice.get("delta") or {}).get("content")
+                if c:
+                    out.append(c)
+        return "".join(out)
+
+    async def test_preamble_text_dropped_on_synthetic_hit(self):
+        """模型先吐几个字再调合成工具：普通文本必须被丢弃，只输出合成正文。"""
+        syn = "v2o_emit_x"
+        chunks = [
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="开头几个字")], role="model"))]),
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(function_call=types.FunctionCall(
+                    name=syn, args={"content": "合成正文"}))], role="model"))]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        content = self._collect_content(body)
+        assert content == "合成正文"
+        assert "开头几个字" not in content
+
+    async def test_buffer_flushed_when_no_synthetic_hit(self):
+        """全程未命中合成调用：缓冲的普通文本流末完整 flush（防截断未生效正文不丢）。"""
+        chunks = [
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="正常回答")], role="model"))]),
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[], role="model"),
+                finish_reason=types.FinishReason.STOP)]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, "v2o_emit_x")
+        content = self._collect_content(body)
+        assert content == "正常回答"
+
+    async def test_no_synthetic_tool_name_passthrough(self):
+        """未启用防截断：正文 chunk 直接透传，不缓冲（零行为变化）。"""
+        chunks = [
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="普通正文")], role="model"),
+                finish_reason=types.FinishReason.STOP)]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, None)
+        assert self._collect_content(body) == "普通正文"
+
+
+
     """防截断 + fake- 假流式组合：假流式路径的解构必须生效（fake 管传输方式，
     防截断管生成方式，两者可叠加且互不破坏）。"""
 

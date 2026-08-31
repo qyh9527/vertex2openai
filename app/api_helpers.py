@@ -833,6 +833,41 @@ def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str
     return openai_dict
 
 
+def _try_buffer_side_text(sse_line: str, side_buffer: list) -> Optional[str]:
+    """防截断 side-buffer：把 SSE chunk 里的正文 delta 暂存进缓冲，不透传。
+
+    返回值：
+    - None  → 整条 chunk 已吞下（纯正文），调用方跳过即可；
+    - str   → 剥掉正文后的新 SSE 行（chunk 还带角色/思考/finish 等信息），调用方透传它；
+    - False → 不是正文 chunk（角色/工具调用/finish 等），调用方原样透传 sse_line。
+
+    规则：仅缓冲 delta.content（字符串且有内容）；工具调用 delta 不缓冲
+    （真实工具调用与正文并存是合法输出，不能吞）。
+    """
+    try:
+        if not sse_line.startswith("data: "):
+            return False
+        payload = json.loads(sse_line[len("data: "):].strip())
+        choices = payload.get("choices") or []
+        if not choices:
+            return False
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if not (isinstance(content, str) and content):
+            return False
+        if delta.get("tool_calls"):
+            return False
+        side_buffer.append(content)
+        delta.pop("content", None)
+        if delta or choice.get("finish_reason"):
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return None
+    except Exception:
+        return False
+
+
 def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[str]:
     """真流式预填充去重：改写单条 SSE chunk 的 delta.content。
 
@@ -1106,6 +1141,12 @@ async def execute_gemini_call(
                 prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
                 synthetic_seen = False            # 防截断：本次流式是否出现过合成工具调用（流末用于"未生效"提示）
                 synthetic_empty_warned = False    # 防截断：空 content 只告警一次，避免刷屏
+                # 防截断 side-buffer（参考 Antigravity-gateway stream.go）：合成工具出现之前的
+                # 普通文本 delta 先进旁路缓冲不直接透传——一旦命中合成调用即丢弃缓冲
+                # （单来源原则：避免客户端看到"普通文本 + 合成正文"两段并存）；
+                # 全程未命中合成调用则流末把缓冲 flush 出去当兜底（防截断未生效时正文不丢）。
+                side_buffer: list = []
+                side_emitted = False               # 缓冲已 flush（防重复输出）
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -1152,6 +1193,11 @@ async def execute_gemini_call(
                                 # 原样返回同一对象 = 本 chunk 无合成 part。
                                 if chunk_item_call is None or chunk_item_call is not _orig_chunk:
                                     synthetic_seen = True
+                                    if side_buffer and not side_emitted:
+                                        # 命中合成调用：丢弃此前缓冲的普通文本（单来源原则）
+                                        print(f"⚠️ [防截断] 模型在调用合成工具前输出了 {sum(len(s) for s in side_buffer)} "
+                                              "字普通文本，已丢弃（正文以合成 content 为准）。")
+                                        side_buffer = []
                                     if not _syn_contents and not synthetic_empty_warned:
                                         synthetic_empty_warned = True
                                         print("⚠️ [防截断] 流式出现合成工具调用但 content 为空，"
@@ -1175,12 +1221,28 @@ async def execute_gemini_call(
                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                     if sse_chunk is None:
                                         continue  # 正文暂存于去重器，跳过空 chunk
+                                if synthetic_tool_name and not synthetic_seen and not side_emitted:
+                                    # 合成调用尚未出现：普通文本先入 side-buffer 不透传
+                                    #（命中合成即丢弃、流末未命中则 flush 兜底）
+                                    _sideheld = _try_buffer_side_text(sse_chunk, side_buffer)
+                                    if _sideheld is None:
+                                        continue      # 纯正文 chunk：已整条吞下
+                                    if _sideheld is not False:
+                                        sse_chunk = _sideheld  # 剥掉正文后的剩余信息照常透传
+                                    # False（非正文 chunk）原样透传
                                 yield sse_chunk
 
                         # 防截断已启用但全程未出现合成工具调用：模型没走合成通道，本次防截断未生效
                         if synthetic_tool_name and not synthetic_seen:
                             print(f"⚠️ [防截断] 请求已启用防截断但全程未出现合成工具调用（{synthetic_tool_name}），"
                                   "本次未生效（如实透传普通输出）。")
+                        # 未命中合成调用：flush side-buffer 当兜底（正文不丢）
+                        if synthetic_tool_name and not synthetic_seen and side_buffer and not side_emitted:
+                            side_emitted = True
+                            for _sc in side_buffer:
+                                _sb_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
+                                yield f"data: {json.dumps(_sb_payload, ensure_ascii=False)}\n\n"
+                            side_buffer = []
 
                         # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
                         if deduper is not None and not deduper.done:

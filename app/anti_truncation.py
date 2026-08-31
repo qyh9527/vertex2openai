@@ -60,6 +60,9 @@ def build_synthetic_tool(tool_name: str) -> dict:
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
                 "required": ["content"],
+                # strict 约束：禁止模型在参数里加额外字段（SDK Schema 支持该键，
+                # 真机已验证 FunctionDeclaration 接受 additionalProperties=false）
+                "additionalProperties": False,
             },
         },
     }
@@ -130,19 +133,52 @@ def inject_request(request_obj: Any) -> tuple[Any, str]:
     }), tool_name
 
 
+def _find_content_field(obj: Any, depth: int = 0) -> Optional[str]:
+    """递归在参数对象里找 content 字符串字段（兜底：模型把 content 塞进嵌套对象时）。
+
+    有界递归（depth ≤ 4）防深层嵌套；命中第一个非空 content 字符串即返回。
+    """
+    if depth > 4 or not isinstance(obj, dict):
+        return None
+    content = obj.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    for value in obj.values():
+        if isinstance(value, dict):
+            found = _find_content_field(value, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
 def extract_content_from_args(args: Any) -> Optional[str]:
-    """从合成工具参数（dict 或 JSON 字符串）提取 content 正文。"""
+    """从合成工具参数（dict 或 JSON 字符串）提取 content 正文。
+
+    提取管线（参考 Antigravity-gateway repair.go，适配 SDK 场景）：
+    1. 标准提取：顶层 content 字符串字段（SDK 正常场景，一次到位）；
+    2. JSON 字符串失败时尝试剥 Markdown 代码围栏（模型爱把参数包进 ```json 里）再解析；
+    3. 递归兜底：content 被塞进嵌套对象（shape 写错）时逐层找；
+    4. 全失败返回 None（调用方回退普通输出，不静默丢正文）。
+    """
     if args is None:
         return None
     if isinstance(args, str):
+        stripped = args.strip()
+        if stripped.startswith("```"):
+            # 剥 Markdown 代码围栏：去掉首行 ```/```json 与结尾 ```
+            lines = stripped.splitlines()
+            body_lines = lines[1:-1] if stripped.rstrip().endswith("```") else lines[1:]
+            stripped = "\n".join(body_lines).strip()
         try:
-            args = json.loads(args)
+            args = json.loads(stripped)
         except Exception:
             return None
     if isinstance(args, dict):
         content = args.get("content")
         if isinstance(content, str) and content.strip():
             return content
+        # 顶层没有：递归找嵌套 content（模型 shape 写错的兜底）
+        return _find_content_field(args)
     return None
 
 
