@@ -259,7 +259,7 @@ class TestSuccessReporting:
     async def test_stream_success_reports_success(self, env, monkeypatch):
         ex, ck = _install(
             monkeypatch,
-            {"stream": ["data: x\n\n"]},
+            {"stream": ['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"]},
             {"response": _json(200)},
         )
         resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
@@ -335,4 +335,119 @@ class TestChannelRetryOverride:
         monkeypatch.setattr(app_state, "get_channel_retry", lambda ch: None)
         max_r, _ = get_retry_settings()
         assert max_r == app_config.DEFAULT_SETTINGS["retry_max"]
+
+
+class TestAllFailedAggregation:
+    """P0-6：全部通道失败时聚合每个通道的错误摘要，前序原因不丢失。"""
+
+    async def test_last_channel_error_contains_all_channels(self, env, monkeypatch):
+        """express 429 → cookie 503：最终错误必须包含两个通道名与各自错误信息。"""
+        ex, ck = _install(
+            monkeypatch,
+            {"response": _json(429, {"error": {"message": "Express 配额耗尽", "type": "upstream_error"}})},
+            {"response": _json(503, {"error": {"message": "Vertex 上游不可用", "type": "upstream_error"}})},
+        )
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        assert resp.status_code >= 400
+        body = json.loads(resp.body.decode("utf-8"))
+        msg = body["error"]["message"]
+        assert "Express API Key" in msg
+        assert "Express 配额耗尽" in msg
+        assert "Cookie 直连" in msg
+        assert "Vertex 上游不可用" in msg
+        # OpenAI 错误形状完整（P0-8）
+        assert body["error"]["type"] and body["error"]["code"] is not None
+
+    async def test_display_names_not_internal_keys(self, env, monkeypatch):
+        """聚合错误用 CHANNEL_NAMES 显示名，不暴露 express/cookie 内部键。"""
+        ex, ck = _install(monkeypatch, {"response": _json(429)}, {"response": _json(429)})
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        body = json.loads(resp.body.decode("utf-8"))
+        msg = body["error"]["message"]
+        # 显示名 "Express API Key" 本身含 'express'，这里断言的是内部键裸形式
+        #（聚合格式为 "显示名 HTTP xxx: ..."，内部键只应作为 attempts 的 channel 字段存在）
+        assert "HTTP 429: express" not in msg
+        assert "通道 express" not in msg
+        assert "通道 cookie" not in msg
+
+    async def test_unstarted_no_fallback_aggregates(self, env, monkeypatch):
+        ex, ck = _install(monkeypatch,
+                          {"raise": UpstreamUnstartedError("express 429 重试耗尽")},
+                          {"response": _json(200)})
+        resp = await chat_api._dispatch(["express"], _req(), None, failover_mode=True)
+        assert isinstance(resp, JSONResponse)
+        body = json.loads(resp.body.decode("utf-8"))
+        assert "Express API Key" in body["error"]["message"]
+        assert "429 重试耗尽" in body["error"]["message"]
+
+
+class TestEmptyStreamFailover:
+    """P0-7：流式响应只有心跳/空 delta/[DONE] 时不算成功——有兜底切换、无兜底给可见错误。"""
+
+    async def test_heartbeat_only_switches_to_second(self, env, monkeypatch):
+        """主通道只发心跳 + [DONE]：必须切换到第二通道拿正文。"""
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [": keep-alive\n\n", "data: [DONE]\n\n"]},
+            {"stream": ["data: {\"choices\":[{\"delta\":{\"content\":\"兜底正文\"}}]}\n\n", "data: [DONE]\n\n"]},
+        )
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        assert isinstance(resp, StreamingResponse)
+        body = "".join([c async for c in resp.body_iterator])
+        assert "兜底正文" in body
+        assert len(ex.calls) == 1 and len(ck.calls) == 1
+
+    async def test_empty_delta_only_switches(self, env, monkeypatch):
+        """role 声明 + 空 content chunk 不算有效输出。"""
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": ['data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+                        "data: [DONE]\n\n"]},
+            {"stream": ['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"]},
+        )
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        body = "".join([c async for c in resp.body_iterator])
+        assert "hi" in body
+        assert len(ck.calls) == 1
+
+    async def test_empty_stream_no_fallback_visible_error(self, env, monkeypatch):
+        """单通道空流：必须输出可见 SSE 错误（含"空流"），而不是只有 [DONE]。"""
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [": keep-alive\n\n", "data: [DONE]\n\n"]},
+            {"response": _json(200)},
+        )
+        resp = await chat_api._dispatch(["express"], _req(), None, failover_mode=True)
+        assert isinstance(resp, StreamingResponse)
+        body = "".join([c async for c in resp.body_iterator])
+        assert "error" in body
+        assert "空流" in body
+        assert "[DONE]" in body
+
+    async def test_real_content_is_success_not_empty(self, env, monkeypatch):
+        """有正文的流不算空流：不触发兜底（防误切换回归）。"""
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": ['data: {"choices":[{"delta":{"content":"正文"}}]}\n\n', "data: [DONE]\n\n"]},
+            {"response": _json(200)},
+        )
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        assert isinstance(resp, StreamingResponse)
+        body = "".join([c async for c in resp.body_iterator])
+        assert "正文" in body
+        assert len(ck.calls) == 0
+
+    async def test_sse_error_event_is_effective_output(self, env, monkeypatch):
+        """带明确 OpenAI 错误事件的流是"有效输出"：不触发空流兜底（upstream 已如实报错）。"""
+        err_chunk = 'data: {"error":{"message":"上游 500","type":"server_error","code":500}}\n\n'
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [err_chunk, "data: [DONE]\n\n"]},
+            {"stream": ['data: {"choices":[{"delta":{"content":"不该出现"}}]}\n\n']},
+        )
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        body = "".join([c async for c in resp.body_iterator])
+        assert "上游 500" in body
+        assert "不该出现" not in body   # 错误事件已如实透传，不再切兜底重发
+        assert len(ck.calls) == 0
 

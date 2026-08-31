@@ -5,6 +5,15 @@ import config as app_config
 from runtime_state import app_state
 
 
+def _chan(channel: str) -> str:
+    """熔断日志的通道显示名（与路由层共用同一显示来源，P0-4）。"""
+    try:
+        from api_helpers import channel_display_name
+        return channel_display_name(channel)
+    except Exception:
+        return channel
+
+
 class UpstreamUnstartedError(Exception):
     """未向客户端发出任何数据时的上游失败信号（hybrid 模式下可切换通道）。
 
@@ -56,7 +65,7 @@ class ChannelBreaker:
         """通道成功：清零连续失败计数，立即解除冷却。"""
         with self._lock:
             if self._state.pop(channel, None):
-                print(f"✅ [熔断器] {channel} 通道恢复，连续失败计数已清零。")
+                print(f"✅ [熔断器] {_chan(channel)} 通道恢复，连续失败计数已清零。")
 
     def report_failure(self, channel: str) -> None:
         """通道失败：连续失败计数 +1，达到阈值即进入冷却。"""
@@ -66,7 +75,7 @@ class ChannelBreaker:
             rec["failures"] += 1
             if rec["failures"] >= self._threshold():
                 rec["cooldown_until"] = now + self._cooldown()
-                print(f"⚠️ [熔断器] {channel} 通道连续失败 {rec['failures']} 次，"
+                print(f"⚠️ [熔断器] {_chan(channel)} 通道连续失败 {rec['failures']} 次，"
                       f"进入 {self._cooldown():.0f}s 冷却，期间自动切换其它通道。")
             self._state[channel] = rec
 

@@ -10,7 +10,10 @@ from runtime_state import app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstreams.service_account import ServiceAccountUpstream
-from api_helpers import extract_upstream_error, create_openai_error_response, is_retryable_exception
+from api_helpers import (
+    extract_upstream_error, create_openai_error_response, is_retryable_exception,
+    channel_display_name,
+)
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
 
@@ -27,6 +30,8 @@ CHANNELS = {
     "vertex": sa_upstream,
 }
 
+# 通道显示名（日志/错误聚合用）：真身是 api_helpers.CHANNEL_META（P0-1 唯一显示来源），
+# 这里只保留兼容导入供既有代码/测试引用；新代码请用 channel_display_name()。
 CHANNEL_NAMES = {
     "express": "Express API Key",
     "cookie": "Cookie 直连",
@@ -88,9 +93,81 @@ def _switchable_json(resp: JSONResponse) -> bool:
     return resp.status_code in SWITCHABLE_STATUS_CODES
 
 
+def _summarize_json_error(resp: JSONResponse) -> str:
+    """从上游 JSONResponse 里提取一行错误摘要（不消费响应体，P0-6）。
+
+    响应体形如 {"error": {"message": ...}}；提取失败回退为"无错误详情"。
+    """
+    try:
+        import json as _json
+        body = resp.body
+        if isinstance(body, bytes):
+            data = _json.loads(body.decode("utf-8", errors="replace"))
+        else:
+            data = _json.loads(body)
+        msg = (((data or {}).get("error") or {}).get("message")) or data.get("message")
+        if msg:
+            return str(msg)[:200]
+    except Exception:
+        pass
+    return "无错误详情"
+
+
+def _extract_stream_message(chunk: str) -> str:
+    """从一条 SSE chunk 里提取 OpenAI 错误 message（无错误返回空串）。"""
+    try:
+        if not isinstance(chunk, str) or not chunk.startswith("data:"):
+            return ""
+        payload = chunk[len("data:"):].strip()
+        if payload == "[DONE]" or not payload:
+            return ""
+        data = json.loads(payload)
+        err = (data or {}).get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])[:300]
+    except Exception:
+        pass
+    return ""
+
+
+def _chunk_has_effective_output(chunk: str) -> bool:
+    """一条 SSE chunk 是否携带"有效输出"（正文/图片/工具调用/明确错误事件，P0-7）。
+
+    无效保活：SSE 注释心跳（`: keep-alive`）、空 content 的 role/usage 尾块、只有 [DONE]。
+    """
+    try:
+        if not isinstance(chunk, str) or not chunk.startswith("data:"):
+            return False   # SSE 注释行（心跳）等
+        payload = chunk[len("data:"):].strip()
+        if payload == "[DONE]" or not payload:
+            return False
+        data = json.loads(payload)
+        if isinstance(data.get("error"), dict) and data["error"].get("message"):
+            return True    # 明确的 OpenAI 错误事件
+        for choice in (data.get("choices") or []):
+            delta = (choice or {}).get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str) and content.strip():
+                return True
+            if delta.get("tool_calls"):
+                return True
+            extra = delta.get("extra_content")
+            if isinstance(extra, dict) and (extra.get("image") or extra.get("images")):
+                return True
+            if choice.get("finish_reason"):
+                return True   # 正常收尾块（空流不会有）
+    except Exception:
+        pass
+    return False
+
+
 async def _dispatch(channels: list, request: OpenAIRequest,
                     fastapi_request: Request, failover_mode: bool):
-    """按通道顺序尝试，第一个成功即返回；失败且可切换则依次兜底。"""
+    """按通道顺序尝试，第一个成功即返回；失败且可切换则依次兜底。
+
+    P0-6：每个已尝试通道的名称/状态/错误摘要都记进 attempts；全部失败时聚合进
+    最终错误响应，前序通道的失败原因不再丢失。
+    """
     if not channels:
         return JSONResponse(
             status_code=503,
@@ -100,10 +177,13 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         )
 
     last_status, last_msg = 500, "上游通道全部不可用"
+    attempts: list = []   # [{channel, status, message}]（全部失败聚合用）
     for idx, channel in enumerate(channels):
         # 熔断冷却中的通道直接跳过（日志由熔断器打出）
         if breaker.is_cooling(channel):
-            last_status, last_msg = 503, f"{channel} 通道处于熔断冷却中"
+            attempts.append({"channel": channel, "status": 503,
+                             "message": "通道处于熔断冷却中"})
+            last_status, last_msg = 503, f"{channel_display_name(channel)} 通道处于熔断冷却中"
             continue
 
         upstream = CHANNELS[channel]
@@ -124,43 +204,72 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 return resp
 
             # 非流式 JSONResponse
-            if isinstance(resp, JSONResponse) and remaining_channels(channels, idx) \
-                    and _switchable_json(resp):
+            if isinstance(resp, JSONResponse) and failover_mode and _switchable_json(resp):
+                # P0-6：可切换错误无论是否还有兜底通道，都记录失败摘要
+                #（最后一个通道返回 429/5xx 时不再"原样返回"当作普通结果——
+                # 前序通道的失败原因会丢，客户端只会看到最后一个错误）。
                 breaker.report_failure(channel)
-                print(f"⚠️ [故障转移] {channel} 通道 HTTP {resp.status_code}（限流/上游故障），"
-                      f"切换至 {channels[idx + 1]} 通道兜底。")
-                last_status, last_msg = resp.status_code, "限流或上游故障"
-                continue
+                attempts.append({"channel": channel, "status": resp.status_code,
+                                 "message": _summarize_json_error(resp)})
+                if remaining_channels(channels, idx):
+                    print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
+                          f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
+                    last_status, last_msg = resp.status_code, attempts[-1]["message"]
+                    continue
+                # 无兜底通道：聚合返回（含本通道与所有前序通道的错误）
+                return _all_failed_response(attempts, resp.status_code, "")
 
+            # 不可切换错误（400/401/403 等）如实返回；也记入 attempts 供日志聚合
+            if isinstance(resp, JSONResponse) and resp.status_code >= 400:
+                attempts.append({"channel": channel, "status": resp.status_code,
+                                 "message": _summarize_json_error(resp)})
             breaker.report_success(channel)
             return resp
 
         except UpstreamUnstartedError as e:
             if not failover_mode:
                 raise  # 非 hybrid：upstream 不应抛此异常；透传给外层兜底
+            breaker.report_failure(channel)
+            attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
             if remaining_channels(channels, idx):
-                breaker.report_failure(channel)
-                print(f"⚠️ [故障转移] {channel} 通道未出流失败（{str(e)[:120]}），"
-                      f"切换至 {channels[idx + 1]} 通道兜底。")
+                print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道未出流失败（{str(e)[:120]}），"
+                      f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
                 last_status, last_msg = 503, str(e)
                 continue
-            # 无兜底通道：如实转成 OpenAI 错误响应（不再 raise，避免被外层误判成 500）
-            breaker.report_failure(channel)
-            code, msg = extract_upstream_error(ValueError(str(e)))
-            return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
+            # 无兜底通道：聚合所有尝试结果（P0-6），如实转成 OpenAI 错误响应
+            return _all_failed_response(attempts, last_status, last_msg)
         except Exception as e:
             # 非流式/其他异常：只对"可切换"类错误继续兜底（429/503/配额等）
+            breaker.report_failure(channel)
             if remaining_channels(channels, idx) and _exception_switchable(e):
-                breaker.report_failure(channel)
-                print(f"⚠️ [故障转移] {channel} 通道异常（{str(e)[:120]}），"
-                      f"切换至 {channels[idx + 1]} 通道兜底。")
+                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
+                print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道异常（{str(e)[:120]}），"
+                      f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
                 last_status, last_msg = 503, str(e)
                 continue
+            if not remaining_channels(channels, idx):
+                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
+                return _all_failed_response(attempts, 503, str(e))
             raise
 
-    # 全部通道尝试完毕仍失败：如实转成 OpenAI 错误格式
+    # 全部通道尝试完毕仍失败：聚合每个通道的具体错误（P0-6）
+    return _all_failed_response(attempts, last_status, last_msg)
+
+
+def _all_failed_response(attempts: list, last_status: int, last_msg: str) -> JSONResponse:
+    """所有候选通道失败后的聚合错误（OpenAI error 形状，含每个通道的摘要）。"""
+    parts = []
+    for a in attempts:
+        name = channel_display_name(a["channel"])
+        msg = (a.get("message") or "").strip() or "无错误详情"
+        code = a.get("status") or "—"
+        if str(msg) != msg:
+            msg = str(msg)
+        parts.append(f"{name} HTTP {code}: {msg}")
+    summary = "；".join(parts) if parts else (last_msg or "上游通道全部不可用")
+    print(f"❌ [路由兜底] 所有候选通道均失败：{summary[:400]}")
     code, msg = extract_upstream_error(
-        ValueError(f"{last_msg}（最后尝试通道状态：{last_status}）"))
+        ValueError(f"所有候选通道均失败：{summary[:600]}"))
     return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
 
 
@@ -181,21 +290,52 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
     - 正常：逐 chunk 透传（含 SSE 心跳），结束后给主通道记成功；
     - UpstreamUnstartedError：主通道"未出流"就挂了 → 有兜底则切剩余通道重发，
       无兜底则转成 SSE 错误流收尾。
+    - P0-7 空流判定：generator "正常结束"但全程只有心跳/空 delta/[DONE]（无有效输出）
+      时不算成功——有兜底则切换重发，无兜底则发送可见 SSE 错误再 [DONE]，
+      不再静默空回。
       （已出流的错误由 upstream 内部发错误 chunk 收尾，这里不会看到异常。）
     """
+    has_output = False
     try:
         async for chunk in primary_resp.body_iterator:
+            if not has_output and _chunk_has_effective_output(chunk):
+                has_output = True
             yield chunk
-        breaker.report_success(primary_channel)
+        if has_output:
+            breaker.report_success(primary_channel)
+            return
+        # 空流（只有心跳/空 delta/[DONE]）：按未出流失败处理
+        breaker.report_failure(primary_channel)
+        if remaining:
+            print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式结束但无有效输出"
+                  f"（上游返回空流），切换至 {channel_display_name(remaining[0])} 通道重新发起请求。")
+            switch_resp = await _dispatch(remaining, request, fastapi_request, failover_mode)
+            if isinstance(switch_resp, StreamingResponse):
+                async for chunk in switch_resp.body_iterator:
+                    yield chunk
+            else:
+                # 兜底通道非流式失败（JSONResponse）：转成 SSE 错误流收尾
+                body = switch_resp.body
+                yield f"data: {body.decode('utf-8', errors='replace')}\n\n"
+                yield "data: [DONE]\n\n"
+            return
+        # 无兜底：发送可见的 SSE 错误（P0-7 不静默空回）
+        print(f"❌ [故障转移] {channel_display_name(primary_channel)} 通道流式结束但无有效输出"
+              f"（上游返回空流），且无兜底通道。")
+        err_payload = create_openai_error_response(
+            502, f"{channel_display_name(primary_channel)} 通道上游返回空流（无正文/工具调用/错误事件），本次请求未获得有效回复。", "upstream_error")
+        yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
     except UpstreamUnstartedError as e:
         breaker.report_failure(primary_channel)
         if not remaining:
-            print(f"❌ [故障转移] {primary_channel} 通道未出流失败且无兜底通道（{str(e)[:120]}）。")
+            print(f"❌ [故障转移] {channel_display_name(primary_channel)} 通道未出流失败且无兜底通道（{str(e)[:120]}）。")
             yield f"data: {json.dumps(create_openai_error_response(502, str(e)[:500], 'upstream_error'))}\n\n"
             yield "data: [DONE]\n\n"
             return
-        print(f"⚠️ [故障转移] {primary_channel} 通道流式未出流失败（{str(e)[:120]}），"
-              f"切换至 {remaining[0]} 通道重新发起请求。")
+        print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式未出流失败（{str(e)[:120]}），"
+              f"切换至 {channel_display_name(remaining[0])} 通道重新发起请求。")
         switch_resp = await _dispatch(remaining, request, fastapi_request, failover_mode)
         if isinstance(switch_resp, StreamingResponse):
             async for chunk in switch_resp.body_iterator:

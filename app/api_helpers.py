@@ -32,9 +32,39 @@ from anti_truncation import (
 # 引入报错重试统计器
 from logger import stats
 
-# 假流式前缀：请求 fake-<模型名> 时该请求走假流式（Express 通道），其余模型保持真实流式。
+# 假流式前缀：请求 fake-<模型名> 时该请求走假流式（标准 SDK 通道通用），其余模型保持真实流式。
 # 定义在公共模块：models_api（列表暴露）、express_sdk（强制假流式）、cookie_proxy（剥前缀）共用。
 FAKE_PREFIX = "fake-"
+
+# ===== 通道身份元数据（全项目唯一显示来源，P0-1）=====
+# 所有请求、重试、故障转移、熔断、端点日志的渠道文案都从这里取。
+# 内部键保持稳定（持久化数据/熔断状态都存它），显示名与认证方式只在此处描述。
+CHANNEL_META = {
+    "express": {"display": "Express API Key", "provider": "Vertex Express", "auth": "api_key"},
+    "cookie": {"display": "Cookie 直连", "provider": "Agent Platform Studio", "auth": "cookie"},
+    "vertex": {"display": "服务账号（Vertex SA）", "provider": "Vertex AI", "auth": "service_account"},
+}
+
+
+def channel_display_name(channel: Optional[str]) -> str:
+    """内部通道键 → 用户可读显示名（未知键原样返回，绝不抛异常）。"""
+    if not channel:
+        return "未知通道"
+    meta = CHANNEL_META.get(channel if isinstance(channel, str) else str(channel))
+    if meta:
+        return meta["display"]
+    return str(channel)
+
+
+def channel_call_text(channel: Optional[str]) -> str:
+    """调用类日志的通道描述（显示名 + 认证方式），如「服务账号（Vertex SA）[service_account]」。"""
+    if not channel:
+        return "未知通道"
+    key = str(channel)
+    meta = CHANNEL_META.get(key)
+    if not meta:
+        return key
+    return f"{meta['display']}[{meta['auth']}]"
 
 
 def _safety_score_enabled() -> bool:
@@ -244,8 +274,10 @@ def report_client_failure(client, kind: str = "conn", reason: str = "") -> None:
     kind="conn"：连接级失败计数，达到阈值自动舍弃重建（只有 httpx.TransportError 类异常
                  才上报此类型；429 等 HTTP 状态错误是连接健康的证明，不要上报）。
     kind="evict"：立即舍弃复用 Client（如安全策略拦截等硬错误），下次请求重建连接池。
-    Express 通道的缓存 Client 挂有 _vertex_on_failure 回调（见 express_sdk）；
-    非复用 Client 无回调，静默跳过。
+                 日志会标注「状态=evicted」，且 PROHIBITED_CONTENT 等安全拦截不会被
+                 误判为可重试错误（is_retryable_exception 只认 429/503/配额类）。
+    Express 与 服务账号 通道的缓存 Client 都挂有 _vertex_on_failure 回调
+    （分别见 express_sdk / service_account）；非复用 Client 无回调，静默跳过。
     """
     hook = getattr(client, "_vertex_on_failure", None)
     if callable(hook):
@@ -854,7 +886,7 @@ async def gemini_fake_stream_generator(
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
 ):
-    print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
+    print(f"🌊 [假流式] 已开始通过 {channel_call_text(channel_name)} 调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
@@ -971,7 +1003,7 @@ async def gemini_fake_stream_generator(
         raise
     except Exception as e_outer_gemini:
         err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
-        print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
+        print(f"❌ [API 错误响应] {channel_call_text(channel_name)} 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
         _sa_hint = sa_channel_hint(channel_name, str(e_outer_gemini))
         if _sa_hint:
             print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
@@ -1036,7 +1068,7 @@ async def execute_gemini_call(
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
     actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
-    print(f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
+    print(f"🚀 [上游请求] 正在通过 {channel_call_text(channel_name)} 调用模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
 
     async def _client_gone() -> bool:
         """检测客户端是否已断开连接（用于在重试前及时止损）。"""
@@ -1206,7 +1238,7 @@ async def execute_gemini_call(
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
                             wait_time = backoff_sec
                             stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                            print(f"⚠️ [自动重试] {channel_call_text(channel_name)} 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
@@ -1222,7 +1254,7 @@ async def execute_gemini_call(
                             continue
 
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
-                        print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
+                        print(f"❌ [API 错误响应] {channel_call_text(channel_name)} 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         _sa_hint = sa_channel_hint(channel_name, str(e_stream_call))
                         if _sa_hint:
                             print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")

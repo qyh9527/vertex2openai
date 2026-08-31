@@ -2,7 +2,7 @@ import re
 import threading
 from functools import partial
 
-from typing import Any
+from typing import Any, Optional
 
 import google.genai
 from fastapi import Request
@@ -16,6 +16,8 @@ from api_helpers import (
     execute_gemini_call,
     create_openai_error_response,
     FAKE_PREFIX,
+    channel_display_name,
+    channel_call_text,
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
@@ -38,7 +40,7 @@ OPENAI_SEARCH_SUFFIX = "-openaisearch"
 # 额度按 API Key 与请求计费，与连接是否复用无关；429 限流也按请求判定，不受影响。
 # dict 的 get/set 在 GIL 下原子，异步协程并发安全；极端并发下重复创建只是多费一个对象。
 #
-# 两个控制台可调行为（「Express Client 复用」卡片）：
+# 两个控制台可调行为（「Google GenAI Client 复用」卡片，Express 与服务账号通道共用）：
 #   client_reuse=False              → 每请求新建 Client，彻底不用缓存
 #   client_reuse_evict_threshold=N  → 缓存 Client 连续 N 次"连接级失败"（httpx.TransportError
 #                                    类，如 RemoteProtocolError / ConnectError / 超时，不含 429
@@ -80,7 +82,7 @@ def _on_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -
         with _CLIENT_CACHE_LOCK:
             _CLIENT_CACHE.pop(cache_key, None)
             _CLIENT_FAILURES.pop(cache_key, None)
-        print(f"⚠️ [Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），下次请求重建连接池。")
+        print(f"⚠️ [Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），下次请求将重建连接池（状态=evicted）。")
         return
     try:
         threshold = int(app_state.get_setting(
@@ -95,8 +97,8 @@ def _on_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -
         if cnt >= threshold:
             _CLIENT_CACHE.pop(cache_key, None)
             _CLIENT_FAILURES.pop(cache_key, None)
-            print(f"⚠️ [Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已舍弃，"
-                  f"下次请求将重建连接池。")
+            print(f"⚠️ [Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已淘汰"
+                  f"（状态=evicted），下次请求将重建连接池。")
         else:
             _CLIENT_FAILURES[cache_key] = cnt
 
@@ -110,6 +112,7 @@ def _get_cached_client(express_api_key: str, priority_paygo: bool = False,
     控制台 client_reuse 关闭时不做缓存，每请求新建 Client。
     """
     if not app_state.get_setting("client_reuse", True):
+        _log_client_reuse("express", reused=False)
         return _new_express_client(express_api_key, priority_paygo,
                                    headers=headers, timeout=timeout, cache_key=None)
     base_url = app_config.VERTEX_BASE_URL or None
@@ -117,11 +120,28 @@ def _get_cached_client(express_api_key: str, priority_paygo: bool = False,
     cache_key = (express_api_key, base_url, priority_paygo, headers_key)
     with _CLIENT_CACHE_LOCK:
         client = _CLIENT_CACHE.get(cache_key)
+        reused = client is not None
         if client is None:
             client = _new_express_client(express_api_key, priority_paygo,
                                          headers=headers, timeout=timeout, cache_key=cache_key)
             _CLIENT_CACHE[cache_key] = client
+    _log_client_reuse("express", reused)
     return client
+
+
+def _log_client_reuse(channel: str, reused: bool, evicted: bool = False) -> None:
+    """P1-3：Client 来源日志（new=新建连接池 / reused=命中缓存复用 / evicted=缓存已被淘汰后重建）。
+
+    排查连接复用问题（keep-alive 失效、代理切换后旧连接报错）时，
+    这行日志能直接回答"这次请求用的到底是新建还是旧的连接池对象"。
+    """
+    if evicted:
+        state = "缓存此前已被淘汰，本次新建连接池"
+    elif reused:
+        state = "复用缓存 Client"
+    else:
+        state = "新建 Client 连接池"
+    print(f"🔌 [Client 复用] {channel_display_name(channel)} 本次请求{state}。")
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, bool, str | None]:
@@ -139,7 +159,8 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, bool, str | None]
             break
 
     if base_model_name.startswith(LEGACY_PAY_PREFIX):
-        return base_model_name, False, False, "当前版本已经移除 Pay/Service Account 模式，请改用 Express Mode 模型名称。"
+        return base_model_name, False, False, ("当前在 Express 通道：[PAY] 前缀仅由服务账号（vertex）/ 混合自动（hybrid）通道剥除，"
+                                               "请把通道策略切到服务账号，或直接使用普通模型名。")
 
     if base_model_name.endswith(OPENAI_SEARCH_SUFFIX) or base_model_name.endswith(OPENAI_DIRECT_SUFFIX):
         return base_model_name, False, False, "当前版本已经移除 -openai/-openaisearch 直连上游路径，请直接使用普通模型名或 -search 模型名。"
@@ -164,7 +185,8 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
-                           prefill_active: bool = False) -> dict | None:
+                           prefill_active: bool = False,
+                           channel_name: Optional[str] = None) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
     if is_image_model:
         return None
@@ -192,7 +214,7 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
         thinking_config["thinking_budget"] = t["budget"]
 
     if app_state.get_setting("debug_outbound", False):
-        print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")
+        print(f"🔎 [出站调试] {channel_display_name(channel_name)} 模型={base_model_name} thinkingConfig={thinking_config}")
 
     return thinking_config
 
@@ -210,11 +232,15 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
             "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
 
 
-_ENDPOINT_LOGGED = False
+# P0-5：端点诊断按 (channel, auth, base_url, project, location) 去重——
+# Express 与服务账号两条通道的端点语义完全不同，各自至少打一次；
+# 同一进程先 Express 后 SA（或反过来）时两种端点日志都必须出现。
+# 账号 / project / location 变化后重新记录。
+_ENDPOINT_LOGGED_KEYS: set = set()
 
 
-def _log_resolved_endpoint(client: Any) -> None:
-    """把 SDK 实际解析出的上游端点打进日志（每进程一次）。
+def _log_resolved_endpoint(client: Any, channel_name: Optional[str] = None) -> None:
+    """把 SDK 实际解析出的上游端点打进日志（按通道+端点身份去重）。
 
     为什么需要它：Express（api_key）模式下**无法**指定 location——SDK 里
     project/location 与 api_key 互斥，硬传会 `ValueError: Project/location and
@@ -222,22 +248,33 @@ def _log_resolved_endpoint(client: Any) -> None:
     https://aiplatform.googleapis.com/ ，project/location 均为 None，请求 URL 里
     根本没有 location 段。因此报错信息里出现的 `locations/xxx` 区域是 **Google 后端
     为该 Key 自行路由**的结果，不是本代理选的，客户端侧无从指定。
-    打印出来便于随时核实（尤其怀疑"被路由到冷门区域"时）。
+
+    服务账号（vertex）通道则由 SDK 按 Client 的 project/location 拼完整资源路径，
+    日志明确输出脱敏 project 与 location，便于核实 403/404 到底落在哪个项目/区域。
     """
-    global _ENDPOINT_LOGGED
-    if _ENDPOINT_LOGGED:
-        return
-    _ENDPOINT_LOGGED = True
     try:
         api = client._api_client
         base_url = getattr(api._http_options, "base_url", None)
         api_version = getattr(api._http_options, "api_version", None)
         scope = "全局端点（URL 无 location 段）" if base_url == "https://aiplatform.googleapis.com/" \
             else "自定义/区域端点"
-        print(f"🌐 [上游端点] 标准模式解析结果：base_url={base_url} api_version={api_version} "
-              f"project={api.project} location={api.location} → {scope}。"
-              "Express Key 模式下具体区域由 Google 后端路由，无法在客户端指定"
-              "（如需强制指向某端点，可设环境变量 VERTEX_BASE_URL）。")
+        ch = channel_name or "express"
+        key = (ch, getattr(api, "project", None), getattr(api, "location", None),
+               base_url, api_version)
+        if key in _ENDPOINT_LOGGED_KEYS:
+            return
+        _ENDPOINT_LOGGED_KEYS.add(key)
+        suffix = ""
+        if ch == "vertex":
+            proj = getattr(api, "project", None)
+            suffix = (f"（服务账号：SDK 将按 project={proj} / location={getattr(api, 'location', None)} "
+                      "拼标准 Vertex 资源路径）")
+        else:
+            suffix = ("Express Key 模式下具体区域由 Google 后端路由，无法在客户端指定"
+                      "（如需强制指向某端点，可设环境变量 VERTEX_BASE_URL）。")
+        print(f"🌐 [上游端点] {channel_display_name(ch)} 解析结果：base_url={base_url} "
+              f"api_version={api_version} project={getattr(api, 'project', None)} "
+              f"location={getattr(api, 'location', None)} → {scope}。{suffix}")
     except Exception as e:
         print(f"⚠️ [上游端点] 读取端点解析结果失败（不影响调用）：{e}")
 
@@ -358,8 +395,8 @@ class ExpressSDKUpstream(BaseUpstream):
         fallback_model = resolved.get("fallback_model")
         fallback_client_factory = resolved.get("fallback_client_factory")
 
-        _log_resolved_endpoint(client_to_use)
-        print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
+        _log_resolved_endpoint(client_to_use, channel_name=self.channel_name)
+        print(f"🌐 [上游端点] 使用官方 Gemini SDK 通过 {channel_call_text(self.channel_name)} 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
             print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
         if priority_paygo:
@@ -434,7 +471,8 @@ class ExpressSDKUpstream(BaseUpstream):
 
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
-                                                 prefill_active=prefill_active)
+                                                 prefill_active=prefill_active,
+                                                 channel_name=self.channel_name)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
@@ -457,7 +495,30 @@ class ExpressSDKUpstream(BaseUpstream):
                     if k in ("temperature", "top_p", "top_k", "candidate_count",
                              "max_output_tokens", "stop_sequences", "thinking_config",
                              "response_modalities", "image_config")}
-            print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
+            print(f"🔎 [出站调试] {channel_display_name(self.channel_name)} 生成参数={_dbg}")
+            # P1-1：请求形状摘要——safety_settings / 工具声明 / system_instruction /
+            # response_schema / 预填充 / 防截断。只记形状与名称，不打印参数里的敏感值。
+            _shape = []
+            _ss = gen_config_dict.get("safety_settings") or []
+            if _ss:
+                _shape.append("safety_settings=[" + ", ".join(
+                    f"{getattr(s, 'category', s)}/{getattr(s, 'threshold', '')}"
+                    for s in _ss) + "]")
+            _tools_dbg = gen_config_dict.get("tools") or []
+            _tool_names = [f.get("name") for t in _tools_dbg if isinstance(t, dict)
+                           for f in (t.get("function_declarations") or [])
+                           if isinstance(f, dict) and f.get("name")]
+            if _tool_names:
+                _shape.append(f"工具声明={_tool_names}（共 {len(_tool_names)} 个）")
+            if gen_config_dict.get("tool_config"):
+                _shape.append(f"tool_config={gen_config_dict['tool_config']}")
+            _shape.append(f"system_instruction={'有' if gen_config_dict.get('system_instruction') else '无'}")
+            _shape.append(f"response_schema={'有' if gen_config_dict.get('response_schema') else '无'}")
+            _shape.append(f"response_mime_type={gen_config_dict.get('response_mime_type') or '无'}")
+            if synthetic_tool_name:
+                _shape.append(f"防截断合成工具={synthetic_tool_name}")
+            _shape.append(f"预填充={'有（' + str(len(prefill_text)) + ' 字）' if prefill_text else '无'}")
+            print(f"🔎 [出站调试] {channel_display_name(self.channel_name)} 请求形状：{'；'.join(_shape)}")
 
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,

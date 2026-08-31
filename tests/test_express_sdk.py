@@ -31,7 +31,7 @@ class TestNormalizeModelName:
     def test_legacy_pay_rejected(self):
         result = _normalize_model_name("[PAY] gemini-x")
         assert result[1] is False and result[2] is False
-        assert "移除" in result[3]
+        assert "服务账号" in result[3]
 
     def test_openai_direct_rejected(self):
         result = _normalize_model_name("gemini-x-openai")

@@ -428,7 +428,7 @@ curl http://localhost:8050/v1/chat/completions \
 2. 为该服务账号创建 **Key（JSON）** 并下载（安全提示：服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限，请妥善保管、只用于本项目、必要时轮换）。
 3. 在控制台「通道与凭证 → 服务账号」标签页粘贴整段 SA JSON（`client_email` / `private_key` / `project_id` 三个字段必须有），选区域（默认 `global`），保存。或设置环境变量 `VERTEX_SA_FILE` 指向 key 文件路径（docker 挂载场景）。
 
-**旧配置兼容**：带 `[PAY]` 前缀的模型名（旧版服务账号模式的入口）在 `vertex` / `hybrid` 策略下会被自动剥掉前缀走服务账号通道。
+**旧配置兼容**：带 `[PAY]` 前缀的模型名（旧版服务账号模式的入口）在 `vertex` / `hybrid` 策略下会被自动剥掉前缀走服务账号通道。**注意（hybrid 顺序相关）**：`[PAY]` 前缀是在服务账号（vertex）通道内被剥除的；混合自动下若把 Express 排在 vertex 之前，请求会先打到 Express——Express 不认 `[PAY]`，会按"该前缀仅在服务账号通道剥除"返回 400 且不切换（400 属不可切换错误）。需要用 `[PAY]` 时请把策略设为 `vertex`，或在「混合自动」里把服务账号通道排到 Express 之前。
 
 **常见错误**：
 - `403 Permission 'aiplatform.endpoints.predict' denied` → 服务账号缺角色或项目没开计费（见上）。

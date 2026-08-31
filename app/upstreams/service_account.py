@@ -52,7 +52,8 @@ def _on_sa_client_failure(cache_key: tuple, kind: str = "conn", reason: str = ""
         with _SA_CLIENT_CACHE_LOCK:
             _SA_CLIENT_CACHE.pop(cache_key, None)
             _SA_CLIENT_FAILURES.pop(cache_key, None)
-        print(f"⚠️ [SA Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），下次请求重建连接池。")
+        print(f"⚠️ [SA Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），"
+              f"下次请求将重建连接池（状态=evicted）。")
         return
     try:
         threshold = int(app_state.get_setting(
@@ -67,7 +68,8 @@ def _on_sa_client_failure(cache_key: tuple, kind: str = "conn", reason: str = ""
         if cnt >= threshold:
             _SA_CLIENT_CACHE.pop(cache_key, None)
             _SA_CLIENT_FAILURES.pop(cache_key, None)
-            print(f"⚠️ [SA Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已舍弃，下次请求将重建连接池。")
+            print(f"⚠️ [SA Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已淘汰"
+                  f"（状态=evicted），下次请求将重建连接池。")
         else:
             _SA_CLIENT_FAILURES[cache_key] = cnt
 
@@ -134,15 +136,25 @@ def _get_cached_sa_client(sa_json: str, project_id: str, location: str,
     client_reuse 关闭时每请求新建。
     """
     if not app_state.get_setting("client_reuse", True):
+        _log_sa_client_reuse(reused=False)
         return _new_sa_client(sa_json, project_id, location, headers, timeout, cache_key=None)
     headers_key = tuple(sorted((headers or {}).items()))
     cache_key = (sa_json, project_id, location, headers_key)
     with _SA_CLIENT_CACHE_LOCK:
         client = _SA_CLIENT_CACHE.get(cache_key)
+        reused = client is not None
         if client is None:
             client = _new_sa_client(sa_json, project_id, location, headers, timeout, cache_key=cache_key)
             _SA_CLIENT_CACHE[cache_key] = client
+    _log_sa_client_reuse(reused)
     return client
+
+
+def _log_sa_client_reuse(reused: bool) -> None:
+    """P1-3：SA Client 来源日志（new=新建连接池 / reused=命中缓存复用）。"""
+    from api_helpers import channel_display_name
+    print(f"🔌 [SA Client 复用] {channel_display_name('vertex')} 本次请求"
+          f"{'复用缓存 Client' if reused else '新建 Client 连接池'}。")
 
 
 class ServiceAccountUpstream(ExpressSDKUpstream):
@@ -166,6 +178,10 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         for w in warnings:
             print(f"⚠️ [流量等级] {w}")
         client_to_use = _get_cached_sa_client(sa_json, project_id, location, headers, timeout)
+        # 每次调用标明通道身份 + 脱敏 project/location（P0-2/12.3：SA 请求不再被误认为 Express）
+        _proj = (project_id or "（取 SA JSON 自带 project_id）") if project_id else "（取 SA JSON 自带 project_id）"
+        print(f"🌐 [上游请求] 服务账号（Vertex SA）通道：使用 SA 凭证（Bearer）调用模型 {base_model_name}，"
+              f"project={_proj} location={location}（SDK 按 project/location 拼标准 Vertex 资源路径）。")
         return {
             "client": client_to_use,
             "model_to_call": base_model_name,   # 裸名，SDK 按 Client 的 project/location 拼路径

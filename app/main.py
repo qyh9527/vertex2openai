@@ -717,15 +717,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Express Client 复用 -->
+      <!-- Google GenAI Client 复用（Express / 服务账号通道共用） -->
       <div class="card p-5">
         <div class="flex items-center justify-between mb-3">
-          <div class="text-sm font-semibold">Express Client 复用</div>
+          <div class="text-sm font-semibold">Google GenAI Client 复用<span class="text-xs text-neutral-400" style="font-weight:400">（Express / 服务账号通道共用）</span></div>
           <label class="switch"><input type="checkbox" id="client_reuse"><span class="slider"></span></label>
         </div>
         <div class="space-y-3">
           <div class="flex items-center justify-between"><span class="text-sm">连接级失败自动舍弃阈值(次)<span class="helpq" onclick="hlp(this,'h_cre')">?</span></span><input id="client_reuse_evict_threshold" type="number" class="inp" style="width:90px"></div>
-          <div id="h_cre" class="helpbox">google-genai 的 Client 复用了 httpx 连接池（省 TLS 握手）；但长驻进程里可能残留<b>失效的 keep-alive 连接</b>，导致连续的连接级错误（<code>RemoteProtocolError</code> / <code>ConnectError</code> / 超时）。<br>此开关开启时：缓存 Client 连续连接级失败达到阈值（默认 5 次，0=不自动舍弃）即<b>自动舍弃</b>，下次请求重建连接池。<b>429 限流不算连接级失败</b>（连接本身健康），不会误触发。安全策略拦截等硬错误会<b>立即舍弃</b>，不等阈值。<br>关闭此开关：每个请求都新建 Client（彻底避免复用失效连接），但失去连接复用、延迟开销增大——仅排查"复用后持续连接错误"时临时用。</div>
+          <div id="h_cre" class="helpbox"><b>作用对象：Express 与 服务账号两条 SDK 通道</b>。google-genai 的 Client 复用了 httpx 连接池（省 TLS 握手）；但长驻进程里可能残留<b>失效的 keep-alive 连接</b>，导致连续的连接级错误（<code>RemoteProtocolError</code> / <code>ConnectError</code> / 超时）。<br>此开关开启时：缓存 Client 连续连接级失败达到阈值（默认 5 次，0=不自动舍弃）即<b>自动舍弃</b>，下次请求重建连接池。<b>429 限流不算连接级失败</b>（连接本身健康），不会误触发。安全策略拦截等硬错误会<b>立即舍弃</b>，不等阈值。<br>关闭此开关：每个请求都新建 Client（彻底避免复用失效连接），但失去连接复用、延迟开销增大——仅排查"复用后持续连接错误"时临时用。</div>
         </div>
       </div>
 
@@ -752,7 +752,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
-            <div id="h_dbg" class="helpbox">两条通道都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>
+            <div id="h_dbg" class="helpbox">两条 SDK 通道（Express / 服务账号）都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数（标注当前通道名）。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>
           </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
@@ -1742,7 +1742,7 @@ async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_
     }
     strategy = mapping.get(raw)
     if strategy is None:
-        return JSONResponse(status_code=400, content={"error": "无效的通道模式，应为 express / cookie / vertex / hybrid。"})
+        return JSONResponse(status_code=400, content={"error": "无效的通道模式，应为 express / cookie / vertex / hybrid（vertex = 服务账号 SA 通道）。"})
     if not app_state.set_channel_strategy(strategy):
         return JSONResponse(status_code=400, content={"error": "设置通道策略失败。"})
     return JSONResponse(content={"status": "success", "channel_strategy": strategy})
