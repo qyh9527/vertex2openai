@@ -26,7 +26,9 @@ jobs:
         cache-dependency-path: app/requirements.txt
 
     - name: Install dependencies
-      run: pip install -r app/requirements.txt
+      run: |
+        pip install -r app/requirements.txt
+        pip install pytest
 
     - name: Compile smoke (import all app modules)
       run: python -m compileall -q app
