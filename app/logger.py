@@ -52,13 +52,49 @@ def _setup_file_logger():
 file_logger = _setup_file_logger()
 
 
+def classify_error(status=None, message="") -> str:
+    """把一次错误归类到固定分类（数据概览「错误/拦截分类」用）。
+
+    分类依据 Google 官方错误码与安全拦截原因（HTTP 429 RESOURCE_EXHAUSTED /
+    401 UNAUTHENTICATED / 403 PERMISSION_DENIED / blockReason SAFETY、
+    PROHIBITED_CONTENT、RECITATION、BLOCKLIST、SPII、IMAGE_SAFETY 等），
+    再叠加本项目的自身错误形态（Cookie 失效、空流、客户端断开）。
+    语义消息优先于状态码（同一个 400 可能是安全拦截）。
+    """
+    s = status if isinstance(status, int) else None
+    low = str(message or "").lower()
+    if s == 499 or "客户端已断开" in low or "client_closed" in low:
+        return "客户端断开"
+    if ("安全策略拦截" in low or "prohibited_content" in low or "content_filter" in low
+            or any(k in low for k in ("safety", "recitation", "blocklist",
+                                      "spii", "image_safety"))):
+        return "安全拦截"
+    if s in (401, 403) or any(k in low for k in ("cookie", "unauthenticated",
+                                                  "permission denied",
+                                                  "凭证", "权限")):
+        return "凭证/权限失效"
+    if (s == 429 or "429" in low or "quota" in low or "too many requests" in low
+            or "resource_exhausted" in low):
+        return "429 限流/配额"
+    if any(k in low for k in ("未返回任何内容", "无有效内容", "空流", "未返回任何响应")):
+        return "空流/无有效内容"
+    if s is not None:
+        if 500 <= s <= 599:
+            return "5xx 上游错误"
+        if 400 <= s <= 499:
+            return f"HTTP {s} 请求错误"
+    return "其他错误"
+
+
 class ProxyStats:
     """算力消耗统计：内存累计 + 持久化到 STATE_DIR/stats.json（重建容器不丢）。
 
     设计（参考 new-api / one-api / LiteLLM 等网关的用量追踪做法，适配单实例 JSON 落盘）：
       - 每次请求把 prompt/completion tokens 与请求数累加到内存，并写入"当天"的按天聚合；
       - 写盘节流（默认 30s 一次，原子写临时文件 + rename），启动时从磁盘恢复历史；
-      - 前端展示累计数字 + 最近 7/30 天趋势柱状图。
+      - 前端展示累计数字 + 最近 7/30 天趋势柱状图；
+      - 按天聚合含 requests/success/error/retries，另有按小时聚合（最近 72 小时桶）
+        与错误分类计数 error_categories（供数据概览按小时趋势与分类排行）。
     """
 
     def __init__(self):
@@ -71,7 +107,9 @@ class ProxyStats:
         self.completion_tokens = 0
         self.cached_prompt_tokens = 0     # 命中上下文缓存的输入 token（隐式缓存 90% 折扣）
         self.cost = 0.0                   # 估算美刀成本（按官方按量价，见 model_pricing）
-        self._daily = {}          # "YYYY-MM-DD" -> {requests, success, prompt_tokens, completion_tokens, cached_prompt_tokens, cost}
+        self.error_categories = {}        # 分类名 -> 次数（classify_error 的固定分类集）
+        self._daily = {}          # "YYYY-MM-DD" -> {requests, success, error, retries, prompt_tokens, completion_tokens, cached_prompt_tokens, cost}
+        self._hourly = {}          # "YYYY-MM-DD HH" -> {requests, success, error, retries}（最近 72 桶）
         self._last_save = 0.0
         self.lock = threading.Lock()
         self._load_from_disk()
@@ -80,6 +118,15 @@ class ProxyStats:
 
     def _today_key(self) -> str:
         return time.strftime("%Y-%m-%d")
+
+    def _this_hour_key(self) -> str:
+        return time.strftime("%Y-%m-%d %H")
+
+    def _prune_hourly(self):
+        """只保留最近 72 个小时桶（3 天），防止无界增长。"""
+        if len(self._hourly) > 72:
+            for k in sorted(self._hourly)[:len(self._hourly) - 72]:
+                self._hourly.pop(k, None)
 
     def _load_from_disk(self):
         """启动时恢复历史统计（与 web_state.json 同目录、同在挂载卷内）。"""
@@ -100,6 +147,13 @@ class ProxyStats:
             daily = data.get("daily") or {}
             if isinstance(daily, dict):
                 self._daily = {k: dict(v) for k, v in daily.items() if isinstance(v, dict)}
+            hourly = data.get("hourly") or {}
+            if isinstance(hourly, dict):
+                self._hourly = {k: dict(v) for k, v in hourly.items() if isinstance(v, dict)}
+            cats = data.get("error_categories") or {}
+            if isinstance(cats, dict):
+                self.error_categories = {str(k): int(v) for k, v in cats.items()
+                                          if isinstance(v, (int, float))}
             print(f"📊 [用量统计] 已恢复历史：请求 {self.total_requests} 次，"
                   f"累计 {self.prompt_tokens + self.completion_tokens} tokens，"
                   f"按天记录 {len(self._daily)} 天。")
@@ -123,6 +177,8 @@ class ProxyStats:
                     "cost": round(self.cost, 6),
                 },
                 "daily": self._daily,
+                "hourly": self._hourly,
+                "error_categories": self.error_categories,
             }
             tmp = STATS_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -135,16 +191,19 @@ class ProxyStats:
         except Exception as e:
             print(f"⚠️ [用量统计] 落盘失败（不影响运行）：{e}")
 
-    def _touch_daily(self, prompt=0, completion=0, success=0, request=0,
-                     cached=0, cost=0.0):
+    def _touch_daily(self, prompt=0, completion=0, success=0, request=0, error=0,
+                     retry=0, cached=0, cost=0.0):
         key = self._today_key()
         day = self._daily.get(key)
         if day is None:
-            day = {"requests": 0, "success": 0, "prompt_tokens": 0,
-                   "completion_tokens": 0, "cached_prompt_tokens": 0, "cost": 0.0}
+            day = {"requests": 0, "success": 0, "error": 0, "retries": 0,
+                   "prompt_tokens": 0, "completion_tokens": 0,
+                   "cached_prompt_tokens": 0, "cost": 0.0}
             self._daily[key] = day
         day["requests"] = day.get("requests", 0) + request
         day["success"] = day.get("success", 0) + success
+        day["error"] = day.get("error", 0) + error
+        day["retries"] = day.get("retries", 0) + retry
         day["prompt_tokens"] = day.get("prompt_tokens", 0) + prompt
         day["completion_tokens"] = day.get("completion_tokens", 0) + completion
         day["cached_prompt_tokens"] = day.get("cached_prompt_tokens", 0) + cached
@@ -153,6 +212,18 @@ class ProxyStats:
         if len(self._daily) > 180:
             for k in sorted(self._daily)[:len(self._daily) - 180]:
                 self._daily.pop(k, None)
+
+    def _touch_hourly(self, success=0, request=0, error=0, retry=0):
+        key = self._this_hour_key()
+        hour = self._hourly.get(key)
+        if hour is None:
+            hour = {"requests": 0, "success": 0, "error": 0, "retries": 0}
+            self._hourly[key] = hour
+        hour["requests"] = hour.get("requests", 0) + request
+        hour["success"] = hour.get("success", 0) + success
+        hour["error"] = hour.get("error", 0) + error
+        hour["retries"] = hour.get("retries", 0) + retry
+        self._prune_hourly()
 
     def _maybe_save(self):
         """节流写盘（默认 30s 一次），避免每个请求都做一次磁盘 IO。"""
@@ -174,16 +245,27 @@ class ProxyStats:
         with self.lock:
             self.total_requests += 1
             self._touch_daily(request=1)
+            self._touch_hourly(request=1)
             self._maybe_save()
 
-    def add_error(self):
+    def add_error(self, status=None, message=""):
+        """计一次错误；可选带 HTTP 状态与消息用于分类统计。"""
         with self.lock:
             self.error_requests += 1
+            self._touch_daily(error=1)
+            self._touch_hourly(error=1)
+            try:
+                cat = classify_error(status, message)
+                self.error_categories[cat] = self.error_categories.get(cat, 0) + 1
+            except Exception:
+                pass
             self._maybe_save()
 
     def add_retry(self):
         with self.lock:
             self.retry_counts += 1
+            self._touch_daily(retry=1)
+            self._touch_hourly(retry=1)
             self._maybe_save()
 
     def add_success(self):
@@ -191,6 +273,7 @@ class ProxyStats:
         with self.lock:
             self.success_requests += 1
             self._touch_daily(success=1)
+            self._touch_hourly(success=1)
             self._maybe_save()
 
     def add_tokens(self, p_tokens, c_tokens, cached=0, model=None, tier="standard"):
@@ -214,11 +297,13 @@ class ProxyStats:
             self.success_requests += 1
             self._touch_daily(prompt=p_tokens, completion=c_tokens, success=1,
                               cached=cached, cost=cost)
+            self._touch_hourly(success=1)
             self._maybe_save()
 
     def get_json_stats(self):
         with self.lock:
             daily = [{"date": d, **(self._daily[d] or {})} for d in sorted(self._daily)]
+            hourly = [{"hour": k, **(self._hourly[k] or {})} for k in sorted(self._hourly)]
             return {
                 "uptime": round(time.time() - self.start_time, 2),
                 "total": self.total_requests,
@@ -230,6 +315,9 @@ class ProxyStats:
                 "cached_prompt_tokens": self.cached_prompt_tokens,
                 "cost": round(self.cost, 6),
                 "daily": daily,
+                "hourly": hourly,
+                "error_categories": dict(sorted(self.error_categories.items(),
+                                                key=lambda kv: -kv[1])),
             }
 
 

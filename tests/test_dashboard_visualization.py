@@ -20,3 +20,19 @@ def test_dashboard_health_chart_uses_status_colors_not_black_success_segment():
     """成功分段应使用健康状态绿，不能把成功画成黑色。"""
     assert "const CHART_COLORS={success:'#0ca30c'" in DASHBOARD_HTML
     assert "colors=['#171717'" not in DASHBOARD_HTML
+
+
+def test_dashboard_request_trend_granularity_switch():
+    """请求量趋势：按小时/7 天/30 天三档粒度切换（对齐 sub2api 的 granularity 做法）。"""
+    assert "function renderReqTrend(gran)" in DASHBOARD_HTML
+    assert "req-gran-hour" in DASHBOARD_HTML
+    assert "req-gran-day7" in DASHBOARD_HTML
+    assert "req-gran-day30" in DASHBOARD_HTML
+    assert "HOURLY=d.hourly||[]" in DASHBOARD_HTML
+
+
+def test_dashboard_error_categories_panel():
+    """错误/拦截分类统计面板：后端 error_categories 驱动，排行展示重复次数。"""
+    assert "ERROR_CATS=d.error_categories||{}" in DASHBOARD_HTML
+    assert "function renderErrorCats()" in DASHBOARD_HTML
+    assert "error-cat-list" in DASHBOARD_HTML

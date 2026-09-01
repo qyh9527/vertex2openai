@@ -1445,7 +1445,7 @@ class CookieProxyUpstream(BaseUpstream):
                     if failover_mode:
                         raise UpstreamUnstartedError(res.get("message", "生图失败"))
                     yield _make_openai_chunk(response_id, model_display, role="assistant")
-                    stats.add_error()
+                    stats.add_error(message=res.get("message", "生图失败"))
                     print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
                     yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {res.get('message', '生图失败')}")
                     yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
@@ -1615,7 +1615,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     raise UpstreamUnstartedError(data)
                                 if not has_yielded_to_client:
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                stats.add_error()
+                                stats.add_error(message=data)
                                 print(f"🔑 [Studio] 权限错误: {data[:150]}")
                                 yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
                                 yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
@@ -1639,7 +1639,7 @@ class CookieProxyUpstream(BaseUpstream):
                                         yield _make_openai_chunk(response_id, model_display, role="assistant")
 
                                     err_prefix = "不可重试错误" if status == "fatal_error" else "重试耗尽"
-                                    stats.add_error()
+                                    stats.add_error(message=data)
                                     print(f"❌ [Studio] {err_prefix} | {data[:150]}")
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
                                     yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
@@ -1702,7 +1702,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 detail += f"；promptFeedback 拦截：{blocked_msg}"
                             desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
                             hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
-                            stats.add_error()
+                            stats.add_error(message=detail)
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             yield _make_openai_chunk(
@@ -1879,7 +1879,7 @@ class CookieProxyUpstream(BaseUpstream):
                             detail += f"；promptFeedback 拦截：{blocked_msg}"
                         desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
                         hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
-                        stats.add_error()
+                        stats.add_error(message=detail)
                         print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                         full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"

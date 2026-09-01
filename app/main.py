@@ -69,10 +69,10 @@ async def stats_tracker_middleware(request: Request, call_next):
         try:
             response = await call_next(request)
             if response.status_code >= 400:
-                stats.add_error()
+                stats.add_error(status=response.status_code)
             return response
         except Exception as e:
-            stats.add_error()
+            stats.add_error(message=str(e))
             raise e
     return await call_next(request)
 
@@ -247,7 +247,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; --viz-prompt:#2a78d6; --viz-completion:#eb6834; --viz-track:#f3f4f6; --viz-grid:#e5e7eb; --status-good:#0ca30c; --status-warning:#f59e0b; --status-critical:#d03b3b; }
+  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; --viz-prompt:#2a78d6; --viz-completion:#eb6834; --viz-track:#f3f4f6; --viz-grid:#e5e7eb; --status-good:#0ca30c; --status-warning:#f59e0b; --status-critical:#d03b3b; --viz-hour:#3987e5; --viz-cat1:#3987e5; --viz-cat2:#1baf7a; --viz-cat3:#e87ba4; --viz-cat4:#4a3aa7; }
   * { -webkit-font-smoothing:antialiased; }
   body { background:var(--bg); color:var(--fg); font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif; }
   .card { background:#fff; border:1px solid var(--border); border-radius:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
@@ -329,6 +329,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .trend-segment { min-height:0; }
   .trend-segment.prompt { background:var(--viz-prompt); }
   .trend-segment.completion { background:var(--viz-completion); }
+  /* 请求量趋势复用堆叠段样式，但颜色由内联 status-*/viz-hour 变量给出 */
   .trend-zero { width:min(24px,72%); height:2px; border-radius:999px; background:var(--viz-grid); }
   .trend-label { color:#898781; font-size:10px; line-height:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .trend-tooltip { position:absolute; z-index:10; left:50%; bottom:8px; width:max-content; max-width:152px; padding:7px 8px; border:1px solid var(--border); border-radius:8px; background:#fff; color:var(--fg); box-shadow:0 8px 18px rgba(16,24,40,.12); font-size:11px; line-height:1.55; opacity:0; pointer-events:none; transform:translate(-50%,4px); transition:opacity .14s ease,transform .14s ease; }
@@ -414,6 +415,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+    </div>
+    <!-- 请求量趋势（总请求/成功/重试/错误，按天或按小时；参考 sub2api 的 granularity 切换） -->
+    <div class="card p-5 mt-3">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <div class="lbl">请求量趋势 <span class="text-neutral-400 font-normal">· 总请求 / 成功 / 拥堵重试 / 错误（堆叠，悬停查看明细）</span></div>
+        <div class="flex gap-1 text-xs shrink-0">
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-hour" onclick="renderReqTrend('hour')">按小时 · 24h</button>
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-day7" onclick="renderReqTrend('day7')">7 天</button>
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-day30" onclick="renderReqTrend('day30')">30 天</button>
+        </div>
+      </div>
+      <div class="trend-legend mb-2" aria-label="请求量趋势图例"><span class="trend-legend-item"><i class="legend-dot success"></i>成功</span><span class="trend-legend-item"><i class="legend-dot retry"></i>重试</span><span class="trend-legend-item"><i class="legend-dot error"></i>错误</span><span class="trend-legend-item"><i class="trend-swatch" style="background:var(--viz-hour)"></i>其他（未收尾）</span></div>
+      <div id="req-trend-chart" class="trend-chart" role="group" aria-label="按天或按小时的请求量堆叠趋势图"></div>
+      <div id="req-trend-empty" class="text-xs text-neutral-400 py-2">暂无历史数据。</div>
+    </div>
+    <!-- 错误 / 拦截分类统计：某类错误重复了几次，一目了然 -->
+    <div class="card p-5 mt-3">
+      <div class="lbl mb-3">错误 / 拦截分类 <span class="text-neutral-400 font-normal">· 按官方错误码与拦截原因归类，累计计数</span></div>
+      <div id="error-cat-list" class="space-y-2.5"><div class="text-xs text-neutral-400">暂无错误记录。</div></div>
     </div>
   </section>
 
@@ -960,8 +980,120 @@ async function fetchStats(){
     $('t-cost').textContent='$'+((d.cost||0)).toFixed(4);
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
     DAILY=d.daily||[]; renderTrend();
+    HOURLY=d.hourly||[]; renderReqTrend();
+    ERROR_CATS=d.error_categories||{}; renderErrorCats();
     renderChart(d.success,d.error,d.retries);
   }catch(e){}
+}
+
+/* ---------- 请求量趋势（按天/按小时）与错误分类 ---------- */
+let HOURLY=[], ERROR_CATS={}, REQ_GRAN='hour';
+function setReqGranBtn(){
+  ['req-gran-hour','req-gran-day7','req-gran-day30'].forEach(id=>{
+    const b=$(id); if(!b) return;
+    const on=(id==='req-gran-'+REQ_GRAN);
+    b.style.background=on?'var(--accent)':''; b.style.color=on?'#fff':'';
+  });
+}
+function hourKeyToDate(key){
+  /* "YYYY-MM-DD HH" -> 当天 12:00 的 Date（避免时区偏移），供窗口对齐 */
+  const m=/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2})$/.exec(String(key||'').trim());
+  return m ? {date:new Date(+m[1],+m[2]-1,+m[3],12), h:+m[4]} : null;
+}
+function buildHourWindow(n){
+  const byHour=new Map((HOURLY||[]).filter(d=>d&&hourKeyToDate(d.hour)).map(d=>[d.hour,d]));
+  const now=new Date();
+  const p=x=>String(x).padStart(2,'0');
+  return Array.from({length:n},(_,i)=>{
+    /* 从整点回推 n 小时；小时桶 key 是 "YYYY-MM-DD HH"（后端北京时间） */
+    const dt=new Date(now.getFullYear(),now.getMonth(),now.getDate(),now.getHours()-n+1+i);
+    const key=`${dt.getFullYear()}-${p(dt.getMonth()+1)}-${p(dt.getDate())} ${p(dt.getHours())}`;
+    return {hour:key,...(byHour.get(key)||{})};
+  });
+}
+function buildReqDayWindow(days){
+  /* 与 Token 趋势同源：复用 DAILY 按天聚合（requests/success/error/retries 已在 stats 里） */
+  const byDate=new Map((DAILY||[]).filter(d=>d&&keyToLocalDate(d.date)).map(d=>[d.date,d]));
+  const latest=(DAILY||[]).length ? keyToLocalDate(DAILY[DAILY.length-1].date) : null;
+  const end=latest || new Date();
+  end.setHours(12,0,0,0);
+  return Array.from({length:days},(_,i)=>{
+    const date=new Date(end); date.setDate(end.getDate()-days+1+i);
+    const key=dateKey(date);
+    return {date:key,...(byDate.get(key)||{})};
+  });
+}
+function renderReqTrend(gran){
+  if(gran) REQ_GRAN=gran;
+  const c=$('req-trend-chart'); if(!c) return;
+  setReqGranBtn();
+  let slots, labelOf, tipTitle;
+  if(REQ_GRAN==='hour'){
+    slots=buildHourWindow(24);
+    labelOf=(s,i)=>(i%3===0)?s.hour.slice(11)+':00':'';
+    tipTitle=s=>s.hour.replace(' ', ' ');
+  }else{
+    const days=(REQ_GRAN==='day30')?30:7;
+    slots=buildReqDayWindow(days);
+    labelOf=(s,i)=>{const l=s.date.slice(5).replace('-','/'); return (days<=7||i===0||i===slots.length-1||i%5===0)?l:'';};
+    tipTitle=s=>s.date;
+  }
+  const num=v=>Math.max(0,Number(v)||0);
+  const totalOf=s=>num(s.success)+num(s.error)+num(s.retries);
+  const maxV=Math.max(1,...slots.map(totalOf));
+  c.style.setProperty('--trend-columns',String(slots.length));
+  c.replaceChildren();
+  const empty=$('req-trend-empty');
+  if(empty){ const has=slots.some(s=>totalOf(s)>0||num(s.requests)>0); empty.style.display=has?'none':'block'; empty.textContent=has?'':'暂无历史数据。'; }
+  slots.forEach((s,index)=>{
+    const success=num(s.success), retries=num(s.retries), error=num(s.error);
+    /* 进行中/未收尾（总请求-成功-错误>0）画成中性蓝段，不冒充结果分类 */
+    const other=Math.max(0,num(s.requests)-success-error);
+    const total=success+retries+error;
+    const height=total?Math.max(6,Math.round(total/maxV*100)):0;
+    const segments=[];
+    if(success) segments.push(`<span class="trend-segment" style="flex:${success} 1 0;background:var(--status-good)"></span>`);
+    if(retries) segments.push(`<span class="trend-segment" style="flex:${retries} 1 0;background:var(--status-warning)"></span>`);
+    if(error) segments.push(`<span class="trend-segment" style="flex:${error} 1 0;background:var(--status-critical)"></span>`);
+    if(other) segments.push(`<span class="trend-segment" style="flex:${other} 1 0;background:var(--viz-hour)"></span>`);
+    const label=labelOf(s,index);
+    const cell=document.createElement('div');
+    cell.className='trend-cell';
+    cell.innerHTML=`<div class="trend-bar-zone"><div class="trend-mark" tabindex="0" role="img" aria-label="${tipTitle(s)}：成功 ${fmt(success)}，重试 ${fmt(retries)}，错误 ${fmt(error)}">${total?`<div class="trend-bar" style="height:${height}%">${segments.join('')}</div>`:'<div class="trend-zero"></div>'}<div class="trend-tooltip" role="tooltip"><strong>${tipTitle(s)}</strong><span>成功：${fmt(success)}</span><br><span>重试：${fmt(retries)}</span><br><span>错误：${fmt(error)}</span>${other?`<br><span>其他（未收尾）：${fmt(other)}</span>`:''}</div></div></div><div class="trend-label">${label||'&nbsp;'}</div>`;
+    c.appendChild(cell);
+  });
+}
+const ERR_CAT_COLORS=['var(--viz-cat1)','var(--viz-cat2)','var(--viz-cat3)','var(--viz-cat4)'];
+function renderErrorCats(){
+  const box=$('error-cat-list'); if(!box) return;
+  const entries=Object.entries(ERROR_CATS||{}).filter(([,v])=>Number(v)>0).sort((a,b)=>b[1]-a[1]);
+  box.replaceChildren();
+  if(!entries.length){
+    const p=document.createElement('div');
+    p.className='text-xs text-neutral-400'; p.textContent='暂无错误记录。';
+    box.appendChild(p); return;
+  }
+  const max=Math.max(1,...entries.map(([,v])=>Number(v)||0));
+  entries.forEach(([name,count],i)=>{
+    const v=Number(count)||0;
+    const row=document.createElement('div');
+    row.className='flex items-center gap-3';
+    const swatch=document.createElement('i');
+    swatch.className='legend-dot shrink-0';
+    swatch.style.background=ERR_CAT_COLORS[i%ERR_CAT_COLORS.length];
+    const nameSpan=document.createElement('span');
+    nameSpan.className='text-xs text-neutral-600 min-w-0 truncate'; nameSpan.textContent=name; nameSpan.title=name;
+    const track=document.createElement('div');
+    track.className='metric-track flex-1';
+    const fill=document.createElement('div');
+    fill.className='metric-fill'; fill.style.width=Math.max(3,Math.round(v/max*100))+'%';
+    fill.style.background=ERR_CAT_COLORS[i%ERR_CAT_COLORS.length];
+    track.appendChild(fill);
+    const val=document.createElement('span');
+    val.className='val text-xs font-semibold shrink-0'; val.textContent=fmt(v)+' 次';
+    row.append(swatch,nameSpan,track,val);
+    box.appendChild(row);
+  });
 }
 
 /* ---------- Channel ---------- */

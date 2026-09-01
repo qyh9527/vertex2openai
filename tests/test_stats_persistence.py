@@ -83,3 +83,63 @@ class TestStatsPersistence:
     def test_read_recent_log_lines_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("STATE_DIR", str(tmp_path))
         assert logger_mod.read_recent_log_lines(5) == []
+
+    # ---------- 按天 requests/success/error/retries + 按小时聚合（数据概览趋势图） ----------
+
+    def test_daily_request_outcome_fields(self, tmp_path, monkeypatch):
+        """按天聚合必须带 requests/success/error/retries，供按天趋势图堆叠。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.increment_total(); st.add_success(); st.add_error(); st.add_retry()
+        st._flush()
+        st2 = logger_mod.ProxyStats()
+        day = st2.get_json_stats()["daily"][0]
+        assert day["requests"] == 1
+        assert day["success"] == 1
+        assert day["error"] == 1
+        assert day["retries"] == 1
+
+    def test_hourly_recorded_and_persisted(self, tmp_path, monkeypatch):
+        """按小时聚合落盘并可恢复（前端 24h 趋势图数据源）。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.increment_total(); st.add_success(); st.add_error(); st.add_retry()
+        st._flush()
+        st2 = logger_mod.ProxyStats()
+        hourly = st2.get_json_stats()["hourly"]
+        assert len(hourly) == 1
+        assert hourly[0]["requests"] == 1
+        assert hourly[0]["success"] == 1
+        assert hourly[0]["error"] == 1
+        assert hourly[0]["retries"] == 1
+
+    def test_hourly_pruned_to_72_buckets(self, tmp_path, monkeypatch):
+        """小时桶只保留最近 72 个，防止无界增长。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        for i in range(80):
+            st._hourly[f"2026-08-{i:02d} 00"] = {"requests": 1}
+        st._touch_hourly(request=1)
+        assert len(st._hourly) <= 72
+
+    # ---------- 错误分类统计 ----------
+
+    def test_error_categories_classified_and_persisted(self, tmp_path, monkeypatch):
+        """错误按官方错误码/拦截原因归类计数，且落盘恢复。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.add_error(status=429)                                   # 429 限流/配额
+        st.add_error(message="Agent Platform 安全策略拦截了请求：PROHIBITED_CONTENT")
+        st.add_error(message="Agent Platform 安全策略拦截了请求：PROHIBITED_CONTENT")
+        st.add_error(status=401, message="API key not valid. Please pass a valid API key.")
+        st._flush()
+        st2 = logger_mod.ProxyStats()
+        cats = st2.get_json_stats()["error_categories"]
+        assert cats["安全拦截"] == 2
+        assert cats["429 限流/配额"] == 1
+        assert cats["凭证/权限失效"] == 1
+
+    def test_error_categories_sorted_desc(self, tmp_path, monkeypatch):
+        """分类列表按次数降序（前端排行榜顺序即 API 顺序）。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.add_error(status=500)
+        st.add_error(status=500)
+        st.add_error(status=429)
+        cats = st.get_json_stats()["error_categories"]
+        assert list(cats) == ["5xx 上游错误", "429 限流/配额"]
