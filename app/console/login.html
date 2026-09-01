@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · agentplatform2api</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>body{background:#fbfbfd;font-family:'Inter',system-ui,sans-serif;color:#18181b}
+.inp{border:1px solid #e8e8ec;border-radius:10px;padding:11px 13px;width:100%;outline:none;font-size:15px}
+.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+.btn{background:#4f46e5;color:#fff;border-radius:10px;font-weight:600;padding:11px;width:100%;transition:.15s}
+.btn:hover{background:#4338ca}</style>
+</head><body class="min-h-screen flex items-center justify-center px-4">
+  <div class="w-full max-w-sm">
+    <div class="flex items-center gap-3 mb-6 justify-center">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="11" fill="url(#lg)"/>
+      <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/><path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
+      <span class="text-lg font-bold tracking-tight">agentplatform2api</span>
+    </div>
+    <div class="bg-white border border-neutral-200 rounded-2xl p-6 shadow-sm">
+      <p class="text-sm text-neutral-500 mb-4">请输入访问密码（即 API_KEY）</p>
+      <form id="f" onsubmit="return doLogin(event)">
+        <input id="pw" type="password" class="inp mb-3" placeholder="密码" autofocus autocomplete="current-password">
+        <button class="btn" type="submit">进入控制台</button>
+      </form>
+      <p id="err" class="text-xs text-rose-600 mt-3 h-4"></p>
+    </div>
+  </div>
+<script>
+async function doLogin(e){
+  e.preventDefault();
+  const pw=document.getElementById('pw').value;
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  if(r.ok){ location.href='/'; } else { document.getElementById('err').textContent='密码错误，请重试'; }
+  return false;
+}
+</script>
+</body></html>

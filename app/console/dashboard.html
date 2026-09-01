@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agentplatform2api · 控制台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; --viz-prompt:#2a78d6; --viz-completion:#eb6834; --viz-track:#f3f4f6; --viz-grid:#e5e7eb; --status-good:#0ca30c; --status-warning:#f59e0b; --status-critical:#d03b3b; --viz-hour:#3987e5; --viz-cat1:#3987e5; --viz-cat2:#1baf7a; --viz-cat3:#e87ba4; --viz-cat4:#4a3aa7; }
+  * { -webkit-font-smoothing:antialiased; }
+  body { background:var(--bg); color:var(--fg); font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .lbl { font-size:12px; color:var(--muted); font-weight:500; }
+  .val { font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+  .btn { background:var(--accent); color:#fff; border-radius:9px; font-weight:600; transition:.15s; box-shadow:0 1px 2px rgba(79,70,229,.25); }
+  .btn:hover { background:var(--accent-hover); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-ghost { background:#fff; color:var(--fg); border:1px solid var(--border); border-radius:9px; font-weight:500; }
+  .btn-ghost:hover { background:#f7f7f9; }
+  .inp { border:1px solid var(--border); border-radius:9px; background:#fff; font-size:14px; padding:8px 10px; width:100%; outline:none; transition:.15s; color:var(--fg); }
+  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+  .inp:disabled { background:#f4f4f6; color:#a1a1aa; }
+  .tab { padding:14px 4px; font-size:14px; font-weight:500; color:var(--muted); border-bottom:2px solid transparent; cursor:pointer; white-space:nowrap; }
+  .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .tab:hover:not(.active){ color:var(--fg); }
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); background:#fff; color:#52525b; }
+  .pill-accent { border-color:transparent; background:rgba(79,70,229,.08); color:var(--accent); font-weight:600; }
+  .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#dcdce3;border-radius:8px}
+  ::-webkit-scrollbar-thumb:hover{background:#c0c0ca}
+  .toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--fg); color:#fff; padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:.25s; pointer-events:none; z-index:50; }
+  .modal-mask{position:fixed;inset:0;background:rgba(15,15,20,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
+  .modal-card{background:#fff;border-radius:14px;width:min(560px,94vw);max-height:82vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+  .toast.show { opacity:1; }
+  .switch { position:relative; width:40px; height:22px; }
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:#e4e4e7;border-radius:999px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+  input:checked + .slider{background:var(--accent)}
+  input:checked + .slider:before{transform:translateX(18px)}
+  .hero { background:linear-gradient(180deg,#fff, #fbfbfd); border:1px solid var(--border); border-radius:16px; }
+  /* 说明收纳：面板功能很多，长说明平铺会挤爆版面，但说明本身不能省。
+     统一收进 ⓘ 折叠块——默认只占一个图标，点开才展开详细文字。 */
+  .helpq { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+           border-radius:50%; border:1px solid #d4d4d8; color:#a1a1aa; font-size:10px; line-height:1;
+           cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s; }
+  .helpq:hover { border-color:var(--accent); color:var(--accent); background:rgba(79,70,229,.06); }
+  .helpq.on { border-color:var(--accent); color:#fff; background:var(--accent); }
+  .helpbox { display:none; margin-top:7px; padding:9px 11px; border-radius:9px; background:#f7f7fa;
+             border:1px solid #ececf1; font-size:12px; line-height:1.75; color:#52525b; }
+  .helpbox.show { display:block; }
+  /* 手机端：帮助文字里的长标识符（模型资源路径、URL）必须能断行，否则会把整张卡片撑破 */
+  .helpbox, .helpbox code { overflow-wrap:anywhere; word-break:break-word; }
+  .helpbox code { display:inline; white-space:normal; }
+  .helpbox b { color:var(--fg); }
+  .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
+
+  /* 数据概览：所有数据色在此集中定义，避免默认黑色把健康度/趋势误画成无信息色块。 */
+  .metric-track { height:7px; border-radius:999px; overflow:hidden; background:var(--viz-track); }
+  .metric-fill { height:100%; width:0; border-radius:999px; transition:width .3s ease; }
+  .metric-fill.prompt { background:var(--viz-prompt); }
+  .metric-fill.completion { background:var(--viz-completion); }
+  .health-ring { position:relative; width:144px; height:144px; flex:0 0 auto; }
+  .health-ring canvas { width:100% !important; height:100% !important; }
+  .health-centre { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; pointer-events:none; }
+  .health-centre strong { color:var(--fg); font-size:25px; line-height:1; letter-spacing:-.04em; }
+  .health-centre span { margin-top:5px; color:var(--muted); font-size:11px; }
+  .health-legend { width:100%; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-top:15px; }
+  .health-legend-item { min-width:0; padding:7px 6px; border:1px solid #f0f0f2; border-radius:8px; background:#fcfcfd; text-align:center; }
+  .health-legend-label { display:flex; align-items:center; justify-content:center; gap:4px; color:var(--muted); font-size:10px; white-space:nowrap; }
+  .health-legend-value { display:block; margin-top:2px; color:var(--fg); font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .legend-dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; }
+  .legend-dot.success { background:var(--status-good); }
+  .legend-dot.error { background:var(--status-critical); }
+  .legend-dot.retry { background:var(--status-warning); }
+  .trend-legend { display:flex; align-items:center; gap:12px; color:var(--muted); font-size:11px; }
+  .trend-legend-item { display:inline-flex; align-items:center; gap:5px; }
+  .trend-swatch { width:9px; height:9px; border-radius:3px; }
+  .trend-swatch.prompt { background:var(--viz-prompt); }
+  .trend-swatch.completion { background:var(--viz-completion); }
+  .trend-chart { --trend-columns:7; display:grid; grid-template-columns:repeat(var(--trend-columns),minmax(0,1fr)); gap:clamp(4px,1vw,8px); height:132px; padding:4px 0 0; }
+  .trend-cell { min-width:0; height:100%; display:flex; flex-direction:column; gap:7px; }
+  .trend-bar-zone { position:relative; min-height:0; flex:1; display:flex; align-items:flex-end; border-bottom:1px solid var(--viz-grid); }
+  .trend-mark { position:relative; width:100%; height:100%; display:flex; align-items:flex-end; justify-content:center; outline:none; border-radius:5px; cursor:default; }
+  .trend-mark:focus-visible { box-shadow:0 0 0 2px rgba(79,70,229,.32); }
+  .trend-bar { width:min(24px,72%); min-height:5px; display:flex; flex-direction:column-reverse; gap:2px; overflow:hidden; border-radius:4px 4px 0 0; transition:height .3s ease; }
+  .trend-segment { min-height:0; }
+  .trend-segment.prompt { background:var(--viz-prompt); }
+  .trend-segment.completion { background:var(--viz-completion); }
+  /* 请求量趋势复用堆叠段样式，但颜色由内联 status-*/viz-hour 变量给出 */
+  .trend-zero { width:min(24px,72%); height:2px; border-radius:999px; background:var(--viz-grid); }
+  .trend-label { color:#898781; font-size:10px; line-height:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .trend-tooltip { position:absolute; z-index:10; left:50%; bottom:8px; width:max-content; max-width:152px; padding:7px 8px; border:1px solid var(--border); border-radius:8px; background:#fff; color:var(--fg); box-shadow:0 8px 18px rgba(16,24,40,.12); font-size:11px; line-height:1.55; opacity:0; pointer-events:none; transform:translate(-50%,4px); transition:opacity .14s ease,transform .14s ease; }
+  .trend-tooltip strong { display:block; margin-bottom:2px; }
+  .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { opacity:1; transform:translate(-50%,0); }
+  @media (max-width:640px) { .health-legend { gap:4px; } .health-legend-item { padding:6px 3px; } .trend-chart { gap:3px; } .trend-bar { width:78%; } .trend-tooltip { left:0; transform:translate(0,4px); } .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { transform:translate(0,0); } }
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-5xl mx-auto px-5 md:px-8 py-6">
+
+  <!-- Header -->
+  <header class="hero px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-3">
+    <div class="flex items-center gap-3.5">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+        <rect width="40" height="40" rx="11" fill="url(#lg)"/>
+        <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/>
+        <path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
+      </svg>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
+        <p class="text-xs text-neutral-500 mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 三通道</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="pill pill-accent" id="mode-pill">通道 —</span>
+      <span class="pill"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span></span><span id="uptime">运行中</span></span>
+      <button onclick="logout()" class="pill" style="cursor:pointer" title="退出登录">退出</button>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="flex gap-6 border-b border-neutral-200 mb-6 overflow-x-auto">
+    <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
+    <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
+    <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
+    <div class="tab" data-tab="logs" onclick="switchTab('logs')">运行日志</div>
+  </nav>
+
+  <!-- Overview -->
+  <section id="view-overview">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1">0</div></div>
+      <div class="card p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1 text-emerald-600">0</div></div>
+      <div class="card p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1 text-amber-500">0</div></div>
+      <div class="card p-4"><div class="lbl">错误 / 拦截</div><div id="s-error" class="val text-2xl font-bold mt-1 text-rose-600">0</div></div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="card p-5 flex flex-col items-center justify-center">
+        <div class="lbl w-full mb-3">服务健康度 <span class="text-neutral-400 font-normal">· 成功 / 错误</span></div>
+        <div class="health-ring">
+          <canvas id="donut" aria-label="服务健康度：成功与错误请求占比" role="img"></canvas>
+          <div class="health-centre" aria-hidden="true"><strong id="health-rate">—</strong><span>已完成成功率</span></div>
+        </div>
+        <div class="health-legend" aria-label="服务健康度明细">
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot success"></i>成功</span><strong id="h-success" class="health-legend-value">0</strong></div>
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot error"></i>错误</span><strong id="h-error" class="health-legend-value">0</strong></div>
+          <div class="health-legend-item"><span class="health-legend-label"><i class="legend-dot retry"></i>重试</span><strong id="h-retries" class="health-legend-value">0</strong></div>
+        </div>
+      </div>
+      <div class="card p-5 md:col-span-2">
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 已持久化 · Express / 服务账号计入（Cookie 不回传）</span></div>
+        <div class="space-y-4">
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="metric-track" role="progressbar" aria-label="Prompt 输入 Token 占比" aria-valuemin="0" aria-valuemax="100"><div id="t-prompt-bar" class="metric-fill prompt"></div></div></div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="metric-track" role="progressbar" aria-label="Completion 输出 Token 占比" aria-valuemin="0" aria-valuemax="100"><div id="t-completion-bar" class="metric-fill completion"></div></div></div>
+          <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
+          <div class="flex justify-between text-sm"><span class="text-neutral-600">缓存命中 <span class="text-neutral-400">（隐式缓存 90% 折扣，命中即省钱）</span></span><span class="val font-semibold"><span id="t-cached">0</span> tokens · <span id="t-hitrate">—</span></span></div>
+          <div class="flex justify-between text-sm"><span class="text-neutral-600">估算花费 <span class="text-neutral-400">（按官方按量价）</span></span><span id="t-cost" class="val font-semibold">$0.00</span></div>
+          <div class="pt-3 border-t border-neutral-100">
+            <div class="flex items-center justify-between gap-3 mb-2">
+              <div><span class="text-xs text-neutral-600 font-medium">每日 Token 趋势</span><span class="text-[11px] text-neutral-400 ml-1">· 悬停查看明细</span></div>
+              <div class="flex gap-1 text-xs shrink-0">
+                <button class="px-2 py-0.5 rounded border border-neutral-200" id="range7" onclick="renderTrend(7)">7 天</button>
+                <button class="px-2 py-0.5 rounded border border-neutral-200" id="range30" onclick="renderTrend(30)">30 天</button>
+              </div>
+            </div>
+            <div class="trend-legend" aria-label="趋势图图例"><span class="trend-legend-item"><i class="trend-swatch prompt"></i>Prompt</span><span class="trend-legend-item"><i class="trend-swatch completion"></i>Completion</span></div>
+            <div id="trend-chart" class="trend-chart" role="group" aria-label="最近每日 Prompt 与 Completion Token 的堆叠趋势图"></div>
+            <div id="trend-empty" class="text-xs text-neutral-400 py-2">暂无历史数据；将显示最近日期窗口。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- 请求量趋势（总请求/成功/重试/错误，按天或按小时；参考 sub2api 的 granularity 切换） -->
+    <div class="card p-5 mt-3">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <div class="lbl">请求量趋势 <span class="text-neutral-400 font-normal">· 总请求 / 成功 / 拥堵重试 / 错误（堆叠，悬停查看明细）</span></div>
+        <div class="flex gap-1 text-xs shrink-0">
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-hour" onclick="renderReqTrend('hour')">按小时 · 24h</button>
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-day7" onclick="renderReqTrend('day7')">7 天</button>
+          <button class="px-2 py-0.5 rounded border border-neutral-200" id="req-gran-day30" onclick="renderReqTrend('day30')">30 天</button>
+        </div>
+      </div>
+      <div class="trend-legend mb-2" aria-label="请求量趋势图例"><span class="trend-legend-item"><i class="legend-dot success"></i>成功</span><span class="trend-legend-item"><i class="legend-dot retry"></i>重试</span><span class="trend-legend-item"><i class="legend-dot error"></i>错误</span><span class="trend-legend-item"><i class="trend-swatch" style="background:var(--viz-hour)"></i>其他（未收尾）</span></div>
+      <div id="req-trend-chart" class="trend-chart" role="group" aria-label="按天或按小时的请求量堆叠趋势图"></div>
+      <div id="req-trend-empty" class="text-xs text-neutral-400 py-2">暂无历史数据。</div>
+    </div>
+    <!-- 错误 / 拦截分类统计：某类错误重复了几次，一目了然 -->
+    <div class="card p-5 mt-3">
+      <div class="lbl mb-3">错误 / 拦截分类 <span class="text-neutral-400 font-normal">· 按官方错误码与拦截原因归类，累计计数</span></div>
+      <div id="error-cat-list" class="space-y-2.5"><div class="text-xs text-neutral-400">暂无错误记录。</div></div>
+    </div>
+  </section>
+
+  <!-- Channel -->
+  <section id="view-channel" class="hidden">
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <div class="lbl mb-0">上游调用通道</div>
+        <span class="pill pill-accent" id="chan-status" style="text-transform:none">—</span>
+      </div>
+      <div class="flex gap-4 border-b border-neutral-200 mb-4 overflow-x-auto">
+        <div class="tab active" data-ctab="express" onclick="switchChanTab('express')">Express API Key</div>
+        <div class="tab" data-ctab="cookie" onclick="switchChanTab('cookie')">Cookie 直连</div>
+        <div class="tab" data-ctab="vertex" onclick="switchChanTab('vertex')">服务账号</div>
+        <div class="tab" data-ctab="hybrid" onclick="switchChanTab('hybrid')">混合自动</div>
+      </div>
+
+      <!-- Express 标签页 -->
+      <div id="ctab-express" class="ctab-pane">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用 <code>VERTEX_EXPRESS_API_KEY</code> 调官方 SDK（可多个，按「多 Key 轮询」开关轮询/随机摊薄限流）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('express')">设为当前策略</button>
+        </div>
+        <div class="lbl mb-2">Express API Key（控制台管理，可多个）</div>
+        <div id="express-keys-summary" class="text-xs text-neutral-500 mb-2"></div>
+        <textarea id="express-keys-input" rows="3" class="inp log mb-3" placeholder="每行一个 Key；留空 = 保持不变；填写 = 整表覆盖当前列表（多 Key 轮询/随机摊薄限流）"></textarea>
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <button class="text-xs text-neutral-500 underline" onclick="clearExpressKeys()">清除控制台 Key（回落环境变量）</button>
+          <button class="btn px-4 py-2 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
+        </div>
+      </div>
+
+      <!-- Cookie 标签页 -->
+      <div id="ctab-cookie" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用控制台 Cookie 直连 <code>batchGraphql</code>（走网页端配额，可规避 429；见下方风险提示）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('cookie')">设为当前策略</button>
+        </div>
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <div class="lbl">Google Cookie 账号（可配多个，按轮询/随机选择使用）</div>
+          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addCookieAccount()">+ 添加账号</button>
+        </div>
+        <div id="cookie-accounts"></div>
+        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个 Google 账号：粘贴完整 Cookie（含 HttpOnly 字段，支持 Cookie-Editor 导出的 JSON / Header String，自动解析）+ 对应 Project ID。<b>Cookie 输入框留空 = 保持该账号原值不变</b>，只更新 Project ID。多账号时按「多 Key 轮询」开关轮询或随机选号，单账号行为与原来一致。Cookie 过期会自动切换其它可用账号/通道（hybrid 模式）。</p>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+      </div>
+
+      <!-- 服务账号标签页 -->
+      <div id="ctab-vertex" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">用 Google Cloud <b>服务账号 JSON</b> 走标准 Vertex AI 认证（Bearer token，OAuth2 JWT-bearer）。项目须<b>开启计费</b>且该服务账号有 <code>aiplatform.user</code> 权限。可配多个账号，按轮询/随机选号。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('vertex')">设为当前策略</button>
+        </div>
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <div class="lbl">服务账号（可配多个，按轮询/随机选择使用）</div>
+          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addSaAccount()">+ 添加账号</button>
+        </div>
+        <div id="sa-accounts"></div>
+        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个服务账号：粘贴完整 <b>SA JSON</b>（含 <code>client_email</code> / <code>private_key</code> / <code>project_id</code>）+ 可选 Project ID 覆盖 + 区域。SA JSON 输入框留空 = 保持该账号原值不变。<b>凭证只回显掩码</b>（client_email + project + location），永不回填 JSON。</p>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限：请妥善保管、只用于本项目、必要时轮换。区域默认 <code>global</code>（多数 Gemini 模型只在 global 提供）。</p>
+      </div>
+
+      <!-- 混合自动标签页 -->
+      <div id="ctab-hybrid" class="ctab-pane hidden">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-xs text-neutral-500 leading-relaxed">混合自动：按下面的优先级顺序尝试，<b>限流/5xx/未出流失败</b>自动切换下一通道；400/401/403 如实报错不切换；任一通道连续失败自动熔断冷却（阈值/冷却见模型参数页）。</div>
+          <button class="btn px-4 py-2 text-sm" onclick="setStrategy('hybrid')">设为当前策略</button>
+        </div>
+        <div class="lbl mb-2">参与通道与优先级顺序</div>
+        <div id="hybrid-channels"></div>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">勾选 = 参与混合自动；↑↓ 调整优先级（越靠上越先尝试）；「重试次数」为该通道<b>内部</b>重试上限（留空 = 用全局 <code>retry_max</code>）。熔断在每通道内独立计数。</p>
+
+        <div class="mt-5 border-t border-neutral-100 pt-4">
+          <div class="lbl mb-2">PayGo 流量等级（Express / 服务账号通道）</div>
+          <select id="paygo_tier" class="inp" style="min-width:260px">
+            <option value="auto">auto · global 请求自动 Priority（默认，保持现状）</option>
+            <option value="off">off · 不打层级头</option>
+            <option value="standard">standard · 仅 paygo_only 时打 shared 标记</option>
+            <option value="flex">flex · 允许排队至 30 分钟（仅 global）</option>
+            <option value="priority">priority · 优先调度（仅 global）</option>
+          </select>
+          <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="paygo_only"><span>paygo_only（标准档绕过预配吞吐、强制纯按量；flex/priority 自带该语义）</span></label>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">这是 ST-Vertex-PayGo 方案融合出的官方「按量共享容量」层级头。Flex/Priority 仅对 <code>location=global</code> 生效，非 global 自动降级并告警；Cookie 通道走 batchGraphql，不受此设置影响。<br>💡 <b>默认关闭</b>。勾选 = 打 <code>shared</code> 标记强制走<b>按量计费</b>（绕过预配吞吐）——按量正是 <b>Google Cloud $300 赠金可抵扣</b>的计费方式，<b>不会阻止使用赠金</b>；反而「预配吞吐」是预付费承诺容量、不走按量账单。</p>
+        </div>
+
+        <div class="flex justify-end mt-5">
+          <button class="btn px-5 py-2 text-sm" onclick="saveHybridConfig()">💾 保存混合自动配置</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Params -->
+  <section id="view-params" class="hidden">
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <div class="lbl mb-1">选择模型 <span id="ov-badge" class="pill pill-accent hidden" style="text-transform:none">已有专属参数</span></div>
+          <select id="model-sel" class="inp" style="min-width:240px" onchange="renderCaps()"></select>
+        </div>
+        <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
+      </div>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">上面的下拉框选择<b>编辑对象</b>：选「＊ 全局默认」就是在改所有模型的默认值；选某个具体模型，就是在改<b>那个模型</b>的专属值（保存后模型名后出现 ★）。切换下拉框时，下面 ① 区的字段会跟着换成对应对象的值。<br>
+      <b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）跟随上面的下拉框，用本卡片的按钮保存。<br>
+      <b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关）只有全局一份，用页面底部的「保存全局设置」保存，<b>不会</b>动到 ① 区的任何内容。<br>
+      优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
+      <div class="flex items-center gap-2 mt-3 flex-wrap">
+        <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
+        <button id="btn-scope-clear" class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
+        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="refreshRemoteModels(event)">🌐 获取远程模型</button>
+        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="openModelEditor()">📝 编辑模型</button>
+        <span id="ov-hint" class="text-xs text-neutral-500"></span>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-5">
+      <span class="pill pill-accent" style="text-transform:none">① 按模型参数</span>
+      <span class="text-xs text-neutral-500">下面这些卡片的内容，属于上方下拉框选中的那个对象（全局默认 / 某个模型），用上方的保存按钮写入。</span>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <!-- 思考 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">思考强度</div>
+        <div class="mb-3" id="wrap-g3level">
+          <div class="lbl mb-1">Gemini 3.x 思考档位（thinking_level）</div>
+          <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
+        </div>
+        <div id="wrap-g25budget">
+          <div class="lbl mb-1">Gemini 2.5 思考预算（thinking_budget，-1=动态，0=关闭*）</div>
+          <input id="thinking_g25_budget" type="number" class="inp" placeholder="-1">
+        </div>
+        <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="mt-3 pt-3 border-t border-neutral-100">
+          <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
+          <select id="native_thinking_mode" class="inp">
+            <option value="request">跟随请求（默认）</option>
+            <option value="off">关闭原生思考（角色扮演推荐）</option>
+            <option value="console">强制用上方档位（忽略前端）</option>
+          </select>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>跑角色扮演预设、想让预设自带的思维链接管时，选“关闭原生思考”。</b>只想对某个模型这么设，就用上方的“保存为该模型专属”。<br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 等常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到<span id="ntm-floor">该模型最低档</span>，并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项在压档位的同时于响应侧<b>剥离思考块</b>——重预设下这是避免“只有思考、没有正文”的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见“开关 &amp; 预填充”卡片的压制开关。）</p>
+        </div>
+      </div>
+
+      <!-- 生图 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">生图</div>
+        <div class="mb-3">
+          <div class="lbl mb-1">默认分辨率（image_size）</div>
+          <select id="image_size" class="inp"><option value="512">512</option><option value="1K">1K</option><option value="2K">2K</option><option value="4K">4K</option></select>
+        </div>
+        <div>
+          <div class="lbl mb-1">默认宽高比（aspect_ratio）</div>
+          <select id="image_aspect_ratio" class="inp"></select>
+        </div>
+        <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="space-y-3 mt-3 pt-3 border-t border-neutral-100">
+          <div class="text-xs text-neutral-400">以下两项仅对生图模型有意义，可按模型专属保存</div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
+            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 采样默认 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">采样默认值 <span class="text-xs font-normal text-neutral-400">（留空=不注入，交给模型默认）</span></div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div><div class="lbl mb-1.5">temperature</div><input id="default_temperature" type="number" step="0.1" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1.5">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1.5">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
+        </div>
+        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-neutral-100">
+          <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
+          <select id="sampling_policy" class="inp" style="max-width:170px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
+        </div>
+        <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。<br>
+          <b>自动判定</b>（默认）：按版本号推断——3.6 起、3.5 Flash-Lite、以及 4.x 及以后一律剥离。<br>
+          <b>什么时候需要手动改</b>：版本号表达不了“号更小但发布更晚”。比如日后出一个 <code>gemini-3.5-pro</code>，官方按“更新模型”废弃了采样，自动判定却会因为 3.5 &lt; 3.6 而放行——此时给它选<b>强制剥离</b>即可，不必改代码。反过来官方澄清某模型仍可调，就选<b>强制保留</b>。<br>
+          可按模型专属保存。生图模型不受此开关影响（本来就剥离全部采样）；<code>candidate_count</code> 是 3.x 的硬限制，也不归它管。</div>
+        <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
+
+      <!-- 控制台注入（可按模型覆盖） -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
+        <div class="space-y-3">
+
+          <div>
+            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
+            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
+            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injp" class="helpbox">
+              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
+              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
+              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
+              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
+              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
+            </div>
+          </div>
+          <div>
+            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
+            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
+            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-6">
+      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
+      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后点页面底部「保存全局设置」，它只保存本区、不影响 ① 区。</span>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card p-5">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-sm">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
+              <select id="express_location" class="inp" style="max-width:180px">
+            <option value="global">global（默认·推荐）</option>
+            <option value="">默认（后端自选·旧行为）</option>
+            <optgroup label="美国">
+              <option value="us-central1">us-central1（爱荷华）</option>
+              <option value="us-east1">us-east1（南卡）</option>
+              <option value="us-east4">us-east4（北弗吉尼亚）</option>
+              <option value="us-east5">us-east5（哥伦布）</option>
+              <option value="us-south1">us-south1（达拉斯）</option>
+              <option value="us-west1">us-west1（俄勒冈）</option>
+              <option value="us-west4">us-west4（拉斯维加斯）</option>
+            </optgroup>
+            <optgroup label="欧洲">
+              <option value="europe-west1">europe-west1（比利时）</option>
+              <option value="europe-west2">europe-west2（伦敦）</option>
+              <option value="europe-west3">europe-west3（法兰克福）</option>
+              <option value="europe-west4">europe-west4（荷兰）</option>
+              <option value="europe-west8">europe-west8（米兰）</option>
+              <option value="europe-west9">europe-west9（巴黎）</option>
+              <option value="europe-southwest1">europe-southwest1（马德里）</option>
+              <option value="europe-central2">europe-central2（华沙）</option>
+              <option value="europe-north1">europe-north1（芬兰）</option>
+            </optgroup>
+            <optgroup label="亚太">
+              <option value="asia-east1">asia-east1（台湾）</option>
+              <option value="asia-east2">asia-east2（香港）</option>
+              <option value="asia-northeast1">asia-northeast1（东京）</option>
+              <option value="asia-northeast2">asia-northeast2（大阪）</option>
+              <option value="asia-northeast3">asia-northeast3（首尔）</option>
+              <option value="asia-south1">asia-south1（孟买）</option>
+              <option value="asia-southeast1">asia-southeast1（新加坡）</option>
+              <option value="asia-southeast2">asia-southeast2（雅加达）</option>
+              <option value="australia-southeast1">australia-southeast1（悉尼）</option>
+            </optgroup>
+            <optgroup label="其它">
+              <option value="northamerica-northeast1">northamerica-northeast1（蒙特利尔）</option>
+              <option value="southamerica-east1">southamerica-east1（圣保罗）</option>
+              <option value="me-central1">me-central1（多哈）</option>
+              <option value="me-west1">me-west1（特拉维夫）</option>
+            </optgroup>
+          </select>
+            </div>
+            <div id="h_loc" class="helpbox">
+              <b>作用</b>：决定标准（Express）模式请求发到哪个区域，解决“偶发 404、报错里出现没见过的区域”。<br><br>
+              <b>为什么会 404</b>：不指定时由 Google 后端自己挑区域，可能挑到<b>不提供该模型</b>的区域。<br>
+              实测同一个 Key、同一个模型：<code>gemini-2.5-pro</code> 不指定 → 被路由到新加坡区域报 404；选 <code>global</code> → <b>正常出文</b>。<br><br>
+              <b>默认 global</b>：多数 Gemini 模型只在 global 提供，选具体区域反而可能 404，按需再换。<br><br>
+              <b>用哪个项目</b>：自动使用「通道与凭证」里填的 Project ID（或环境变量 <code>GOOGLE_PROJECT_ID</code>）。两者都没有时自动退回不指定区域的旧方式。<br><br>
+              <b>注意</b>：该项目必须是这个 API Key <b>有权、且已开启计费</b>的项目。<br><br>
+              <b>失败会自动兜底</b>：若上游回“模型不存在 / 需要计费”，代理会<b>自动改回不指定区域重试一次</b>，并在运行日志说明怎么修——所以这个设置不会让原本能用的配置变得不能用。
+            </div>
+          </div>
+
+      <!-- 输入图压缩 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-sm font-semibold">输入图片压缩</div>
+          <label class="switch"><input type="checkbox" id="img_compress_enabled"><span class="slider"></span></label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <div><div class="lbl mb-1">最长边(px)</div><input id="img_compress_max_dim" type="number" class="inp"></div>
+          <div><div class="lbl mb-1">阈值(MB)</div><input id="img_compress_max_mb" type="number" step="0.1" class="inp"></div>
+          <div><div class="lbl mb-1">JPEG质量</div><input id="img_compress_quality" type="number" class="inp"></div>
+        </div>
+      </div>
+
+      <!-- 重试 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">重试与退避</div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
+          <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+        </div>
+      </div>
+
+      <!-- Google GenAI Client 复用（Express / 服务账号通道共用） -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-sm font-semibold">Google GenAI Client 复用<span class="text-xs text-neutral-400" style="font-weight:400">（Express / 服务账号通道共用）</span></div>
+          <label class="switch"><input type="checkbox" id="client_reuse"><span class="slider"></span></label>
+        </div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between"><span class="text-sm">连接级失败自动舍弃阈值(次)<span class="helpq" onclick="hlp(this,'h_cre')">?</span></span><input id="client_reuse_evict_threshold" type="number" class="inp" style="width:90px"></div>
+          <div id="h_cre" class="helpbox"><b>作用对象：Express 与 服务账号两条 SDK 通道</b>。google-genai 的 Client 复用了 httpx 连接池（省 TLS 握手）；但长驻进程里可能残留<b>失效的 keep-alive 连接</b>，导致连续的连接级错误（<code>RemoteProtocolError</code> / <code>ConnectError</code> / 超时）。<br>此开关开启时：缓存 Client 连续连接级失败达到阈值（默认 5 次，0=不自动舍弃）即<b>自动舍弃</b>，下次请求重建连接池。<b>429 限流不算连接级失败</b>（连接本身健康），不会误触发。安全策略拦截等硬错误会<b>立即舍弃</b>，不等阈值。<br>关闭此开关：每个请求都新建 Client（彻底避免复用失效连接），但失去连接复用、延迟开销增大——仅排查"复用后持续连接错误"时临时用。</div>
+        </div>
+      </div>
+
+      <!-- 防截断合成传输协议 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">防截断（Anti-Truncation）</div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between"><span class="text-sm">启用字段名<span class="helpq" onclick="hlp(this,'h_ant')">?</span></span><input id="anti_truncation_field" type="text" class="inp" style="width:190px"></div>
+          <div id="h_ant" class="helpbox"><b>是什么</b>：重提示词场景（酒馆复杂预设/角色卡/超长历史）下模型回答经常被 <code>max_output_tokens</code> 提前截断、丢尾巴坏格式。开启后，代理给请求注入一个请求级唯一的<b>合成传输工具</b>（<code>v2o_emit_&lt;随机数&gt;</code>），指示模型把<b>最终可见回答放进该工具调用的 content 参数输出</b>（Function Call 通道），从而绕开普通文本生成通道的截断；代理收到响应后<b>解构还原为标准 assistant.content</b>，对客户端完全透明，真实工具调用原样保留。<br><br><b>怎么用</b>：下游请求体加「启用字段名」字段（默认 <code>anti_truncation</code>）置 <code>true</code>，即对该请求启用；不启用时完全不影响。字段名可改成客户端不冲突的名字。<br><br><b>注意事项</b>：仅对文本/Chat 模型生效（生图/音频等自动忽略）；需要模型支持工具调用；与 <code>tool_choice=none</code> 冲突时以 <code>auto</code> 覆盖（否则合成工具不会被调用、防截断失效）；回答以工具参数整体输出、首字比普通流式略慢；不同模型对"工具输出"的截断保护效果不同，若发现仍被截断可配合调大「默认输出上限」。</div>
+        </div>
+      </div>
+
+      <!-- 开关 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">注册 fake- 前缀模型<span class="helpq" onclick="hlp(this,'h_fake')">?</span></span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div id="h_fake" class="helpbox">开启后，<b>/v1/models 模型列表会为每个模型额外添加 <code>fake-&lt;模型名&gt;</code> 条目</b>（例如 <code>fake-gemini-3.7-flash</code>）。客户端选中它，该请求就强制走假流式；选普通模型名则保持真实流式——假流式按模型选择，不再全局生效。<br>生图模型不受此开关影响（本来就强制假流式）；Cookie 直连通道没有假流式实现，<code>fake-</code> 前缀会被自动剥掉当普通模型处理。</div>
+          <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+            <div id="h_ss" class="helpbox">在每条回复<b>正文末尾</b>附一个可折叠块，列出该回复各安全分类的概率与严重度评分（Hate Speech / Dangerous Content / Sexually Explicit / Harassment / Jailbreak）。用来判断内容离触发拦截还有多远。<br>前端若不渲染 HTML，会看到一段 <code>&lt;details&gt;</code> 原文，属正常。<br><b>Cookie 通道注意</b>：该通道平时下发 <code>OFF</code>（分类器整个关闭、上游不回传评分）。打开本开关后会改为下发 <code>BLOCK_NONE</code>——仍然<b>永不拦截</b>，只是让上游把评分算出来回传。不需要看评分就关掉，保持 <code>OFF</code>。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
+            <div id="h_dbg" class="helpbox">两条 SDK 通道（Express / 服务账号）都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数（标注当前通道名）。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
+            <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。<b>无正文时的原始响应样本总是会自动记录，不需要开这个</b>。</div>
+          </div>
+
+
+          <div class="pt-1 border-t border-neutral-100"></div>
+          <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
+
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">思维链守卫<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
+          <div id="h_cotg" class="helpbox">
+            解决<b>“预设思维链经常不写、直接出正文”</b>：预填充只是把话头停在 <code>&lt;思维链标签&gt;</code> 上，<b>没有任何一句话告诉模型必须先完成思考</b>，模型于是常常跳过思考直接写正文，前端正则就抓不到思维链。<br>
+            打开后，代理会自动识别预填充里<b>未闭合的开标签</b>，在续写指令末尾追加一条硬性要求：先逐条写完该标签内的思考、用对应闭合标签收尾，然后才写正文。<br>
+            没检测到未闭合标签时（例如预填充只是普通句子）本项不做任何事；生图模型不适用。<br>
+            <b>仍不稳定时</b>：把「原生思考控制」从“关闭原生思考”改为“强制用上方档位 + low”再对比——压到 minimal 会让模型倾向“直接给答案”，可能连带跳过预设要求的长思考。
+          </div>
+          <div>
+            <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
+              <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+            </div>
+            <div id="h_pfm" class="helpbox">
+              <b>什么是预填充</b>：请求里<b>最后一条 assistant 消息</b>（酒馆预设里通常是最底部那条“助手”条目，内容多为思维链的开标签）。它替模型写好了回复开头，模型只能顺着往下写——这是破限最强的杠杆，也用来顶掉原生思维链。预设里那些 system 条目<b>不是</b>预填充。<br>
+              <b>为什么需要兼容</b>：Gemini 3.x 拒绝以 assistant 结尾的请求（400），必须改造成 user 结尾。<br><br>
+              <b>智能（默认）</b>：删掉那条 assistant，把它的文字并进最后一条 user。模型视角＝“用户给了我一段参考文字”。输出干净（实测开闭标签各 1 个），但模型没有“说过”这句话，破限杠杆最弱。<br>
+              <b>保留模型轮次</b>：assistant 原样留着，后面补一句很短的 user 推动语。模型视角＝“这是我自己写了一半的”，破限杠杆保留。代价是模型容易当成新一轮、<b>把开标签再写一遍</b>（实测 3/3）。<br>
+              <b>最小</b>：只补占位 user 保证不报错，<b>不把预填充拼回输出</b>——思考开标签会缺失，前端正则可能抓不到。<br>
+              <b>关闭</b>：原样发出，3.x 直接 400；而且代理检测不到预填充，思考压制也不会触发。<br><br>
+              2.5 及更早的模型不受影响，走的是<b>原生透传</b>，效果等同老式预填充。
+            </div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
+            <div id="h_pst" class="helpbox">检测到预填充时，把模型的<b>原生思维链压到最低并不回传</b>，让预设自带的思维链接管（写作效果通常更好，也避免“只有思考没有正文”）。<br>3.x 压到最低档（无法完全关闭），2.5-flash 预算 0 全关，2.5-pro 降到 128。<br><b>只在请求真的带预填充时才触发</b>；若你的预设把思维链写在 system 里、没有 assistant 条目，请改用上方“思考强度”卡片的“关闭原生思考”。</div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-end gap-3 mt-4">
+      <span class="text-xs text-neutral-500">只保存 ② 区（图压缩 / 重试 / 假流式 / 调试开关）；① 区请用上方那个保存按钮</span>
+      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
+    </div>
+  </section>
+
+  <!-- Logs -->
+  <section id="view-logs" class="hidden">
+    <div class="card overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
+        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
+        <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
+        <button id="clear-log-btn" onclick="clearLogView()" class="ml-auto text-xs px-2 py-1 rounded border border-neutral-200" title="清空当前界面显示（不影响磁盘日志与实时流）">🧹 清空</button>
+        <button id="autoscroll-btn" onclick="toggleAutoScroll()" class="text-xs px-2 py-1 rounded border border-neutral-200">📌 自动滚动</button>
+      </div>
+      <div class="px-3 py-2 border-b border-neutral-200 flex items-center gap-2 flex-wrap">
+        <input id="log-filter" class="inp" style="width:150px" placeholder="🔍 关键字过滤…">
+        <div id="log-chips" class="flex gap-1 flex-wrap"></div>
+      </div>
+      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
+    </div>
+  </section>
+</div>
+<div id="toast" class="toast"></div>
+
+<!-- 编辑模型列表弹窗 -->
+<div id="model-editor" class="modal-mask hidden" onclick="if(event.target===this)closeModelEditor()">
+  <div class="modal-card">
+    <div class="px-5 py-3 border-b border-neutral-200 flex items-center justify-between">
+      <div class="font-semibold text-sm">编辑模型列表</div>
+      <button class="text-neutral-400 hover:text-neutral-700 text-lg leading-none" onclick="closeModelEditor()">×</button>
+    </div>
+    <div class="p-4 overflow-y-auto space-y-3">
+      <div class="flex gap-2">
+        <input id="me-new-model" type="text" class="inp" placeholder="输入模型名，如 gemini-2.5-flash" style="flex:1" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <button class="btn px-4 py-2 text-sm" onclick="addCustomModel()">添加</button>
+      </div>
+      <div class="text-xs text-neutral-500 leading-relaxed">自定义模型会出现在 <code>/v1/models</code> 与下方模型下拉里，本机持久化（重建容器不丢）。<b>远程/本地模型</b>来自配置缓存，用「获取远程模型」按钮刷新。</div>
+      <div id="me-list" class="space-y-1"></div>
+    </div>
+    <div class="px-5 py-3 border-t border-neutral-200 flex justify-end">
+      <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300" onclick="closeModelEditor()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let CAPS = {}, chart = null, curAR = "";
+let GLOBAL_SETTINGS = {}, OVERRIDES = {};
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
+
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
+function fmt(n){ return (n||0).toLocaleString('en-US'); }
+async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
+
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active', e.dataset.tab===t));
+  ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+}
+
+/* ---------- Overview ---------- */
+const CHART_COLORS={success:'#0ca30c',error:'#d03b3b',retry:'#f59e0b',empty:'#e5e7eb'};
+function renderChart(successCount,errorCount,retryCount){
+  const success=Math.max(0,Number(successCount)||0);
+  const error=Math.max(0,Number(errorCount)||0);
+  const retries=Math.max(0,Number(retryCount)||0);
+  const completed=success+error;
+  const hasCompleted=completed>0;
+  const rate=hasCompleted ? (success/completed*100) : null;
+  $('health-rate').textContent=rate===null?'—':rate.toFixed(rate===100?0:1)+'%';
+  $('h-success').textContent=fmt(success); $('h-error').textContent=fmt(error); $('h-retries').textContent=fmt(retries);
+
+  /* 重试是一次额外尝试，不是请求最终结果；不能和成功/错误混画成“部分-整体”圆环。 */
+  if(typeof Chart==='undefined') return;
+  const canvas=$('donut'); if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const data=hasCompleted?[success,error]:[1];
+  const colors=hasCompleted?[CHART_COLORS.success,CHART_COLORS.error]:[CHART_COLORS.empty];
+  const labels=hasCompleted?['成功','错误']:['暂无已完成请求'];
+  if(chart){
+    chart.data.labels=labels; chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors;
+    chart.update(); return;
+  }
+  chart=new Chart(ctx,{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff',hoverOffset:3}]},options:{responsive:true,maintainAspectRatio:false,cutout:'72%',plugins:{legend:{display:false},tooltip:{displayColors:true,padding:9,callbacks:{label:c=>`${c.label}：${fmt(c.raw)}`}}}}});
+}
+
+function updateMetricBars(promptTokens,completionTokens){
+  const prompt=Math.max(0,Number(promptTokens)||0);
+  const completion=Math.max(0,Number(completionTokens)||0);
+  const max=Math.max(1,prompt,completion);
+  [["t-prompt-bar",prompt],["t-completion-bar",completion]].forEach(([id,value])=>{
+    const bar=$(id); if(!bar) return;
+    const percent=Math.round(value/max*100);
+    bar.style.width=percent+'%';
+    const track=bar.parentElement;
+    if(track){ track.setAttribute('aria-valuenow',String(percent)); track.setAttribute('aria-valuetext',fmt(value)+' tokens'); }
+  });
+}
+
+let DAILY=[]; let TREND_RANGE=7;
+function setTrendBtn(){
+  ['range7','range30'].forEach(id=>{ const b=$(id); if(!b) return; const on=(id==='range'+TREND_RANGE); b.style.background=on?'var(--accent)':''; b.style.color=on?'#fff':''; });
+}
+function dateKey(date){
+  const p=n=>String(n).padStart(2,'0');
+  return `${date.getFullYear()}-${p(date.getMonth()+1)}-${p(date.getDate())}`;
+}
+function keyToLocalDate(key){
+  const parts=String(key||'').split('-').map(Number);
+  return parts.length===3 && parts.every(Number.isFinite) ? new Date(parts[0],parts[1]-1,parts[2],12) : null;
+}
+function buildTrendWindow(days){
+  const byDate=new Map((DAILY||[]).filter(d=>d&&keyToLocalDate(d.date)).map(d=>[d.date,d]));
+  const latest=(DAILY||[]).length ? keyToLocalDate(DAILY[DAILY.length-1].date) : null;
+  const end=latest || new Date();
+  end.setHours(12,0,0,0);
+  return Array.from({length:days},(_,i)=>{
+    const date=new Date(end); date.setDate(end.getDate()-days+1+i);
+    const key=dateKey(date);
+    return {date:key,...(byDate.get(key)||{})};
+  });
+}
+function renderTrend(days){
+  if(days) TREND_RANGE=days;
+  const c=$('trend-chart'); if(!c) return;
+  setTrendBtn();
+  const slots=buildTrendWindow(TREND_RANGE);
+  const totalOf=d=>Math.max(0,Number(d.prompt_tokens)||0)+Math.max(0,Number(d.completion_tokens)||0);
+  const maxV=Math.max(1,...slots.map(totalOf));
+  c.style.setProperty('--trend-columns',String(slots.length));
+  c.replaceChildren();
+  const empty=$('trend-empty');
+  if(empty){ empty.style.display=DAILY.length?'none':'block'; empty.textContent=DAILY.length?'':'暂无历史数据；将显示最近日期窗口。'; }
+
+  slots.forEach((d,index)=>{
+    const prompt=Math.max(0,Number(d.prompt_tokens)||0);
+    const completion=Math.max(0,Number(d.completion_tokens)||0);
+    const total=prompt+completion;
+    const requests=Math.max(0,Number(d.requests)||0);
+    const height=total?Math.max(6,Math.round(total/maxV*100)):0;
+    const segments=[];
+    if(prompt) segments.push(`<span class="trend-segment prompt" style="flex:${prompt} 1 0"></span>`);
+    if(completion) segments.push(`<span class="trend-segment completion" style="flex:${completion} 1 0"></span>`);
+    const label=d.date.slice(5).replace('-','/');
+    const showLabel=TREND_RANGE<=7 || index===0 || index===slots.length-1 || index%5===0;
+    const cell=document.createElement('div');
+    cell.className='trend-cell';
+    cell.innerHTML=`<div class="trend-bar-zone"><div class="trend-mark" tabindex="0" role="img" aria-label="${d.date}：Prompt ${fmt(prompt)} tokens，Completion ${fmt(completion)} tokens，共 ${fmt(total)} tokens，${fmt(requests)} 请求">${total?`<div class="trend-bar" style="height:${height}%">${segments.join('')}</div>`:'<div class="trend-zero"></div>'}<div class="trend-tooltip" role="tooltip"><strong>${d.date}</strong><span>Prompt：${fmt(prompt)}</span><br><span>Completion：${fmt(completion)}</span><br><span>总计：${fmt(total)} · ${fmt(requests)} 请求</span></div></div></div><div class="trend-label" title="${d.date}">${showLabel?label:'&nbsp;'}</div>`;
+    c.appendChild(cell);
+  });
+}
+async function fetchStats(){
+  try{
+    const d=await (await fetch('/api/stats')).json();
+    $('s-total').textContent=fmt(d.total); $('s-success').textContent=fmt(d.success);
+    $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
+    const prompt=Math.max(0,Number(d.prompt_tokens)||0), completion=Math.max(0,Number(d.completion_tokens)||0);
+    $('t-prompt').textContent=fmt(prompt); $('t-comp').textContent=fmt(completion);
+    $('t-total').textContent=fmt(prompt+completion); updateMetricBars(prompt,completion);
+    const cached=d.cached_prompt_tokens||0;
+    $('t-cached').textContent=fmt(cached);
+    $('t-hitrate').textContent=(prompt>0)?((cached/prompt*100).toFixed(1)+'%'):'—';
+    $('t-cost').textContent='$'+((d.cost||0)).toFixed(4);
+    $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
+    DAILY=d.daily||[]; renderTrend();
+    HOURLY=d.hourly||[]; renderReqTrend();
+    ERROR_CATS=d.error_categories||{}; renderErrorCats();
+    renderChart(d.success,d.error,d.retries);
+  }catch(e){}
+}
+
+/* ---------- 请求量趋势（按天/按小时）与错误分类 ---------- */
+let HOURLY=[], ERROR_CATS={}, REQ_GRAN='hour';
+function setReqGranBtn(){
+  ['req-gran-hour','req-gran-day7','req-gran-day30'].forEach(id=>{
+    const b=$(id); if(!b) return;
+    const on=(id==='req-gran-'+REQ_GRAN);
+    b.style.background=on?'var(--accent)':''; b.style.color=on?'#fff':'';
+  });
+}
+function hourKeyToDate(key){
+  /* "YYYY-MM-DD HH" -> 当天 12:00 的 Date（避免时区偏移），供窗口对齐 */
+  const m=/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2})$/.exec(String(key||'').trim());
+  return m ? {date:new Date(+m[1],+m[2]-1,+m[3],12), h:+m[4]} : null;
+}
+function buildHourWindow(n){
+  const byHour=new Map((HOURLY||[]).filter(d=>d&&hourKeyToDate(d.hour)).map(d=>[d.hour,d]));
+  const now=new Date();
+  const p=x=>String(x).padStart(2,'0');
+  return Array.from({length:n},(_,i)=>{
+    /* 从整点回推 n 小时；小时桶 key 是 "YYYY-MM-DD HH"（后端北京时间） */
+    const dt=new Date(now.getFullYear(),now.getMonth(),now.getDate(),now.getHours()-n+1+i);
+    const key=`${dt.getFullYear()}-${p(dt.getMonth()+1)}-${p(dt.getDate())} ${p(dt.getHours())}`;
+    return {hour:key,...(byHour.get(key)||{})};
+  });
+}
+function buildReqDayWindow(days){
+  /* 与 Token 趋势同源：复用 DAILY 按天聚合（requests/success/error/retries 已在 stats 里） */
+  const byDate=new Map((DAILY||[]).filter(d=>d&&keyToLocalDate(d.date)).map(d=>[d.date,d]));
+  const latest=(DAILY||[]).length ? keyToLocalDate(DAILY[DAILY.length-1].date) : null;
+  const end=latest || new Date();
+  end.setHours(12,0,0,0);
+  return Array.from({length:days},(_,i)=>{
+    const date=new Date(end); date.setDate(end.getDate()-days+1+i);
+    const key=dateKey(date);
+    return {date:key,...(byDate.get(key)||{})};
+  });
+}
+function renderReqTrend(gran){
+  if(gran) REQ_GRAN=gran;
+  const c=$('req-trend-chart'); if(!c) return;
+  setReqGranBtn();
+  let slots, labelOf, tipTitle;
+  if(REQ_GRAN==='hour'){
+    slots=buildHourWindow(24);
+    labelOf=(s,i)=>(i%3===0)?s.hour.slice(11)+':00':'';
+    tipTitle=s=>s.hour.replace(' ', ' ');
+  }else{
+    const days=(REQ_GRAN==='day30')?30:7;
+    slots=buildReqDayWindow(days);
+    labelOf=(s,i)=>{const l=s.date.slice(5).replace('-','/'); return (days<=7||i===0||i===slots.length-1||i%5===0)?l:'';};
+    tipTitle=s=>s.date;
+  }
+  const num=v=>Math.max(0,Number(v)||0);
+  const totalOf=s=>num(s.success)+num(s.error)+num(s.retries);
+  const maxV=Math.max(1,...slots.map(totalOf));
+  c.style.setProperty('--trend-columns',String(slots.length));
+  c.replaceChildren();
+  const empty=$('req-trend-empty');
+  if(empty){ const has=slots.some(s=>totalOf(s)>0||num(s.requests)>0); empty.style.display=has?'none':'block'; empty.textContent=has?'':'暂无历史数据。'; }
+  slots.forEach((s,index)=>{
+    const success=num(s.success), retries=num(s.retries), error=num(s.error);
+    /* 进行中/未收尾（总请求-成功-错误>0）画成中性蓝段，不冒充结果分类 */
+    const other=Math.max(0,num(s.requests)-success-error);
+    const total=success+retries+error;
+    const height=total?Math.max(6,Math.round(total/maxV*100)):0;
+    const segments=[];
+    if(success) segments.push(`<span class="trend-segment" style="flex:${success} 1 0;background:var(--status-good)"></span>`);
+    if(retries) segments.push(`<span class="trend-segment" style="flex:${retries} 1 0;background:var(--status-warning)"></span>`);
+    if(error) segments.push(`<span class="trend-segment" style="flex:${error} 1 0;background:var(--status-critical)"></span>`);
+    if(other) segments.push(`<span class="trend-segment" style="flex:${other} 1 0;background:var(--viz-hour)"></span>`);
+    const label=labelOf(s,index);
+    const cell=document.createElement('div');
+    cell.className='trend-cell';
+    cell.innerHTML=`<div class="trend-bar-zone"><div class="trend-mark" tabindex="0" role="img" aria-label="${tipTitle(s)}：成功 ${fmt(success)}，重试 ${fmt(retries)}，错误 ${fmt(error)}">${total?`<div class="trend-bar" style="height:${height}%">${segments.join('')}</div>`:'<div class="trend-zero"></div>'}<div class="trend-tooltip" role="tooltip"><strong>${tipTitle(s)}</strong><span>成功：${fmt(success)}</span><br><span>重试：${fmt(retries)}</span><br><span>错误：${fmt(error)}</span>${other?`<br><span>其他（未收尾）：${fmt(other)}</span>`:''}</div></div></div><div class="trend-label">${label||'&nbsp;'}</div>`;
+    c.appendChild(cell);
+  });
+}
+const ERR_CAT_COLORS=['var(--viz-cat1)','var(--viz-cat2)','var(--viz-cat3)','var(--viz-cat4)'];
+function renderErrorCats(){
+  const box=$('error-cat-list'); if(!box) return;
+  const entries=Object.entries(ERROR_CATS||{}).filter(([,v])=>Number(v)>0).sort((a,b)=>b[1]-a[1]);
+  box.replaceChildren();
+  if(!entries.length){
+    const p=document.createElement('div');
+    p.className='text-xs text-neutral-400'; p.textContent='暂无错误记录。';
+    box.appendChild(p); return;
+  }
+  const max=Math.max(1,...entries.map(([,v])=>Number(v)||0));
+  entries.forEach(([name,count],i)=>{
+    const v=Number(count)||0;
+    const row=document.createElement('div');
+    row.className='flex items-center gap-3';
+    const swatch=document.createElement('i');
+    swatch.className='legend-dot shrink-0';
+    swatch.style.background=ERR_CAT_COLORS[i%ERR_CAT_COLORS.length];
+    const nameSpan=document.createElement('span');
+    nameSpan.className='text-xs text-neutral-600 min-w-0 truncate'; nameSpan.textContent=name; nameSpan.title=name;
+    const track=document.createElement('div');
+    track.className='metric-track flex-1';
+    const fill=document.createElement('div');
+    fill.className='metric-fill'; fill.style.width=Math.max(3,Math.round(v/max*100))+'%';
+    fill.style.background=ERR_CAT_COLORS[i%ERR_CAT_COLORS.length];
+    track.appendChild(fill);
+    const val=document.createElement('span');
+    val.className='val text-xs font-semibold shrink-0'; val.textContent=fmt(v)+' 次';
+    row.append(swatch,nameSpan,track,val);
+    box.appendChild(row);
+  });
+}
+
+/* ---------- Channel ---------- */
+let CHAN_TAB='express';
+function strategyName(s){
+  return s==='vertex' ? '通道 服务账号' : (s==='hybrid' ? '通道 混合自动' : (s==='cookie' ? '通道 Cookie 直连' : '通道 Express API'));
+}
+function switchChanTab(t){
+  CHAN_TAB=t;
+  document.querySelectorAll('[data-ctab]').forEach(e=>e.classList.toggle('active', e.dataset.ctab===t));
+  ['express','cookie','vertex','hybrid'].forEach(v=>$('ctab-'+v).classList.toggle('hidden', v!==t));
+}
+async function setStrategy(s){
+  try{
+    const r=await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:s})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已切换通道策略：'+strategyName(s)); loadRuntime(); }
+    else toast('❌ '+(d.error||'切换失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function parseCookies(str){
+  str=(str||'').trim();
+  if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
+  return str;
+}
+function extractProject(pid){
+  pid=(pid||'').trim();
+  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/);
+  return m?m[1]:pid;
+}
+async function saveExpressKeys(){
+  const text=$('express-keys-input').value.trim();
+  if(!text){ toast('留空表示不修改；如需覆盖请粘贴 Key 列表'); return; }
+  const keys=text.split(/\n+/).map(s=>s.trim()).filter(Boolean);
+  try{
+    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存 '+d.count+' 个 Express API Key'); $('express-keys-input').value=''; loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function clearExpressKeys(){
+  try{
+    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:[]})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已清除控制台 Key，回落环境变量'); loadRuntime(); }
+    else toast('❌ '+(d.error||'操作失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function cookieRowHtml(acc, isNew){
+  const idx=acc?acc.index:-1;
+  const ck=acc?acc.cookie:'';
+  const pid=acc?(acc.project_id||''):'';
+  const row=document.createElement('div');
+  row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
+  const head=acc
+    ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${ck}</span></div>`
+    : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
+  row.innerHTML=head+
+    `<textarea class="inp log mb-2 acc-cookie" rows="2" placeholder="粘贴完整 Cookie（Cookie-Editor 导出内容自动解析；留空 = 保持原值）"></textarea>`+
+    `<input class="inp mb-2 acc-project" placeholder="Project ID 或含 ?project= 的整条 URL，自动提取" value="${pid}">`+
+    `<div class="flex justify-end gap-2">`+
+    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delCookieAccount(${idx})">删除</button>`:'')+
+    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveCookieRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
+    `</div>`;
+  return row;
+}
+function addCookieAccount(){
+  $('cookie-accounts').appendChild(cookieRowHtml(null,true));
+}
+function renderCookieAccounts(accounts){
+  const box=$('cookie-accounts'); box.innerHTML='';
+  (accounts||[]).forEach(a=>box.appendChild(cookieRowHtml(a,false)));
+}
+async function saveCookieRow(btn, idx){
+  const row=btn.closest('.account-row');
+  const ck=parseCookies(row.querySelector('.acc-cookie').value);
+  const pid=extractProject(row.querySelector('.acc-project').value);
+  if(!ck && !pid){ toast('没有要保存的内容'); return; }
+  try{
+    const r=await fetch('/api/cookie-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,cookie:ck,project_id:pid,delete:false})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存（当前共 '+d.count+' 个账号）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function delCookieAccount(idx){
+  if(!confirm('确认删除该 Cookie 账号？')) return;
+  try{
+    const r=await fetch('/api/cookie-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,cookie:'',project_id:'',delete:true})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已删除（当前共 '+d.count+' 个账号）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'删除失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function loadRuntime(){
+  try{
+    const s=await (await fetch('/api/settings/runtime')).json();
+    const m=s.channel_strategy || 'express';
+    $('mode-pill').textContent = strategyName(m);
+    $('chan-status').textContent = '当前：'+strategyName(m);
+    /* 凭证只回显掩码，绝不回填到输入框（否则保存时会把真实值覆盖成掩码）。
+       输入框留空 = 保持现有值；填了才更新。 */
+    const keys=s.express_keys||[];
+    const envN=s.express_keys_env_count||0;
+    const ctrl=s.express_keys_controlled;
+    $('express-keys-summary').textContent='当前生效 '+(keys.length||0)+' 个：'+(keys.join('、')||'（未配置）')+
+      (ctrl?'　[控制台管理]':(envN?'　[来自环境变量]':''));
+    renderCookieAccounts(s.cookie_accounts||[]);
+    renderSaAccounts(s.sa_accounts||[]);
+    renderHybridConfig(s.hybrid_channels||[], s.channel_retry_overrides||{});
+    if($('paygo_tier')) $('paygo_tier').value=s.paygo_tier||'auto';
+    if($('paygo_only')) $('paygo_only').checked=!!s.paygo_only;
+  }catch(e){}
+}
+
+/* ---- 服务账号（第三通道）---- */
+const SA_LOCATIONS=['global','us-central1','us-east1','us-east4','us-west1','us-west4','northamerica-northeast1','southamerica-east1','europe-west1','europe-west4','europe-west8','europe-west9','asia-east1','asia-east2','asia-northeast1','asia-northeast3','asia-southeast1','australia-southeast1'];
+function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function saRowHtml(acc, isNew){
+  const idx=acc?acc.index:-1;
+  const row=document.createElement('div');
+  row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
+  const head=acc
+    ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
+    : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
+  row.innerHTML=head+
+    `<textarea class="inp log mb-2 acc-sa-json" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
+    `<div class="flex flex-wrap gap-2 mb-2">`+
+      `<input class="inp acc-sa-project" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:180px">`+
+      `<select class="inp acc-sa-location">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${acc&&acc.location===l?'selected':''}>${l}</option>`).join('')+`</select>`+
+    `</div>`+
+    `<div class="flex justify-end gap-2">`+
+    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delSaAccount(${idx})">删除</button>`:'')+
+    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveSaRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
+    `</div>`;
+  return row;
+}
+function addSaAccount(){ $('sa-accounts').appendChild(saRowHtml(null,true)); }
+function renderSaAccounts(accounts){
+  const box=$('sa-accounts'); box.innerHTML='';
+  (accounts||[]).forEach(a=>box.appendChild(saRowHtml(a,false)));
+}
+async function saveSaRow(btn, idx){
+  const row=btn.closest('.account-row');
+  const sa=row.querySelector('.acc-sa-json').value.trim();
+  const pid=extractProject(row.querySelector('.acc-sa-project').value);
+  const loc=row.querySelector('.acc-sa-location').value;
+  if(!sa && !pid && idx<0){ toast('新增账号必须粘贴服务账号 JSON'); return; }
+  try{
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,sa_json:sa,project_id:pid,location:loc,delete:false})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已保存服务账号（当前共 '+d.count+' 个）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function delSaAccount(idx){
+  if(!confirm('确认删除该服务账号？')) return;
+  try{
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,delete:true})});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已删除（当前共 '+d.count+' 个）'); loadRuntime(); }
+    else toast('❌ '+(d.error||'删除失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---- 混合自动（3 通道开关 + 优先级 + 每通道重试 + PayGo 层级）---- */
+const CHAN_META={express:'Express API Key',cookie:'Cookie 直连',vertex:'服务账号'};
+function renderHybridConfig(channels, retries){
+  const box=$('hybrid-channels'); if(!box) return;
+  box.innerHTML='';
+  ['express','cookie','vertex'].forEach(c=>{
+    const enabled=(channels||[]).includes(c);
+    const row=document.createElement('div');
+    row.className='account-row border border-neutral-200 rounded-lg p-3 mb-2 flex flex-wrap items-center gap-3';
+    row.innerHTML=
+      `<label class="flex items-center gap-2 text-sm" style="min-width:130px"><input type="checkbox" class="hyb-enable" ${enabled?'checked':''} data-chan="${c}"><span class="font-medium">${CHAN_META[c]}</span></label>`+
+      `<div class="flex items-center gap-1">`+
+        `<button class="px-2 py-1 text-xs rounded border border-neutral-300 hover:bg-neutral-50" onclick="moveChan('${c}',-1)" title="上移优先级">↑</button>`+
+        `<button class="px-2 py-1 text-xs rounded border border-neutral-300 hover:bg-neutral-50" onclick="moveChan('${c}',1)" title="下移优先级">↓</button>`+
+      `</div>`+
+      `<div class="flex items-center gap-2 text-xs text-neutral-500"><span>重试次数</span><input class="inp hyb-retry" data-chan="${c}" placeholder="全局" style="width:72px" value="${(retries||{})[c]!=null?(retries||{})[c]:''}"></div>`+
+      `<span class="text-xs text-neutral-400">${enabled?('第 '+(channels.indexOf(c)+1)+' 位'):'未参与'}</span>`;
+    box.appendChild(row);
+  });
+}
+function _currentHybridOrder(){
+  const out=[];
+  document.querySelectorAll('#hybrid-channels .account-row').forEach(r=>{
+    const cb=r.querySelector('.hyb-enable'); if(cb.checked) out.push(cb.dataset.chan);
+  });
+  return out;
+}
+function moveChan(c, dir){
+  const box=$('hybrid-channels');
+  const rows=[...box.querySelectorAll('.account-row')];
+  const i=rows.findIndex(r=>r.querySelector('.hyb-enable').dataset.chan===c);
+  const j=i+dir;
+  if(i<0||j<0||j>=rows.length) return;
+  box.insertBefore(rows[i], j>i?rows[j].nextSibling:rows[j]);
+  const order=_currentHybridOrder();
+  box.querySelectorAll('.account-row').forEach(r=>{
+    const cb=r.querySelector('.hyb-enable'); const badge=r.querySelector('.text-neutral-400');
+    badge.textContent=cb.checked?('第 '+(order.indexOf(cb.dataset.chan)+1)+' 位'):'未参与';
+  });
+}
+async function saveHybridConfig(){
+  const channels=_currentHybridOrder();
+  if(channels.length===0){ toast('❌ 至少要勾选一个参与通道'); return; }
+  const retries={};
+  document.querySelectorAll('.hyb-retry').forEach(inp=>{
+    const v=inp.value.trim();
+    retries[inp.dataset.chan]= v==='' ? null : Math.max(0,Math.min(50,parseInt(v)||0));
+  });
+  const patch={
+    hybrid_channels:channels,
+    channel_retry_overrides:retries,
+    paygo_tier:$('paygo_tier').value,
+    paygo_only:$('paygo_only').checked,
+  };
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    if(r.ok){ toast('✅ 混合自动配置已保存'); loadRuntime(); }
+    else toast('保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---------- Params ---------- */
+function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
+async function loadParams(){
+  try{
+    const s=await (await fetch('/api/settings')).json();
+    GLOBAL_SETTINGS=s;
+    curAR = s.image_aspect_ratio || "";
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse'].forEach(k=>setV(k,s[k]));
+    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
+      if(s.hide_thoughts) setV('native_thinking_mode','off');
+      else if(s.thinking_force_console) setV('native_thinking_mode','console');
+    }
+  }catch(e){}
+  try{
+    const c=await (await fetch('/api/capabilities')).json();
+    CAPS=c.capabilities||{};
+    OVERRIDES=c.overrides||{};
+    $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
+      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
+    renderCaps();
+  }catch(e){}
+}
+// ---------- 模型管理：获取远程 / 编辑弹窗 ----------
+let ME_CUSTOM=[];
+async function refreshRemoteModels(ev){
+  const btn=ev.target; const old=btn.textContent; btn.disabled=true; btn.textContent='获取中…';
+  try{
+    const r=await fetch('/api/models/refresh',{method:'POST'});
+    const d=await r.json();
+    toast(d.ok?`🌐 已获取 ${(d.models||[]).length} 个模型`:'⚠️ 远程获取失败（已回退本地/磁盘配置）');
+    await loadParams();
+  }catch(e){ toast('❌ 网络请求失败'); }
+  btn.disabled=false; btn.textContent=old;
+}
+async function openModelEditor(){
+  try{
+    const d=await (await fetch('/api/models/manage')).json();
+    ME_CUSTOM=d.custom||[];
+    const custom=new Set(ME_CUSTOM);
+    const list=$('me-list');
+    list.innerHTML=(d.models||[]).map(m=>{
+      const isCustom=custom.has(m);
+      const del=isCustom?`<button class="text-xs px-2 py-0.5 rounded border border-neutral-200 text-rose-600 hover:bg-rose-50" data-m="${m}" onclick="delCustomModel(this)">删除</button>`:'';
+      return `<div class="flex items-center justify-between gap-2 px-3 py-1.5 rounded border border-neutral-100 bg-neutral-50/60"><span class="text-sm truncate">${m}${isCustom?' <span class="text-[10px] text-neutral-400">自定义</span>':''}</span>${del}</div>`;
+    }).join('')||'<div class="text-xs text-neutral-400 py-2">暂无模型</div>';
+    $('me-new-model').value='';
+    $('model-editor').classList.remove('hidden');
+  }catch(e){ toast('❌ 加载模型列表失败'); }
+}
+function closeModelEditor(){ $('model-editor').classList.add('hidden'); }
+async function saveCustomModels(){
+  try{
+    const r=await fetch('/api/models/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:ME_CUSTOM})});
+    if(!r.ok) throw new Error('bad');
+    await loadParams();
+    return true;
+  }catch(e){ toast('❌ 保存失败'); return false; }
+}
+async function addCustomModel(){
+  const v=$('me-new-model').value.trim();
+  if(!v){ toast('请输入模型名'); return; }
+  if(ME_CUSTOM.includes(v)){ toast('该模型已存在'); return; }
+  ME_CUSTOM.push(v);
+  if(await saveCustomModels()){ $('me-new-model').value=''; openModelEditor(); }
+}
+async function delCustomModel(btn){
+  const name=btn.dataset.m;
+  ME_CUSTOM=ME_CUSTOM.filter(m=>m!==name);
+  if(await saveCustomModels()) openModelEditor();
+}
+// 按所选模型把“可覆盖的 7 个参数字段”填成：有专属值用专属，否则回退全局
+function applyModelParamFields(model){
+  // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
+  const ov = (model==='__global__') ? {} : (OVERRIDES[model] || {});
+  PER_MODEL_KEYS.forEach(k=>{
+    const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
+    if(k==='image_aspect_ratio'){ curAR = v || ""; }
+    else setV(k, v);
+  });
+  const isGlobal = (model==='__global__');
+  const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
+  $('ov-badge').classList.toggle('hidden', !has);
+  // 保存按钮的落点随作用域切换，避免"看着像全局、存进了专属"（或反过来）
+  $('btn-scope-save').textContent = isGlobal ? '💾 保存为全局默认' : '💾 保存为该模型专属';
+  $('btn-scope-clear').classList.toggle('hidden', isGlobal);
+  $('ov-hint').textContent = isGlobal
+    ? '当前编辑的是全局默认值，对所有未设专属的模型生效。'
+    : (has ? '当前显示该模型的专属值（带 ★）；改动后点“保存为该模型专属”更新。'
+           : '当前显示全局默认值；改动后点“保存为该模型专属”即可只对此模型生效。');
+}
+async function saveModelOverride(){
+  const m=$('model-sel').value; if(!m) return;
+  const patch={
+    native_thinking_mode:$('native_thinking_mode').value,
+    thinking_g3_level:$('thinking_g3_level').value,
+    thinking_g25_budget:numOr('thinking_g25_budget',-1),
+    image_size:$('image_size').value,
+    image_aspect_ratio:$('image_aspect_ratio').value,
+    default_temperature:numOrNull('default_temperature'),
+    default_top_p:numOrNull('default_top_p'),
+    default_max_tokens:numOrNull('default_max_tokens'),
+    inject_system_instruction:$('inject_system_instruction').value,
+    inject_prefill:$('inject_prefill').value,
+    prefill_instruction:$('prefill_instruction').value,
+    image_system_instruction:$('image_system_instruction').checked,
+    inject_prefill_for_image:$('inject_prefill_for_image').checked,
+    sampling_policy:$('sampling_policy').value,
+    prefill_cot_guard:$('prefill_cot_guard').checked,
+  };
+  if(m==='__global__'){
+    // 全局默认作用域：写进全局设置，而不是任何模型的专属值
+    try{
+      const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+      if(r.ok){ Object.assign(GLOBAL_SETTINGS,patch); toast('已保存为全局默认'); }
+      else toast('保存失败');
+    }catch(e){ toast('保存失败'); }
+    return;
+  }
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    const d=await r.json();
+    if(r.ok){ OVERRIDES[m]=d.override||patch; toast('已保存 '+m+' 专属参数'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function clearModelOverride(){
+  const m=$('model-sel').value; if(!m) return;
+  if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
+    if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('清除失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function refreshModelSelStars(){
+  const sel=$('model-sel'); const cur=sel.value;
+  [...sel.options].forEach(o=>{ const base=o.value; o.textContent = base + (OVERRIDES[base]?' ★':''); });
+  sel.value=cur;
+}
+function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">${t}</span>`; }
+function fillARFor(cap){
+  const sel=$('image_aspect_ratio');
+  const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
+  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${a}">${a}</option>`).join('');
+  sel.value = (curAR && list.includes(curAR)) ? curAR : "";
+}
+function renderCaps(){
+  const m=$('model-sel').value;
+  if(m==='__global__'){
+    applyModelParamFields(m);
+    $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
+    ['thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
+    $('wrap-g3level').style.opacity='1'; $('wrap-g25budget').style.opacity='1';
+    $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
+    $('image-note').textContent='全局默认：仅生图模型会用到。';
+    $('sampling-note').textContent='全局默认：已废弃采样参数的模型会自动剥离。';
+    return;
+  }
+  const cap=CAPS[m]; if(!cap) return;
+  applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
+  const th=cap.thinking||{};
+  let sum=[chip('家族 '+cap.family, true)];
+  if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
+  else if(th.kind==='budget') sum.push(chip('思考预算 '+th.budget_min+'~'+th.budget_max));
+  else sum.push(chip('无思考调节'));
+  if(cap.is_image){
+    sum.push(chip('分辨率 '+cap.image_sizes.join('/')));
+    sum.push(chip('比例 '+cap.image_aspect_ratios.length+' 种'));
+    sum.push(chip('不支持函数调用'));
+  } else {
+    sum.push(chip('采样 '+(cap.sampling_advice==='deprecated'?'已废弃·自动移除':cap.sampling_advice==='recommend_default'?'可调·建议默认':'可调')));
+    sum.push(chip('支持函数调用'));
+  }
+  if(cap.supports_search) sum.push(chip('支持搜索'));
+  $('caps-summary').innerHTML=sum.join('');
+
+  const isLevel=th.kind==='level', isBudget=th.kind==='budget';
+  $('thinking_g3_level').disabled=!isLevel;
+  $('thinking_g25_budget').disabled=!isBudget;
+  $('wrap-g3level').style.opacity=isLevel?'1':'.4';
+  $('wrap-g25budget').style.opacity=isBudget?'1':'.4';
+  let tn='';
+  if(cap.is_image) tn='生图模型不接受思考参数（模型内部自行思考）。';
+  else if(isLevel) tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）') + '。';
+  else if(isBudget) tn=(cap.family==='g25' && m.includes('pro')) ? '2.5 Pro 最低预算 128，无法设 0 关闭；-1 为动态。' : '2.5 Flash 可设 0 关闭思考，-1 为动态。';
+  else tn='该模型不支持思考调节。';
+  $('think-note').textContent=tn;
+
+  const imgOn=cap.is_image;
+  $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
+  fillARFor(cap);
+  $('image-note').textContent = imgOn
+    ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。选到不支持的比例不会报错，会自动回退为“由模型决定”。')
+    : '仅生图模型（名称含 image）使用此项。';
+
+  $('sampling-note').textContent = cap.is_image
+    ? '生图模型会自动剥离采样参数。'
+    : (cap.sampling_advice==='deprecated'
+        ? '⚠️ 该模型已废弃 temperature/top_p/top_k（官方要求移除，现忽略、未来 400），代理会自动移除；如需更确定的输出请改用系统指令。candidate_count 在 3.x 也不支持。'
+        : cap.sampling_advice==='recommend_default'
+          ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
+          : '该模型支持采样参数；留空即用模型默认。');
+}
+function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
+function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
+// 说明折叠：点 ⓘ 展开/收起对应的说明块
+function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
+async function saveSettings(){
+  // 只保存 ② 全局设置区（基础设施项）。
+  // ① 按模型参数不在这里保存——那些字段显示的是"当前所选模型"的生效值，
+  // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
+  const patch={
+    img_compress_enabled:$('img_compress_enabled').checked,
+    img_compress_max_dim:numOr('img_compress_max_dim',1536),
+    img_compress_max_mb:numOr('img_compress_max_mb',1.5),
+    img_compress_quality:numOr('img_compress_quality',85),
+    retry_max:numOr('retry_max',10),
+    retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    client_reuse:$('client_reuse').checked,
+    client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
+    anti_truncation_field:($('anti_truncation_field').value||'').trim() || 'anti_truncation',
+    fake_streaming:$('fake_streaming').checked,
+    fake_streaming_interval:numOr('fake_streaming_interval',1),
+    roundrobin:$('roundrobin').checked,
+    safety_score:$('safety_score').checked,
+    cookie_debug:$('cookie_debug').checked,
+    debug_outbound:$('debug_outbound').checked,
+    prefill_mode:$('prefill_mode').value,
+    express_location:$('express_location').value,
+    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+  };
+  // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
+  // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
+  const m=$('model-sel').value;
+  const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
+  if(!overriding){
+    Object.assign(patch,{
+    });
+  }
+  const scope = overriding
+    ? '将保存全局的基础设施项（图压缩/重试/Client 复用/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
+    : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
+  if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
+    else toast('保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---------- Logs ---------- */
+const logwin=$('logwin'); let autoscroll=true;
+const MAX_LOG_LINES=2000;                     // 缓冲上限：超出丢最旧，防 DOM 无限膨胀
+const LOG_LEVELS=[['all','全部'],['ok','✅ 成功'],['warn','⚠️ 警告'],['err','❌ 错误'],['cost','💰 计费']];
+let curLevel='all'; let filterQ='';
+logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; syncAutoBtn(); });
+function syncAutoBtn(){ const b=$('autoscroll-btn'); if(b){ b.style.background=autoscroll?'#111':''; b.style.color=autoscroll?'#fff':''; } }
+function toggleAutoScroll(){
+  autoscroll=!autoscroll; syncAutoBtn();
+  if(autoscroll && logwin) logwin.scrollTop=logwin.scrollHeight;
+}
+syncAutoBtn();
+function logLevel(t){
+  if(t.includes('✅')||t.includes('🎉')) return 'ok';
+  if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')) return 'warn';
+  if(t.includes('❌')||t.includes('ERROR')) return 'err';
+  if(t.includes('💰')) return 'cost';
+  return 'other';
+}
+function logLine(t){
+  let c='#525252',bg='transparent',bl='2px solid transparent';
+  const lv=logLevel(t);
+  if(lv==='ok'){c='#0369a1';bl='2px solid #38bdf8';}
+  else if(lv==='warn'){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
+  else if(lv==='err'){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
+  else if(lv==='cost'){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
+  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
+  return `<div data-level="${lv}" style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+}
+function isLogVisible(row){
+  if(curLevel!=='all' && row.dataset.level!==curLevel) return false;
+  if(filterQ && !row.textContent.toLowerCase().includes(filterQ)) return false;
+  return true;
+}
+function applyLogFilters(){ for(const row of logwin.children) row.style.display=isLogVisible(row)?'':'none'; }
+function appendLogLine(html){
+  const wrap=document.createElement('div');
+  wrap.innerHTML=html;
+  const row=wrap.firstElementChild;
+  logwin.appendChild(row);
+  row.style.display=isLogVisible(row)?'':'none';
+  while(logwin.children.length>MAX_LOG_LINES) logwin.firstElementChild.remove();
+  if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+}
+function clearLogView(){ logwin.innerHTML=''; }
+function renderLogChips(){
+  const box=$('log-chips'); if(!box) return;
+  box.innerHTML='';
+  for(const [lv,label] of LOG_LEVELS){
+    const b=document.createElement('button');
+    b.textContent=label;
+    b.className='text-xs px-2 py-0.5 rounded border border-neutral-200 '+(curLevel===lv?'bg-neutral-900 text-white':'');
+    b.onclick=()=>{ curLevel=lv; renderLogChips(); applyLogFilters(); };
+    box.appendChild(b);
+  }
+}
+renderLogChips();
+$('log-filter').addEventListener('input',e=>{ filterQ=e.target.value.trim().toLowerCase(); applyLogFilters(); });
+$('log-filter').addEventListener('keydown',e=>{ if(e.key==='Escape'){ e.target.value=''; filterQ=''; applyLogFilters(); } });
+try{
+  const es=new EventSource('/stream-logs');
+  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; appendLogLine(logLine(e.data)); };
+}catch(e){}
+
+/* ---------- Project ID auto-extract（按行内 input 冒泡委托，兼容动态添加的账号行） ---------- */
+document.addEventListener('input',e=>{
+  if(e.target && e.target.classList && e.target.classList.contains('acc-project')){
+    const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/);
+    if(m) e.target.value=m[1];
+  }
+});
+$('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
+
+/* init */
+fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams();
+</script>
+</body>
+</html>

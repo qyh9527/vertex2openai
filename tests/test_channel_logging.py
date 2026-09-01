@@ -216,9 +216,7 @@ class TestClientReuseLog:
 
     def _clear(self):
         import upstreams.express_sdk as sdk
-        with sdk._CLIENT_CACHE_LOCK:
-            sdk._CLIENT_CACHE.clear()
-            sdk._CLIENT_FAILURES.clear()
+        sdk._clear_client_cache()   # 统一池自带加锁；手动 with 锁会死锁（P1-⑤）
 
     def test_reused_logs_reuse(self):
         import upstreams.express_sdk as sdk
@@ -234,11 +232,14 @@ class TestClientReuseLog:
         assert "新建 Client 连接池" in out
 
     def test_evict_marks_state(self):
-        """安全拦截立即淘汰时日志明确标注 evicted。"""
+        """evict 硬淘汰路径（保留机制）日志明确标注 evicted。
+
+        （进阶报告 P1-4 后安全拦截不再触发 evict；本用例验证 evict 机制本身
+        供未来"会话状态损坏"类硬错误使用。）"""
         import upstreams.express_sdk as sdk
         self._clear()
         client = sdk._get_cached_client("k1", False)
-        out = _capture(client._vertex_on_failure, kind="evict", reason="安全策略拦截")
+        out = _capture(client._vertex_on_failure, kind="evict", reason="会话状态损坏")
         assert "evicted" in out
         # 淘汰后下一次是新建
         out2 = _capture(sdk._get_cached_client, "k1", False)

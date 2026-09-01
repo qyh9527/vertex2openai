@@ -182,8 +182,9 @@ class TestSaState:
 
 class TestSaClientCache:
     def _clear(self):
-        with _SA_CLIENT_CACHE_LOCK:
-            _SA_CLIENT_CACHE.clear()
+        # P1-⑤ 统一 ClientPool：池自带加锁，手动 with 锁会死锁，走清池入口
+        from upstreams.service_account import _clear_sa_client_cache
+        _clear_sa_client_cache()
 
     def test_same_account_reuses_same_client(self):
         self._clear()

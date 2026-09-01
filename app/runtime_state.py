@@ -279,6 +279,26 @@ class AppState:
             _current_cookie_account.set(account)
         return (account.get("cookie", ""), account.get("project_id", ""))
 
+    def current_cookie_credential_id(self) -> str:
+        """本次请求选中的 Cookie 账号的脱敏标识（熔断候选粒度用，进阶报告 P0-2）。
+
+        与 get_current_cookie_account 共享同一请求级快照（不重复选号）；
+        标识取 Cookie 的 SHA-256 前 12 位——日志/熔断 key 里绝不落原始 Cookie。
+        无账号返回空串（调用方退回通道粒度）。
+        """
+        cookie, _ = self.get_current_cookie_account()
+        if not cookie:
+            return ""
+        import hashlib
+        return hashlib.sha256(str(cookie).encode("utf-8")).hexdigest()[:12]
+
+    def current_express_credential_id(self, api_key: str) -> str:
+        """Express Key 的脱敏标识（同 current_cookie_credential_id 语义）。"""
+        if not api_key:
+            return ""
+        import hashlib
+        return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:12]
+
     # ---------- 服务账号（第三通道）凭证管理 ----------
 
     def get_sa_accounts(self) -> list:
@@ -377,6 +397,19 @@ class AppState:
                 print(f"🔑 [账号选择] 多服务账号轮询/随机选中第 {idx + 1}/{len(accounts)} 份。")
             _current_sa_account.set(account)
         return (account.get("project_id", ""), account.get("location", "global"), account.get("sa_json", ""))
+
+    def current_sa_credential_id(self) -> str:
+        """本次请求选中的服务账号的脱敏标识（熔断候选粒度用，进阶报告 P0-2）。
+
+        与 get_current_sa_account 共享同一请求级快照；标识取 SA JSON 的
+        SHA-256 前 12 位——熔断 key/日志绝不落原始凭证。
+        无账号返回空串（调用方退回通道粒度）。
+        """
+        _, _, sa_json = self.get_current_sa_account()
+        if not sa_json:
+            return ""
+        import hashlib
+        return hashlib.sha256(str(sa_json).encode("utf-8")).hexdigest()[:12]
 
     # ---------- 混合自动的可配置行为（hybrid 策略下生效）----------
 

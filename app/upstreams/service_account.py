@@ -19,7 +19,6 @@
 """
 
 import json
-import threading
 from functools import partial
 from typing import Any, Optional
 
@@ -37,41 +36,41 @@ import config as app_config
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 
-# ========== 服务账号 Client 复用缓存（与 Express 通道同款防护语义）==========
-# 按 (sa_json, project_id, location, 层级头) 复用 genai.Client。SA 凭证对象自带
-# token 缓存（惰性刷新），复用 Client 即省掉每次刷新与 TLS 握手。
-# client_reuse 开关 / 连接级失败自动舍弃 / 硬错误立即舍弃 与 Express 通道共用同一套设置。
-_SA_CLIENT_CACHE: dict = {}
-_SA_CLIENT_CACHE_LOCK = threading.Lock()
-_SA_CLIENT_FAILURES: dict = {}
+# ========== 服务账号 Client 复用缓存（统一 ClientPool，进阶报告 P1-⑤）==========
+# 原先与 Express 通道各自维护同构的"缓存字典 + 失败计数 + 锁"，已合并为
+# upstreams.client_pool 的全进程唯一池。缓存键仍含层级头：换 PayGo 层级必须
+# 换连接池语义（头不同不能复用旧连接）；client_reuse 关闭时每请求新建。
+# 既有引用别名（_SA_CLIENT_CACHE 等）继续可用（测试按 dict clear 的地方
+# 已改走 _clear_sa_client_cache）。
+from upstreams.client_pool import client_pool as _POOL
+_SA_CLIENT_CACHE_LOCK = _POOL._lock
+_SA_CLIENT_CACHE = _POOL._cache
+
+
+class _SaFailuresView:
+    """兼容对象：_SA_CLIENT_FAILURES 旧名可用（clear 转发统一池）。"""
+
+    def clear(self):
+        _POOL.clear()
+
+    def __len__(self):
+        with _POOL._lock:
+            return len(_POOL._failures)
+
+
+_SA_CLIENT_FAILURES = _SaFailuresView()
+
+
+def _clear_sa_client_cache() -> None:
+    """清空统一池（测试隔离用；池是 Express/SA 共享的，整池清理）。"""
+    _POOL.clear()
 
 
 def _on_sa_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -> None:
-    """复用 SA Client 的一次失败上报（同 Express 通道防护：kind=evict 立即舍弃 / conn 计数）。"""
-    if kind == "evict":
-        with _SA_CLIENT_CACHE_LOCK:
-            _SA_CLIENT_CACHE.pop(cache_key, None)
-            _SA_CLIENT_FAILURES.pop(cache_key, None)
-        print(f"⚠️ [SA Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），"
-              f"下次请求将重建连接池（状态=evicted）。")
-        return
-    try:
-        threshold = int(app_state.get_setting(
-            "client_reuse_evict_threshold",
-            app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]))
-    except (TypeError, ValueError):
-        threshold = app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]
-    if threshold <= 0:
-        return
-    with _SA_CLIENT_CACHE_LOCK:
-        cnt = _SA_CLIENT_FAILURES.get(cache_key, 0) + 1
-        if cnt >= threshold:
-            _SA_CLIENT_CACHE.pop(cache_key, None)
-            _SA_CLIENT_FAILURES.pop(cache_key, None)
-            print(f"⚠️ [SA Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已淘汰"
-                  f"（状态=evicted），下次请求将重建连接池。")
-        else:
-            _SA_CLIENT_FAILURES[cache_key] = cnt
+    """复用 SA Client 的一次失败上报（转发统一 ClientPool；同 Express 通道防护语义）：
+    kind=evict 立即舍弃 / conn 计数达到阈值舍弃。"""
+    _POOL.on_failure(cache_key, kind=kind, reason=reason,
+                     log_prefix="[SA Client 复用]")
 
 
 def build_sa_credentials(sa_json: str):
@@ -130,22 +129,21 @@ def _new_sa_client(sa_json: str, project_id: str, location: str,
 
 def _get_cached_sa_client(sa_json: str, project_id: str, location: str,
                           headers: Optional[dict] = None, timeout: Optional[int] = None) -> Any:
-    """取（必要时创建）复用的服务账号 genai.Client。
+    """取（必要时创建）复用的服务账号 genai.Client（统一 ClientPool 承载，进阶报告 P1-⑤）。
 
     缓存键含层级头：换 PayGo 层级必须换连接池语义（头不同不能复用旧连接）。
     client_reuse 关闭时每请求新建。
     """
-    if not app_state.get_setting("client_reuse", True):
-        _log_sa_client_reuse(reused=False)
-        return _new_sa_client(sa_json, project_id, location, headers, timeout, cache_key=None)
     headers_key = tuple(sorted((headers or {}).items()))
     cache_key = (sa_json, project_id, location, headers_key)
-    with _SA_CLIENT_CACHE_LOCK:
-        client = _SA_CLIENT_CACHE.get(cache_key)
-        reused = client is not None
-        if client is None:
-            client = _new_sa_client(sa_json, project_id, location, headers, timeout, cache_key=cache_key)
-            _SA_CLIENT_CACHE[cache_key] = client
+
+    def _factory(key):
+        return _new_sa_client(sa_json, project_id, location, headers, timeout, cache_key=key)
+
+    if not app_state.get_setting("client_reuse", True):
+        _log_sa_client_reuse(reused=False)
+        return _factory(None)
+    client, reused = _POOL.get_or_create(cache_key, _factory)
     _log_sa_client_reuse(reused)
     return client
 

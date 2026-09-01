@@ -78,12 +78,14 @@ class TestResolveModelPath:
 
 
 class TestClientCache:
-    """_get_cached_client 按 (key, base_url, priority_paygo) 复用（3.6 节设计约束）。"""
+    """_get_cached_client 按 (key, base_url, priority_paygo) 复用（3.6 节设计约束）。
+
+    （P1-⑤ 统一 ClientPool 后：池自带加锁，clear 走 sdk._clear_client_cache，
+    不再手动 with 锁——否则与池内嵌套加锁死锁。）"""
 
     def _clear_cache(self):
         import upstreams.express_sdk as sdk
-        with sdk._CLIENT_CACHE_LOCK:
-            sdk._CLIENT_CACHE.clear()
+        sdk._clear_client_cache()
 
     def test_same_key_reuses_same_client(self):
         self._clear_cache()
@@ -113,9 +115,7 @@ class TestClientReuseGuard:
 
     def _clear(self):
         import upstreams.express_sdk as sdk
-        with sdk._CLIENT_CACHE_LOCK:
-            sdk._CLIENT_CACHE.clear()
-            sdk._CLIENT_FAILURES.clear()
+        sdk._clear_client_cache()   # 统一池自带加锁；手动 with 锁会死锁（P1-⑤）
 
     def _restore_settings(self):
         app_state.update_settings({
@@ -154,13 +154,16 @@ class TestClientReuseGuard:
             self._restore_settings()
 
     def test_hard_error_evicts_immediately(self):
-        """安全策略拦截等硬错误不走阈值，立即舍弃复用。"""
+        """真正的连接/会话硬错误（kind=evict 仍保留的用途）不走阈值，立即舍弃复用。
+
+        （进阶报告 P1-4 后安全拦截已不再触发 evict——但 evict 机制本身保留，
+        供未来"会话状态损坏"类硬错误使用，行为不回退。）"""
         import upstreams.express_sdk as sdk
         self._clear()
         try:
             client = sdk._get_cached_client("key1", False)
             assert sdk._get_cached_client("key1", False) is client
-            client._vertex_on_failure(kind="evict", reason="安全策略拦截")
+            client._vertex_on_failure(kind="evict", reason="会话状态损坏")
             fresh = sdk._get_cached_client("key1", False)
             assert fresh is not client
         finally:

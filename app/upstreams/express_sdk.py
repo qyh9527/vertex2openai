@@ -46,9 +46,50 @@ OPENAI_SEARCH_SUFFIX = "-openaisearch"
 #                                    类，如 RemoteProtocolError / ConnectError / 超时，不含 429
 #                                    限流）自动舍弃，下次请求重建连接池（0=不自动舍弃）。
 #                                    长驻进程里残留的失效 keep-alive 连接正是这类失败之源。
-_CLIENT_CACHE: dict = {}
-_CLIENT_CACHE_LOCK = threading.Lock()
-_CLIENT_FAILURES: dict = {}  # cache_key -> 连续连接级失败次数
+# ========== Client 复用：统一 ClientPool（进阶报告 P1-⑤）==========
+# 原先 Express 与 SA 各自维护"缓存字典 + 失败计数 + 锁"的同构代码，已合并为
+# upstreams.client_pool 的全进程唯一池。缓存键、开关语义、淘汰逻辑逐条保持：
+#   client_reuse=False              → 每请求新建 Client，彻底不用缓存
+#   client_reuse_evict_threshold=N  → 缓存 Client 连续 N 次"连接级失败"（httpx.TransportError
+#                                    类，如 RemoteProtocolError / ConnectError / 超时，不含 429
+#                                    限流）自动舍弃，下次请求重建连接池（0=不自动舍弃）。
+#                                    长驻进程里残留的失效 keep-alive 连接正是这类失败之源。
+# 既有引用别名：_CLIENT_CACHE_LOCK（池的锁）/ _CLIENT_CACHE（池的缓存 dict）/
+# _CLIENT_FAILURES（兼容视图）仍可被测试/代码按原方式使用。
+from upstreams.client_pool import client_pool as _POOL
+_CLIENT_CACHE_LOCK = _POOL._lock
+_CLIENT_CACHE = _POOL._cache
+
+
+class _FailuresView:
+    """兼容对象：既有测试按 dict 方式访问 _CLIENT_FAILURES（只用到 clear）。
+
+    统一池把 cache 与 failures 拆开持有后，这里保持旧名字可用：
+    clear() 同时清空统一池的失败计数与缓存（与旧行为一致——旧测试
+    clear 两个字典总是一起清）。
+    """
+
+    def clear(self):
+        with _CLIENT_CACHE_LOCK:
+            _POOL._failures.clear()
+            _POOL._cache.clear()
+
+    def __len__(self):
+        with _CLIENT_CACHE_LOCK:
+            return len(_POOL._failures)
+
+
+_CLIENT_FAILURES = _FailuresView()
+
+
+def _clear_client_cache() -> None:
+    """清空本通道在统一池中的缓存与失败计数（测试隔离用）。
+
+    统一池是全进程共享的（Express/SA 同池），逐 key 清理无从知道哪些 key
+    属于哪条通道，这里直接清整池——与改造前"各自 clear 自己的字典"在
+    单测隔离语义上等价（SA 测试同样会先清池再建自己的 key）。
+    """
+    _POOL.clear()
 
 
 def _new_express_client(express_api_key: str, priority_paygo: bool,
@@ -71,60 +112,37 @@ def _new_express_client(express_api_key: str, priority_paygo: bool,
 
 
 def _on_client_failure(cache_key: tuple, kind: str = "conn", reason: str = "") -> None:
-    """复用 Client 的一次失败上报（hook，由 api_helpers 触发）。
+    """复用 Client 的一次失败上报（hook，由 api_helpers 触发）——转发统一 ClientPool。
 
-    kind="evict"：立即舍弃缓存 Client（如安全策略拦截等"这条连接/会话状态不对"的硬错误），
-                 下次请求重建连接池。
+    kind="evict"：立即舍弃缓存 Client（真正的"连接/会话状态损坏"硬错误；安全拦截
+                 已不再走此路径，P1-4），下次请求重建连接池。
     kind="conn"（默认）：连接级失败计数，累计达到 client_reuse_evict_threshold 才舍弃；
                  429 限流等 HTTP 状态错误不会走到这里（连接本身健康）。
     """
-    if kind == "evict":
-        with _CLIENT_CACHE_LOCK:
-            _CLIENT_CACHE.pop(cache_key, None)
-            _CLIENT_FAILURES.pop(cache_key, None)
-        print(f"⚠️ [Client 复用] 已立即舍弃缓存 Client（{reason or '硬错误'}），下次请求将重建连接池（状态=evicted）。")
-        return
-    try:
-        threshold = int(app_state.get_setting(
-            "client_reuse_evict_threshold",
-            app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]))
-    except (TypeError, ValueError):
-        threshold = app_config.DEFAULT_SETTINGS["client_reuse_evict_threshold"]
-    if threshold <= 0:
-        return
-    with _CLIENT_CACHE_LOCK:
-        cnt = _CLIENT_FAILURES.get(cache_key, 0) + 1
-        if cnt >= threshold:
-            _CLIENT_CACHE.pop(cache_key, None)
-            _CLIENT_FAILURES.pop(cache_key, None)
-            print(f"⚠️ [Client 复用] 缓存 Client 连续 {cnt} 次连接级失败，已淘汰"
-                  f"（状态=evicted），下次请求将重建连接池。")
-        else:
-            _CLIENT_FAILURES[cache_key] = cnt
+    _POOL.on_failure(cache_key, kind=kind, reason=reason,
+                     log_prefix="[Client 复用]")
 
 
 def _get_cached_client(express_api_key: str, priority_paygo: bool = False,
                        *, headers: dict | None = None, timeout: int | None = None) -> Any:
-    """取（必要时创建）复用的 google-genai Client。
+    """取（必要时创建）复用的 google-genai Client（统一 ClientPool 承载，进阶报告 P1-⑤）。
 
     缓存键含 priority_paygo 与 PayGo 层级头：Priority PayGo 请求头必须只用于钉定到
     global 的资源路径，绝不能复用到普通请求上（流量等级会标错）；换层级必须换连接池语义。
     控制台 client_reuse 关闭时不做缓存，每请求新建 Client。
     """
-    if not app_state.get_setting("client_reuse", True):
-        _log_client_reuse("express", reused=False)
-        return _new_express_client(express_api_key, priority_paygo,
-                                   headers=headers, timeout=timeout, cache_key=None)
     base_url = app_config.VERTEX_BASE_URL or None
     headers_key = tuple(sorted((headers or {}).items()))
     cache_key = (express_api_key, base_url, priority_paygo, headers_key)
-    with _CLIENT_CACHE_LOCK:
-        client = _CLIENT_CACHE.get(cache_key)
-        reused = client is not None
-        if client is None:
-            client = _new_express_client(express_api_key, priority_paygo,
-                                         headers=headers, timeout=timeout, cache_key=cache_key)
-            _CLIENT_CACHE[cache_key] = client
+
+    def _factory(key):
+        return _new_express_client(express_api_key, priority_paygo,
+                                   headers=headers, timeout=timeout, cache_key=key)
+
+    if not app_state.get_setting("client_reuse", True):
+        _log_client_reuse("express", reused=False)
+        return _factory(None)
+    client, reused = _POOL.get_or_create(cache_key, _factory)
     _log_client_reuse("express", reused)
     return client
 

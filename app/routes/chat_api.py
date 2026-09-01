@@ -14,6 +14,7 @@ from api_helpers import (
     extract_upstream_error, create_openai_error_response, is_retryable_exception,
     channel_display_name,
 )
+import outcome as outcome_mod
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
 
@@ -38,8 +39,8 @@ CHANNEL_NAMES = {
     "vertex": "服务账号",
 }
 
-# 可切换错误白名单：只有这些状态码才触发跨通道故障转移。
-# 400/401/403 等属于配置、鉴权、权限问题，切换通道不会变好，直接如实报错。
+# 可切换错误判定：统一失败语义（outcome.py）接管，本常量保留供既有代码/测试引用；
+# 等价性回归见 tests/test_outcome.py（429/500/502/503/504 可切换，400/401/403 等如实报错）。
 SWITCHABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -89,8 +90,29 @@ def _available_channels(order: list) -> list:
 
 
 def _switchable_json(resp: JSONResponse) -> bool:
-    """JSONResponse 是否属于"可切换通道"的失败（限流/上游 5xx）。"""
-    return resp.status_code in SWITCHABLE_STATUS_CODES
+    """JSONResponse 是否属于"可切换通道"的失败（限流/上游 5xx）。
+
+    经统一失败语义分类判定（outcome.status_switchable），等价于既有
+    SWITCHABLE_STATUS_CODES 白名单。
+    """
+    return outcome_mod.status_switchable(resp.status_code)
+
+
+def _current_credential_id(channel: str) -> str:
+    """本次请求在该通道实际选中的凭证脱敏标识（进阶报告 P0-2 候选粒度）。
+
+    与请求级账号快照共享状态（cookie/vertex 取选中账号；express 的 Key 在
+    upstream 内部选择，路由层拿不到稳定标识——留空退回通道粒度，等 P2
+    candidate planner 接管后再补）。取不到返回空串。
+    """
+    try:
+        if channel == "cookie":
+            return app_state.current_cookie_credential_id()
+        if channel == "vertex":
+            return app_state.current_sa_credential_id()
+    except Exception:
+        pass
+    return ""
 
 
 def _summarize_json_error(resp: JSONResponse) -> str:
@@ -177,16 +199,19 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         )
 
     last_status, last_msg = 500, "上游通道全部不可用"
-    attempts: list = []   # [{channel, status, message}]（全部失败聚合用）
+    attempts: list = []   # [{channel, status, message, category, upstream?}]（全部失败聚合用）
     for idx, channel in enumerate(channels):
         # 熔断冷却中的通道直接跳过（日志由熔断器打出）
         if breaker.is_cooling(channel):
             attempts.append({"channel": channel, "status": 503,
-                             "message": "通道处于熔断冷却中"})
+                             "message": "通道处于熔断冷却中",
+                             "category": outcome_mod.TRANSIENT})
             last_status, last_msg = 503, f"{channel_display_name(channel)} 通道处于熔断冷却中"
             continue
 
         upstream = CHANNELS[channel]
+        # 候选粒度：本次请求在该通道选中的凭证（脱敏 id；express 留空=通道粒度）
+        cred = _current_credential_id(channel)
         try:
             resp = await upstream.chat_completions(
                 request, fastapi_request, failover_mode=failover_mode)
@@ -208,9 +233,17 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 # P0-6：可切换错误无论是否还有兜底通道，都记录失败摘要
                 #（最后一个通道返回 429/5xx 时不再"原样返回"当作普通结果——
                 # 前序通道的失败原因会丢，客户端只会看到最后一个错误）。
-                breaker.report_failure(channel)
+                _summary = _summarize_json_error(resp)
+                _cat = outcome_mod.classify_failure(resp.status_code, _summary)
+                # P0-2：429 类带 Retry-After 语义的按精确窗口冷却候选（解析不出走通用计数）
+                if _cat == outcome_mod.RATE_LIMITED:
+                    breaker.report_rate_limited(channel, credential_id=cred or None,
+                                                message=_summary)
+                else:
+                    breaker.report_failure(channel, credential_id=cred or None)
                 attempts.append({"channel": channel, "status": resp.status_code,
-                                 "message": _summarize_json_error(resp)})
+                                 "message": _summary, "category": _cat,
+                                 "upstream": True})
                 if remaining_channels(channels, idx):
                     print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
                           f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
@@ -221,16 +254,27 @@ async def _dispatch(channels: list, request: OpenAIRequest,
 
             # 不可切换错误（400/401/403 等）如实返回；也记入 attempts 供日志聚合
             if isinstance(resp, JSONResponse) and resp.status_code >= 400:
+                _summary = _summarize_json_error(resp)
                 attempts.append({"channel": channel, "status": resp.status_code,
-                                 "message": _summarize_json_error(resp)})
+                                 "message": _summary,
+                                 "category": outcome_mod.classify_failure(
+                                     resp.status_code, _summary),
+                                 "upstream": True})
             breaker.report_success(channel)
+            if cred:
+                breaker.report_success((channel, cred))
             return resp
 
         except UpstreamUnstartedError as e:
             if not failover_mode:
                 raise  # 非 hybrid：upstream 不应抛此异常；透传给外层兜底
-            breaker.report_failure(channel)
-            attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
+            _cat = outcome_mod.classify_exception(e)
+            if _cat == outcome_mod.RATE_LIMITED:
+                breaker.report_rate_limited(channel, credential_id=cred or None, message=str(e))
+            else:
+                breaker.report_failure(channel, credential_id=cred or None)
+            attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
+                             "category": _cat})
             if remaining_channels(channels, idx):
                 print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道未出流失败（{str(e)[:120]}），"
                       f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
@@ -240,15 +284,21 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             return _all_failed_response(attempts, last_status, last_msg)
         except Exception as e:
             # 非流式/其他异常：只对"可切换"类错误继续兜底（429/503/配额等）
-            breaker.report_failure(channel)
+            _cat = outcome_mod.classify_exception(e)
+            if _cat == outcome_mod.RATE_LIMITED:
+                breaker.report_rate_limited(channel, credential_id=cred or None, message=str(e))
+            else:
+                breaker.report_failure(channel, credential_id=cred or None)
             if remaining_channels(channels, idx) and _exception_switchable(e):
-                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
+                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
+                                 "category": _cat})
                 print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道异常（{str(e)[:120]}），"
                       f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
                 last_status, last_msg = 503, str(e)
                 continue
             if not remaining_channels(channels, idx):
-                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200]})
+                attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
+                                 "category": outcome_mod.classify_exception(e)})
                 return _all_failed_response(attempts, 503, str(e))
             raise
 
@@ -257,7 +307,12 @@ async def _dispatch(channels: list, request: OpenAIRequest,
 
 
 def _all_failed_response(attempts: list, last_status: int, last_msg: str) -> JSONResponse:
-    """所有候选通道失败后的聚合错误（OpenAI error 形状，含每个通道的摘要）。"""
+    """所有候选通道失败后的聚合错误（OpenAI error 形状，含每个通道的摘要）。
+
+    最终 HTTP 状态由 outcome.final_http_status 决定（P0-3 修复）：优先取最后一次
+    「真实上游 JSONResponse」的状态码，不再从聚合字符串反推——避免
+    "Express 429 + Cookie 503" 被洗成 500，客户端重试策略/监控图因此失真。
+    """
     parts = []
     for a in attempts:
         name = channel_display_name(a["channel"])
@@ -268,9 +323,12 @@ def _all_failed_response(attempts: list, last_status: int, last_msg: str) -> JSO
         parts.append(f"{name} HTTP {code}: {msg}")
     summary = "；".join(parts) if parts else (last_msg or "上游通道全部不可用")
     print(f"❌ [路由兜底] 所有候选通道均失败：{summary[:400]}")
-    code, msg = extract_upstream_error(
-        ValueError(f"所有候选通道均失败：{summary[:600]}"))
-    return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
+    final_status = outcome_mod.final_http_status(attempts, fallback_status=last_status)
+    return JSONResponse(status_code=final_status,
+                         content=create_openai_error_response(
+                             final_status,
+                             f"所有候选通道均失败：{summary[:600]}",
+                             "upstream_error"))
 
 
 def remaining_channels(channels: list, idx: int) -> bool:
@@ -278,8 +336,12 @@ def remaining_channels(channels: list, idx: int) -> bool:
 
 
 def _exception_switchable(e: Exception) -> bool:
-    """异常是否属于"可切换通道"类（限流/上游繁忙/网络故障）。"""
-    return is_retryable_exception(e)
+    """异常是否属于"可切换通道"类（限流/上游繁忙/网络故障）。
+
+    经统一失败语义分类判定（outcome.exception_switchable），等价于既有
+    is_retryable_exception。
+    """
+    return outcome_mod.exception_switchable(e)
 
 
 async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list,
