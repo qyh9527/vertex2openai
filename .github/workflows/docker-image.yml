@@ -28,7 +28,9 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -r app/requirements.txt
-        pip install pytest
+        # pytest-asyncio：asyncio_mode=auto（pytest.ini）驱动的异步用例必需；
+        # 与本地 .venv 装法保持一致，不进生产镜像（只装在这个 CI job 里）
+        pip install pytest pytest-asyncio
 
     - name: Compile smoke (import all app modules)
       run: python -m compileall -q app
