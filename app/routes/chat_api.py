@@ -1,4 +1,5 @@
 import json
+import random
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -50,14 +51,19 @@ def _channel_order(strategy: str) -> list:
     - cookie   -> [cookie]                 只走 Cookie 直连反代
     - vertex   -> [vertex]                 只走服务账号（标准 Vertex）
     - hybrid   -> 控制台可配顺序（hybrid_channels 设置，默认 [express, cookie]，
-                  可在「混合自动」标签页加入 vertex 并排序）
+                  可在「混合自动」标签页加入 vertex 并排序）；random 模式下
+                  每次请求对参与的通道做一次等概率随机排列
     """
     if strategy == "cookie":
         return ["cookie"]
     if strategy == "vertex":
         return ["vertex"]
     if strategy == "hybrid":
-        return app_state.get_hybrid_channels()
+        channels = list(app_state.get_hybrid_channels())
+        if app_state.get_hybrid_dispatch_mode() == "random":
+            # sample 而不是按请求轮询：所有排列等概率，且不改动持久化的优先级列表。
+            return random.sample(channels, k=len(channels))
+        return channels
     return ["express"]
 
 
@@ -409,24 +415,9 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
             yield "data: [DONE]\n\n"
 
 
-@router.post("/v1/chat/completions")
-async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
-    """
-    /v1/chat/completions 多通道动态分流路由器
-
-    通道策略（控制台「通道与凭证」页可切）：
-    - express  -> 只走 ExpressSDKUpstream（官方 API Key 标准通道）
-    - cookie   -> 只走 CookieProxyUpstream（Cookie 直连反代通道，规避 429 限流）
-    - vertex   -> 只走 ServiceAccountUpstream（服务账号 JSON，标准 Vertex 认证）
-    - hybrid   -> 按控制台「混合自动」标签页的通道顺序尝试（默认 Express 优先，
-                  限流/5xx/未出流失败自动切 Cookie 兜底，可在控制台加入/排序服务账号通道）；
-                  任一通道连续失败自动熔断冷却（failover_threshold / failover_cooldown_seconds）
-
-    统一异常兜底：把上游抛出的 404/403/400 等如实转成 OpenAI 错误格式，
-    避免笼统的 500 Internal Server Error（非流式路径此前直接 raise）。
-    统计由 main.py 的中间件按响应状态码统一计入，这里不重复计数。
-    """
-    strategy = app_state.get_channel_strategy()
+async def _chat_completions_with_strategy(fastapi_request: Request, request: OpenAIRequest,
+                                          strategy: str):
+    """按指定策略执行一次聊天请求；显式渠道路径传入单渠道策略。"""
     order = _available_channels(_channel_order(strategy))
     if not order:
         return JSONResponse(
@@ -443,3 +434,41 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         code, msg = extract_upstream_error(e)
         print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
         return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
+    """
+    /v1/chat/completions 多通道动态分流路由器
+
+    通道策略（控制台「通道与凭证」页可切）：
+    - express  -> 只走 ExpressSDKUpstream（官方 API Key 标准通道）
+    - cookie   -> 只走 CookieProxyUpstream（Cookie 直连反代通道，规避 429 限流）
+    - vertex   -> 只走 ServiceAccountUpstream（服务账号 JSON，标准 Vertex 认证）
+    - hybrid   -> 按控制台「混合自动」标签页的通道顺序尝试（默认 Express 优先，
+                  限流/5xx/未出流失败自动切 Cookie 兜底，可在控制台加入/排序服务账号通道）；
+                  `hybrid_dispatch_mode=random` 时每次请求随机排列已勾选通道；
+                  任一通道连续失败自动熔断冷却（failover_threshold / failover_cooldown_seconds）
+
+    统一异常兜底：把上游抛出的 404/403/400 等如实转成 OpenAI 错误格式，
+    避免笼统的 500 Internal Server Error（非流式路径此前直接 raise）。
+    统计由 main.py 的中间件按响应状态码统一计入，这里不重复计数。
+    """
+    return await _chat_completions_with_strategy(
+        fastapi_request, request, app_state.get_channel_strategy())
+
+
+@router.post("/{channel}/v1/chat/completions")
+async def channel_chat_completions(channel: str, fastapi_request: Request,
+                                   request: OpenAIRequest,
+                                   api_key: str = Depends(get_api_key)):
+    """显式渠道入口：/express/v1、/cookie/v1、/vertex/v1。"""
+    if channel not in CHANNELS:
+        return JSONResponse(
+            status_code=404,
+            content=create_openai_error_response(
+                404, f"未知的独立渠道：{channel}。可用渠道为 express / cookie / vertex。",
+                "invalid_request_error"),
+        )
+    # 显式路径永远只走指定渠道，不读取控制台当前策略，也不触发 hybrid 故障转移。
+    return await _chat_completions_with_strategy(fastapi_request, request, channel)

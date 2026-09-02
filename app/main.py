@@ -282,8 +282,9 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
         "sa_accounts": [mask_sa_account(a, i) for i, a in enumerate(sa_accounts)],
         "sa_accounts_controlled": app_state.get_sa_accounts_console() != [],
         "sa_env_configured": bool(config.VERTEX_SA_JSON or config.VERTEX_SA_FILE),
-        # 混合自动可配置项（hybrid 通道顺序 / 每通道重试覆盖）
+        # 混合自动可配置项（hybrid 通道顺序 / 调度方式 / 每通道重试覆盖）
         "hybrid_channels": app_state.get_hybrid_channels(),
+        "hybrid_dispatch_mode": app_state.get_hybrid_dispatch_mode(),
         "channel_retry_overrides": app_state.get_setting(
             "channel_retry_overrides", config.DEFAULT_SETTINGS["channel_retry_overrides"]),
         # PayGo 流量等级

@@ -261,8 +261,16 @@
       <!-- 混合自动标签页 -->
       <div id="ctab-hybrid" class="ctab-pane hidden">
         <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
-          <div class="text-xs text-neutral-500 leading-relaxed">混合自动：按下面的优先级顺序尝试，<b>限流/5xx/未出流失败</b>自动切换下一通道；400/401/403 如实报错不切换；任一通道连续失败自动熔断冷却（阈值/冷却见模型参数页）。</div>
+          <div class="text-xs text-neutral-500 leading-relaxed">混合自动：默认按下面的优先级顺序尝试；也可选择<b>每次请求完全随机排列已勾选通道</b>，再按随机顺序故障转移。<b>限流/5xx/未出流失败</b>自动切换下一通道；400/401/403 如实报错不切换；任一通道连续失败自动熔断冷却（阈值/冷却见模型参数页）。</div>
           <button class="btn px-4 py-2 text-sm" onclick="setStrategy('hybrid')">设为当前策略</button>
+        </div>
+        <div class="lbl mb-2">混合调度方式</div>
+        <div class="flex flex-wrap items-center gap-3 mb-3">
+          <select id="hybrid_dispatch_mode" class="inp" style="min-width:260px">
+            <option value="priority">固定优先级 · 按下方顺序尝试</option>
+            <option value="random">完全随机 · 每次请求随机排列</option>
+          </select>
+          <span class="text-xs text-neutral-500">随机模式对已勾选通道等概率排列；要使用三渠道随机，请同时勾选 Express、Cookie、服务账号。</span>
         </div>
         <div class="lbl mb-2">参与通道与优先级顺序</div>
         <div id="hybrid-channels"></div>
@@ -966,7 +974,7 @@ async function loadRuntime(){
       (ctrl?'　[控制台管理]':(envN?'　[来自环境变量]':''));
     renderCookieAccounts(s.cookie_accounts||[]);
     renderSaAccounts(s.sa_accounts||[]);
-    renderHybridConfig(s.hybrid_channels||[], s.channel_retry_overrides||{});
+    renderHybridConfig(s.hybrid_channels||[], s.channel_retry_overrides||{}, s.hybrid_dispatch_mode||'priority');
     if($('paygo_tier')) $('paygo_tier').value=s.paygo_tier||'auto';
     if($('paygo_only')) $('paygo_only').checked=!!s.paygo_only;
   }catch(e){}
@@ -1024,8 +1032,9 @@ async function delSaAccount(idx){
 
 /* ---- 混合自动（3 通道开关 + 优先级 + 每通道重试 + PayGo 层级）---- */
 const CHAN_META={express:'Express API Key',cookie:'Cookie 直连',vertex:'服务账号'};
-function renderHybridConfig(channels, retries){
+function renderHybridConfig(channels, retries, dispatchMode){
   const box=$('hybrid-channels'); if(!box) return;
+  if($('hybrid_dispatch_mode')) $('hybrid_dispatch_mode').value=dispatchMode==='random'?'random':'priority';
   box.innerHTML='';
   ['express','cookie','vertex'].forEach(c=>{
     const enabled=(channels||[]).includes(c);
@@ -1072,6 +1081,7 @@ async function saveHybridConfig(){
   });
   const patch={
     hybrid_channels:channels,
+    hybrid_dispatch_mode:$('hybrid_dispatch_mode').value,
     channel_retry_overrides:retries,
     paygo_tier:$('paygo_tier').value,
     paygo_only:$('paygo_only').checked,

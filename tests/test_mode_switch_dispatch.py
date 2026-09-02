@@ -81,6 +81,53 @@ def _chat(c, model="gemini-3.6-flash"):
     )
 
 
+def _chat_at(c, channel, model="gemini-3.6-flash"):
+    return c.post(
+        f"/{channel}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {app_config.API_KEY}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+
+class TestExplicitChannelRoutes:
+    @pytest.mark.parametrize("channel, expected", [
+        ("express", "express"),
+        ("cookie", "cookie"),
+        ("vertex", "vertex"),
+    ])
+    def test_explicit_path_forces_one_channel(self, client, channel, expected):
+        """/<channel>/v1 路径独立于控制台策略，只调用指定上游一次。"""
+        c, ex, ck, sa = client
+        app_state.set_channel_strategy("hybrid")
+
+        resp = _chat_at(c, channel)
+
+        assert resp.status_code == 200
+        calls = {"express": ex.calls, "cookie": ck.calls, "vertex": sa.calls}
+        assert calls == {expected: 1, **{name: 0 for name in calls if name != expected}}
+        app_state.set_channel_strategy("express")
+
+    def test_unprefixed_path_keeps_strategy_dispatch(self, client):
+        """旧 /v1 路径仍按控制台策略分发。"""
+        c, ex, ck, sa = client
+        app_state.set_channel_strategy("vertex")
+
+        resp = _chat(c)
+
+        assert resp.status_code == 200
+        assert sa.calls == 1 and ex.calls == 0 and ck.calls == 0
+        app_state.set_channel_strategy("express")
+
+    def test_explicit_models_path_is_openai_base_url_compatible(self, client):
+        c, _, _, _ = client
+        resp = c.get(
+            "/vertex/v1/models",
+            headers={"Authorization": f"Bearer {app_config.API_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["object"] == "list"
+
+
 class TestModeSwitchDispatch:
     def test_switch_to_vertex_routes_only_sa(self, client, monkeypatch):
         """P1-6 核心：控制台切到 vertex 后，聊天请求只打服务账号上游。"""

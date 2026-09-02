@@ -1,5 +1,6 @@
 import time
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 from typing import List, Dict, Any, Set
 from auth import get_api_key
 from model_loader import get_express_models
@@ -8,8 +9,7 @@ from runtime_state import app_state
 router = APIRouter()
 
 
-@router.get("/v1/models")
-async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_key)):
+async def _list_models():
     current_time = time.time()
     # 不再自动从远程刷新模型配置（曾每 3600s 自动拉取）——远程获取改为控制台
     # 「获取远程模型」按钮手动触发；这里用磁盘缓存 + 本地配置 + 内置兜底 + 自定义模型。
@@ -60,3 +60,22 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
         add_model(model_id)
 
     return {"object": "list", "data": sorted(final_model_list, key=lambda item: item["id"])}
+
+
+@router.get("/v1/models")
+async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_key)):
+    """保持原有无渠道前缀的模型列表入口。"""
+    return await _list_models()
+
+
+@router.get("/{channel}/v1/models")
+async def list_models_for_channel(channel: str, fastapi_request: Request,
+                                  api_key: str = Depends(get_api_key)):
+    """显式渠道入口的模型列表，便于 OpenAI 客户端把 base_url 设为 /<channel>/v1。"""
+    if channel not in {"express", "cookie", "vertex"}:
+        return JSONResponse(status_code=404, content={"error": {
+            "message": f"未知的独立渠道：{channel}。可用渠道为 express / cookie / vertex。",
+            "type": "invalid_request_error",
+            "code": 404,
+        }})
+    return await _list_models()

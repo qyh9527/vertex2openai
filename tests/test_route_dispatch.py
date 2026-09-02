@@ -87,6 +87,22 @@ class TestChannelOrder:
     def test_hybrid_express_first(self):
         assert chat_api._channel_order("hybrid") == ["express", "cookie"]
 
+    def test_hybrid_order_random_mode(self, monkeypatch):
+        """随机模式每次基于全部已参与通道生成新排列，不改动配置顺序。"""
+        configured = ["express", "cookie", "vertex"]
+        monkeypatch.setattr(app_state, "get_hybrid_channels", lambda: configured)
+        monkeypatch.setattr(app_state, "get_hybrid_dispatch_mode", lambda: "random")
+        sampled = []
+
+        def fake_sample(population, k):
+            sampled.append((population, k))
+            return ["vertex", "express", "cookie"]
+
+        monkeypatch.setattr(chat_api.random, "sample", fake_sample)
+        assert chat_api._channel_order("hybrid") == ["vertex", "express", "cookie"]
+        assert sampled == [(configured, 3)]
+        assert configured == ["express", "cookie", "vertex"]
+
     def test_unknown_strategy_defaults_express(self):
         assert chat_api._channel_order("banana") == ["express"]
 

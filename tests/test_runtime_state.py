@@ -142,6 +142,15 @@ class TestUpdateSettings:
         state.update_settings({"model_overrides": {"gemini-x": {"thinking_g3_level": "high"}}})
         assert state.get_model_overrides() == {}
 
+    def test_hybrid_dispatch_mode_defaults_to_priority(self, state):
+        assert state.get_hybrid_dispatch_mode() == "priority"
+
+    def test_hybrid_dispatch_mode_roundtrips_and_invalid_falls_back(self, state):
+        state.update_settings({"hybrid_dispatch_mode": "random"})
+        assert state.get_hybrid_dispatch_mode() == "random"
+        state.update_settings({"hybrid_dispatch_mode": "unexpected"})
+        assert state.get_hybrid_dispatch_mode() == "priority"
+
 
 class TestPersistence:
     def test_atomic_save_no_temp_left(self, state, tmp_path):

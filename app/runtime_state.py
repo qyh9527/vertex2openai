@@ -423,6 +423,16 @@ class AppState:
                 return out
         return list(app_config.DEFAULT_SETTINGS["hybrid_channels"])
 
+    def get_hybrid_dispatch_mode(self) -> str:
+        """混合自动的调度方式：priority=按配置顺序，random=每次请求随机洗牌。"""
+        mode = self.get_setting(
+            "hybrid_dispatch_mode",
+            app_config.DEFAULT_SETTINGS["hybrid_dispatch_mode"],
+        )
+        if mode in ("priority", "random"):
+            return mode
+        return app_config.DEFAULT_SETTINGS["hybrid_dispatch_mode"]
+
     def get_channel_retry(self, channel: str):
         """该通道的独立重试次数覆盖；无覆盖/非法返回 None（= 用全局 retry_max）。"""
         overrides = self.get_setting(

@@ -107,9 +107,11 @@ DEFAULT_SETTINGS = {
     # ===== 第三通道：服务账号（Vertex SA，标准 Vertex AI 认证）=====
     # 混合自动的可配置行为（hybrid 策略下生效）：
     #   hybrid_channels          参与混合自动的通道及优先级顺序（有序列表，只取存在的通道键）
+    #   hybrid_dispatch_mode     priority=按上面顺序，random=每次请求随机排列参与通道
     #   channel_retry_overrides  每通道独立重试次数覆盖（None/缺省 = 用全局 retry_max）；
     #                            键 = express | cookie | vertex
     "hybrid_channels": ["express", "cookie"],
+    "hybrid_dispatch_mode": "priority",
     "channel_retry_overrides": {"express": None, "cookie": None, "vertex": None},
     # ===== PayGo 流量等级（ST-Vertex-PayGo 方案融合，作用于标准 Vertex 端点类通道）=====
     # Express 与 服务账号 两通道打同一组官方"按量共享容量"层级头（cookie 通道走 batchGraphql 不适用）：
