@@ -31,6 +31,17 @@ def test_dashboard_request_trend_granularity_switch():
     assert "HOURLY=d.hourly||[]" in DASHBOARD_HTML
 
 
+def test_dashboard_exposes_copyable_independent_channel_routes():
+    """通道页必须明确展示三种独立入口，并支持复制当前访问地址。"""
+    assert "三种独立渠道接口" in DASHBOARD_HTML
+    assert "channel-route-list" in DASHBOARD_HTML
+    assert "CHANNEL_ROUTE_META" in DASHBOARD_HTML
+    assert "express/v1" in DASHBOARD_HTML or "item.key+'/v1'" in DASHBOARD_HTML
+    assert "cookie" in DASHBOARD_HTML and "vertex" in DASHBOARD_HTML
+    assert "复制地址" in DASHBOARD_HTML
+    assert "navigator.clipboard.writeText" in DASHBOARD_HTML
+
+
 def test_dashboard_error_categories_panel():
     """错误/拦截分类统计面板：后端 error_categories 驱动，排行展示重复次数。"""
     assert "ERROR_CATS=d.error_categories||{}" in DASHBOARD_HTML

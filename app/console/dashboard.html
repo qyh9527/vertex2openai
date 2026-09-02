@@ -202,6 +202,15 @@
   <!-- Channel -->
   <section id="view-channel" class="hidden">
     <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+        <div class="lbl mb-0">三种独立渠道接口</div>
+        <span class="pill pill-accent" style="text-transform:none">固定调用指定渠道</span>
+      </div>
+      <p class="text-xs text-neutral-500 leading-relaxed mb-3">下游可以把 OpenAI 客户端的 <code>base_url</code> 直接设为下面任一地址，绕过当前混合策略，固定使用对应渠道。每行右侧可复制完整地址；三种入口都支持 <code>/models</code> 与 <code>/chat/completions</code>。</p>
+      <div id="channel-route-list" class="space-y-2"></div>
+      <p class="text-xs text-neutral-400 mt-3 leading-relaxed">地址按当前页面访问地址自动生成；本机通过 localhost 访问时会显示为 127.0.0.1。使用三渠道混合负载时，请返回「混合自动」配置参与通道与随机调度。</p>
+    </div>
+    <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
         <div class="lbl mb-0">上游调用通道</div>
         <span class="pill pill-accent" id="chan-status" style="text-transform:none">—</span>
@@ -631,6 +640,61 @@
 
 <script>
 const $ = id => document.getElementById(id);
+const CHANNEL_ROUTE_META=[
+  {key:'express',name:'Express API Key'},
+  {key:'cookie',name:'Cookie 直连'},
+  {key:'vertex',name:'服务账号 Vertex SA'}
+];
+function channelRouteOrigin(){
+  const protocol=window.location.protocol==='https:'?'https:':'http:';
+  let host=window.location.hostname||'127.0.0.1';
+  if(host==='localhost') host='127.0.0.1';
+  if(host.includes(':')&&!host.startsWith('[')) host='['+host+']';
+  const port=window.location.port||(protocol==='https:'?'443':'80');
+  return protocol+'//'+host+':'+port;
+}
+function fallbackCopyText(text){
+  const area=document.createElement('textarea');
+  area.value=text; area.setAttribute('readonly','');
+  area.style.position='fixed'; area.style.opacity='0';
+  document.body.appendChild(area); area.select();
+  let copied=false;
+  try{ copied=document.execCommand('copy'); }catch(e){ copied=false; }
+  area.remove();
+  return copied;
+}
+function copyChannelRoute(text,btn){
+  const markCopied=()=>{
+    const old=btn.textContent; btn.textContent='已复制';
+    setTimeout(()=>{if(btn.isConnected) btn.textContent=old;},1200);
+  };
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(markCopied).catch(()=>{
+      if(fallbackCopyText(text)) markCopied(); else toast('复制失败，请手动选中地址复制');
+    });
+  }else if(fallbackCopyText(text)) markCopied();
+  else toast('复制失败，请手动选中地址复制');
+}
+function renderChannelRoutes(){
+  const box=$('channel-route-list'); if(!box) return;
+  const origin=channelRouteOrigin(); box.innerHTML='';
+  CHANNEL_ROUTE_META.forEach(item=>{
+    const url=origin+'/'+item.key+'/v1';
+    const row=document.createElement('div');
+    row.className='flex flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 p-2.5';
+    const info=document.createElement('div');
+    info.className='flex min-w-0 flex-1 items-center gap-2';
+    const name=document.createElement('span');
+    name.className='shrink-0 text-xs font-semibold text-neutral-700'; name.textContent=item.name;
+    const code=document.createElement('code');
+    code.className='log min-w-0 break-all text-xs text-neutral-600'; code.textContent=url;
+    info.append(name,code);
+    const btn=document.createElement('button');
+    btn.className='btn-ghost shrink-0 px-3 py-1.5 text-xs'; btn.type='button'; btn.textContent='复制地址';
+    btn.addEventListener('click',()=>copyChannelRoute(url,btn));
+    row.append(info,btn); box.appendChild(row);
+  });
+}
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
 const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
@@ -1419,7 +1483,8 @@ document.addEventListener('input',e=>{
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams();
+renderChannelRoutes(); fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams();
+
 </script>
 </body>
 </html>
