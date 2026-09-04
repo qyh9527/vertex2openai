@@ -552,8 +552,8 @@
 
       <div class="card p-5">
         <div class="flex items-center justify-between gap-3 mb-3">
-          <div class="text-sm font-semibold">顶部输入注入<span class="text-xs text-neutral-400" style="font-weight:400">（全局）</span><span class="helpq" onclick="hlp(this,'h_top_input')">?</span></div>
-          <select id="top_input_injection_mode" class="inp" style="max-width:160px"><option value="off">不开</option><option value="fake_stream_only">只在假流开</option><option value="always">无论真/假流都开</option></select>
+          <div class="text-sm font-semibold">顶部注入<span class="text-xs text-neutral-400" style="font-weight:400">（全局）</span><span class="helpq" onclick="hlp(this,'h_top_input')">?</span></div>
+          <select id="top_input_injection_mode" class="inp" style="max-width:180px"><option value="off">不开</option><option value="always">全打开</option><option value="non_vertex_only">仅 Express / Cookie 路由</option></select>
         </div>
         <div class="grid grid-cols-1 gap-3">
           <div class="flex flex-wrap items-center justify-between gap-3">
@@ -564,7 +564,7 @@
           <div id="top_input_injection_plan_list" class="space-y-3"></div>
           <button type="button" class="btn-ghost px-3 py-2 text-sm w-full" onclick="addTopInputInjectionPlan()">＋ 新增内容方案</button>
         </div>
-        <div id="h_top_input" class="helpbox"><b>作用</b>：把最新 user 纯文本复制进一套内容方案，作为 <b>system / AI / user</b> 身份的消息插到所有提示词最前面；原始 user 消息不替换。每套方案可通过内部占位符 <code>{{input}}</code> 精确放置输入内容；不写占位符时，网关会把输入自动追加到方案尾部。<br><br><b>三态与输入搬运相同</b>：不开、只在当前通道实际走假流时开启、或无论真/假流都开启；Cookie 文本通道选择“只在假流开”会自动按全请求开启。方案会持久化在控制台状态中，可固定选择或随机抽取。最新输入不是纯文本时会自动跳过，避免丢失多模态内容。</div>
+        <div id="h_top_input" class="helpbox"><b>作用</b>：把最新 user 纯文本复制进一套内容方案，作为 <b>system / AI / user</b> 身份放进请求体 <code>messages</code> 的第 1 条；原始 user 消息不替换。若方案身份与原 messages 第 1 条身份相同（例如都是 system），网关会将方案正文放前、原正文放后，并用一个换行合并成同一条消息。每套方案可通过内部占位符 <code>{{input}}</code> 精确放置输入内容；不写占位符时，网关会把输入自动追加到方案尾部。<br><br><b>三态</b>：不开、全打开、或仅在底层实际路由到 Express / Cookie 时打开。这里判断的是每次请求实际选中的候选通道，不读取「通道与凭证」页面的四选一策略；hybrid 的某次尝试若转到 Vertex SA，本次不会注入。方案会持久化在控制台状态中，可固定选择或随机抽取。最新输入不是纯文本时会自动跳过，避免丢失多模态内容。</div>
       </div>
 
       <!-- 开关 -->
@@ -1249,6 +1249,7 @@ async function loadParams(){
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_random'].forEach(k=>setV(k,s[k]));
+    if(s.top_input_injection_mode==='fake_stream_only') setV('top_input_injection_mode','non_vertex_only');
     TOP_INPUT_INJECTION_PLANS=Array.isArray(s.top_input_injection_plans)?s.top_input_injection_plans.filter(p=>p&&typeof p==='object').map(p=>({...p})):[];
     renderTopInputInjectionPlans();
     if(TOP_INPUT_INJECTION_PLANS.some(p=>p.id===s.top_input_injection_selected_plan_id)) $('top_input_injection_selected_plan_id').value=s.top_input_injection_selected_plan_id;

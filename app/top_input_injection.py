@@ -1,4 +1,4 @@
-"""可配置的顶部输入注入（Top Input Injection）。
+"""可配置的顶部注入（Top Input Injection）。
 
 把最新 user 纯文本复制进控制台维护的模板方案，并作为 system / assistant / user
 消息插在整个 OpenAI 消息序列开头。它不替换原 user 消息，故与普通问答、工具往返
@@ -12,12 +12,10 @@ import secrets
 from typing import Any, Mapping, Optional
 
 from models import OpenAIMessage
-from input_relay import (
-    MODE_ALWAYS,
-    MODE_FAKE_STREAM_ONLY,
-    MODE_OFF,
-    input_relay_active_for_stream,
-)
+from input_relay import MODE_ALWAYS, MODE_OFF
+
+MODE_NON_VERTEX_ONLY = "non_vertex_only"
+_LEGACY_FAKE_STREAM_ONLY = "fake_stream_only"
 
 SETTING_MODE = "top_input_injection_mode"
 SETTING_PLANS = "top_input_injection_plans"
@@ -30,7 +28,7 @@ MAX_PLAN_CONTENT_CHARS = 100_000
 
 @dataclass(frozen=True)
 class TopInputPlan:
-    """一套持久化的顶部输入注入模板。"""
+    """一套持久化的顶部注入模板。"""
 
     plan_id: str
     name: str
@@ -40,7 +38,7 @@ class TopInputPlan:
 
 @dataclass(frozen=True)
 class TopInputInjectionConfig:
-    """已校验的顶部输入注入配置。"""
+    """已校验的顶部注入配置。"""
 
     mode: str
     plans: tuple[TopInputPlan, ...]
@@ -93,16 +91,19 @@ def _read_plans(raw: Any) -> tuple[TopInputPlan, ...]:
 def get_top_input_injection_config(
     settings: Mapping[str, Any],
 ) -> tuple[Optional[TopInputInjectionConfig], Optional[str]]:
-    """读取顶部输入注入设置；模式关闭或无有效方案时返回空配置。"""
+    """读取顶部注入设置；模式关闭或无有效方案时返回空配置。"""
     mode = str(settings.get(SETTING_MODE) or MODE_OFF).strip().lower()
+    # 该功能此前短暂使用 fake_stream_only；语义升级后平滑映射为“仅非 Vertex SA 路由”。
+    if mode == _LEGACY_FAKE_STREAM_ONLY:
+        mode = MODE_NON_VERTEX_ONLY
     if mode == MODE_OFF:
         return None, None
-    if mode not in (MODE_FAKE_STREAM_ONLY, MODE_ALWAYS):
-        return None, "⛔ [顶部输入注入] 模式无效，已保持空操作。"
+    if mode not in (MODE_NON_VERTEX_ONLY, MODE_ALWAYS):
+        return None, "⛔ [顶部注入] 模式无效，已保持空操作。"
 
     plans = _read_plans(settings.get(SETTING_PLANS))
     if not plans:
-        return None, "⛔ [顶部输入注入] 当前模式已启用但没有有效方案，已保持空操作。"
+        return None, "⛔ [顶部注入] 当前模式已启用但没有有效方案，已保持空操作。"
     return TopInputInjectionConfig(
         mode=mode,
         plans=plans,
@@ -111,14 +112,20 @@ def get_top_input_injection_config(
     ), None
 
 
-def top_input_injection_active_for_stream(
+def top_input_injection_active_for_channel(
     config: TopInputInjectionConfig,
-    is_fake_stream: bool,
-    treat_fake_only_as_always: bool = False,
+    channel: str,
 ) -> bool:
-    """复用输入搬运三态语义，并支持 Cookie 的假流模式降级。"""
-    return input_relay_active_for_stream(
-        config, is_fake_stream, treat_fake_only_as_always=treat_fake_only_as_always)
+    """按实际路由到的候选通道判断顶部注入是否生效。
+
+    ``non_vertex_only`` 判断发生在 upstream 内部：hybrid 请求先到 Express/Cookie
+    就启用，真实转到 Vertex SA 时不启用，不依赖控制台的四选一策略字段。
+    """
+    normalized_channel = str(channel or "").strip().lower()
+    return config.mode == MODE_ALWAYS or (
+        config.mode == MODE_NON_VERTEX_ONLY
+        and normalized_channel in ("express", "cookie")
+    )
 
 
 def _choose_plan(config: TopInputInjectionConfig) -> TopInputPlan:
@@ -141,7 +148,7 @@ def apply_top_input_injection(
     messages: list[OpenAIMessage],
     config: TopInputInjectionConfig,
 ) -> tuple[list[OpenAIMessage], list[str]]:
-    """把所选方案渲染为一条消息并插入消息列表首位。
+    """把所选方案渲染为 messages 第 1 条，必要时与原第一条同角色消息融合。
 
     原始 user 消息绝不替换；其余消息对象也不原地修改，便于混合通道故障转移复用。
     """
@@ -150,17 +157,29 @@ def apply_top_input_injection(
         if str(getattr(message, "role", "")).lower() == "user"
     ), None)
     if source is None:
-        return messages, ["ℹ️ [顶部输入注入] 未找到 user 消息，未改写。"]
+        return messages, ["ℹ️ [顶部注入] 未找到 user 消息，未改写。"]
     if not isinstance(source.content, str) or not source.content.strip():
-        return messages, ["ℹ️ [顶部输入注入] 最新 user 消息不是非空纯文本，未改写（避免丢失图片/多段内容）。"]
+        return messages, ["ℹ️ [顶部注入] 最新 user 消息不是非空纯文本，未改写（避免丢失图片/多段内容）。"]
 
     plan = _choose_plan(config)
     injected_content = _render_plan(plan, source.content)
     if not injected_content.strip():
-        return messages, ["ℹ️ [顶部输入注入] 所选方案渲染为空，未改写。"]
+        return messages, ["ℹ️ [顶部注入] 所选方案渲染为空，未改写。"]
 
     injected = OpenAIMessage(role=plan.role, content=injected_content)
+    first = messages[0] if messages else None
+    if (first is not None
+            and _normalize_role(getattr(first, "role", "")) == plan.role
+            and isinstance(first.content, str)):
+        # 同角色第一条按请求顺序融合：顶部方案在前，原始提示在后，且只隔一个换行。
+        merged = first.model_copy(update={"content": f"{injected_content}\n{first.content}"})
+        return [merged, *messages[1:]], [
+            f"✅ [顶部注入] 已以 {plan.role} 身份将方案「{plan.name}」"
+            f"并入 messages 第 1 条（{len(injected_content)} 字，"
+            f"{'随机' if config.random_enabled else '指定'}选择）。"
+        ]
+
     return [injected, *messages], [
-        f"✅ [顶部输入注入] 已以 {plan.role} 身份在提示词首位注入方案「{plan.name}」"
+        f"✅ [顶部注入] 已以 {plan.role} 身份插入 messages 第 1 条方案「{plan.name}」"
         f"（{len(injected_content)} 字，{'随机' if config.random_enabled else '指定'}选择）。"
     ]

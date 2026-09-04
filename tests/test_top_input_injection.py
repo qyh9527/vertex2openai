@@ -1,15 +1,16 @@
-"""顶部输入注入的纯逻辑测试。"""
+"""顶部注入的纯逻辑测试。"""
 
 import top_input_injection as top_input
-from input_relay import MODE_ALWAYS, MODE_FAKE_STREAM_ONLY
+from input_relay import MODE_ALWAYS
 from models import OpenAIMessage
 from top_input_injection import (
     INPUT_PLACEHOLDER,
+    MODE_NON_VERTEX_ONLY,
     TopInputInjectionConfig,
     TopInputPlan,
     apply_top_input_injection,
     get_top_input_injection_config,
-    top_input_injection_active_for_stream,
+    top_input_injection_active_for_channel,
 )
 
 
@@ -49,27 +50,51 @@ class TestTopInputInjectionConfig:
         assert len(config.plans) == 1
         assert config.plans[0].role == "assistant"
 
-    def test_same_three_state_gating(self):
-        fake_only = TopInputInjectionConfig(MODE_FAKE_STREAM_ONLY, PLANS, "p-system", False)
+    def test_legacy_fake_stream_mode_maps_to_non_vertex_route_mode(self):
+        config, note = get_top_input_injection_config({
+            "top_input_injection_mode": "fake_stream_only",
+            "top_input_injection_plans": [
+                {"id": "p", "role": "system", "content": "内容"},
+            ],
+        })
+        assert note is None
+        assert config.mode == MODE_NON_VERTEX_ONLY
+
+    def test_channel_gating_uses_actual_candidate_route(self):
+        non_vertex_only = TopInputInjectionConfig(MODE_NON_VERTEX_ONLY, PLANS, "p-system", False)
         always = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
-        assert not top_input_injection_active_for_stream(fake_only, False)
-        assert top_input_injection_active_for_stream(fake_only, True)
-        assert top_input_injection_active_for_stream(
-            fake_only, False, treat_fake_only_as_always=True)
-        assert top_input_injection_active_for_stream(always, False)
+        assert top_input_injection_active_for_channel(non_vertex_only, "express")
+        assert top_input_injection_active_for_channel(non_vertex_only, "cookie")
+        assert not top_input_injection_active_for_channel(non_vertex_only, "vertex")
+        assert top_input_injection_active_for_channel(always, "vertex")
 
 
 class TestApplyTopInputInjection:
-    def test_inserts_selected_template_at_absolute_front_without_replacing_user(self):
+    def test_merges_with_same_role_first_message_without_replacing_user(self):
         config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
         messages = _messages("真实输入")
 
         updated, notes = apply_top_input_injection(messages, config)
 
+        assert len(updated) == len(messages)
         assert updated[0].role == "system"
-        assert updated[0].content == "顶部规则：真实输入"
-        assert updated[1:] == messages
+        assert updated[0].content == "顶部规则：真实输入\n原始系统提示"
+        assert updated[1:] == messages[1:]
         assert "系统方案" in notes[0]
+        assert "并入" in notes[0]
+
+    def test_merges_model_alias_as_ai_role(self):
+        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-ai", False)
+        messages = [
+            OpenAIMessage(role="model", content="原始 AI 前缀"),
+            OpenAIMessage(role="user", content="真实输入"),
+        ]
+
+        updated, _ = apply_top_input_injection(messages, config)
+
+        assert len(updated) == 2
+        assert updated[0].role == "model"
+        assert updated[0].content == "AI 看到的原始输入\n\n真实输入\n原始 AI 前缀"
 
     def test_appends_input_when_template_has_no_placeholder(self):
         config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-ai", False)

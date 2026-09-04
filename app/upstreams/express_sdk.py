@@ -25,7 +25,7 @@ from input_relay import apply_input_relay, get_input_relay_config, input_relay_a
 from top_input_injection import (
     apply_top_input_injection,
     get_top_input_injection_config,
-    top_input_injection_active_for_stream,
+    top_input_injection_active_for_channel,
 )
 from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
@@ -434,8 +434,8 @@ class ExpressSDKUpstream(BaseUpstream):
         _is_fake_stream = bool(request_obj.stream and (is_fake or is_image_model))
         _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
         _top_input_active = bool(
-            _top_input_config and top_input_injection_active_for_stream(
-                _top_input_config, _is_fake_stream))
+            _top_input_config and top_input_injection_active_for_channel(
+                _top_input_config, self.channel_name))
         if _top_input_config_note:
             print(_top_input_config_note)
         if _top_input_active:

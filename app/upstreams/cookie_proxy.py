@@ -54,7 +54,7 @@ from input_relay import (
 from top_input_injection import (
     apply_top_input_injection,
     get_top_input_injection_config,
-    top_input_injection_active_for_stream,
+    top_input_injection_active_for_channel,
 )
 from failover import UpstreamUnstartedError
 from signature_store import SignatureRecord, SignatureState, signature_store
@@ -1372,13 +1372,13 @@ class CookieProxyUpstream(BaseUpstream):
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        # Cookie 文本通道没有 fake- 假流式；为避免「只在假流开」在此永久失效，
-        # 该模式在 Cookie 直接按全请求开启处理；生图的强制假流仍是同一结果。
+        # `_is_fake_stream` 仅供输入搬运的旧三态使用；顶部注入按实际候选通道判断。
+        # Cookie 文本通道没有 fake- 假流式，输入搬运仍把「只在假流开」按全请求处理。
         _is_fake_stream = bool(request_obj.stream and _profile["is_image"])
         _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
         _top_input_active = bool(
-            _top_input_config and top_input_injection_active_for_stream(
-                _top_input_config, _is_fake_stream, treat_fake_only_as_always=True))
+            _top_input_config and top_input_injection_active_for_channel(
+                _top_input_config, "cookie"))
         if _top_input_config_note:
             print(_top_input_config_note)
         if _top_input_active:
