@@ -59,6 +59,7 @@ class TestInputRelayConfig:
         always = InputRelayConfig("client_input", "下一步", MODE_ALWAYS)
         assert not input_relay_active_for_stream(fake_only, False)
         assert input_relay_active_for_stream(fake_only, True)
+        assert input_relay_active_for_stream(fake_only, False, treat_fake_only_as_always=True)
         assert input_relay_active_for_stream(always, False)
         assert input_relay_active_for_stream(always, True)
 

@@ -114,9 +114,11 @@ def get_top_input_injection_config(
 def top_input_injection_active_for_stream(
     config: TopInputInjectionConfig,
     is_fake_stream: bool,
+    treat_fake_only_as_always: bool = False,
 ) -> bool:
-    """复用输入搬运的三态语义，保证两种输入处理模式口径一致。"""
-    return input_relay_active_for_stream(config, is_fake_stream)
+    """复用输入搬运三态语义，并支持 Cookie 的假流模式降级。"""
+    return input_relay_active_for_stream(
+        config, is_fake_stream, treat_fake_only_as_always=treat_fake_only_as_always)
 
 
 def _choose_plan(config: TopInputInjectionConfig) -> TopInputPlan:

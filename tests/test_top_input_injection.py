@@ -54,6 +54,8 @@ class TestTopInputInjectionConfig:
         always = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
         assert not top_input_injection_active_for_stream(fake_only, False)
         assert top_input_injection_active_for_stream(fake_only, True)
+        assert top_input_injection_active_for_stream(
+            fake_only, False, treat_fake_only_as_always=True)
         assert top_input_injection_active_for_stream(always, False)
 
 

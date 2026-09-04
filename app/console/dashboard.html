@@ -547,7 +547,7 @@
           <div><div class="lbl mb-1">替换占位语</div><textarea id="input_relay_placeholder" rows="2" class="inp log" placeholder="留空 = 不启用"></textarea></div>
           <div class="flex items-center justify-between gap-3"><span class="text-sm">剥离模型生成的同名已闭合块</span><label class="switch"><input type="checkbox" id="input_relay_strip_generated"><span class="slider"></span></label></div>
         </div>
-        <div id="h_relay" class="helpbox"><b>三态开关</b>：「不开」严格不改请求；「只在假流开」仅在该通道实际使用假流式时生效；「无论真/假流都开」则每次请求均生效。Cookie 文本通道本身不支持 <code>fake-</code> 假流式，选“只在假流开”时不会对它的普通文本请求改写。<br><br><b>用途</b>：客户端把最新输入完整包在上面配置的 XML 元素里（宏会先由客户端替换为真实文本），网关便提取元素内载荷，<b>追加到前一条 assistant 消息尾部</b>，再把 user 消息替换为这里的占位语。只做楼尾追加，不支持其它插入位置。<br><br><b>安全护栏</b>：标签与占位语没有任何默认值；模式不是“不开”但任一留空，网关严格不改请求。标签必须独占整条最新 user 纯文本，且前面必须存在一条普通 assistant 消息；图片、多段内容、工具调用历史或夹带标签外文字都会跳过，避免静默丢上下文。标签名仅允许字母/下划线开头及字母数字、<code>_ . : -</code>，最长 64 字。<br><br><b>剥离输出</b>：打开后，模型自己生成的同名、已闭合块不会回传给客户端；流式标签跨分块也能识别。模型若输出半截未闭合块，流结束时会原样放行，不会吞字。</div>
+        <div id="h_relay" class="helpbox"><b>三态开关</b>：「不开」严格不改请求；「只在假流开」仅在该通道实际使用假流式时生效；「无论真/假流都开」则每次请求均生效。Cookie 文本通道本身不支持 <code>fake-</code> 假流式，因此选“只在假流开”时会自动按“无论真/假流都开”处理，避免该通道静默失效。<br><br><b>用途</b>：客户端把最新输入完整包在上面配置的 XML 元素里（宏会先由客户端替换为真实文本），网关便提取元素内载荷，<b>追加到前一条 assistant 消息尾部</b>，再把 user 消息替换为这里的占位语。只做楼尾追加，不支持其它插入位置。<br><br><b>安全护栏</b>：标签与占位语没有任何默认值；模式不是“不开”但任一留空，网关严格不改请求。标签必须独占整条最新 user 纯文本，且前面必须存在一条普通 assistant 消息；图片、多段内容、工具调用历史或夹带标签外文字都会跳过，避免静默丢上下文。标签名仅允许字母/下划线开头及字母数字、<code>_ . : -</code>，最长 64 字。<br><br><b>剥离输出</b>：打开后，模型自己生成的同名、已闭合块不会回传给客户端；流式标签跨分块也能识别。模型若输出半截未闭合块，流结束时会原样放行，不会吞字。</div>
       </div>
 
       <div class="card p-5">
@@ -564,7 +564,7 @@
           <div id="top_input_injection_plan_list" class="space-y-3"></div>
           <button type="button" class="btn-ghost px-3 py-2 text-sm w-full" onclick="addTopInputInjectionPlan()">＋ 新增内容方案</button>
         </div>
-        <div id="h_top_input" class="helpbox"><b>作用</b>：把最新 user 纯文本复制进一套内容方案，作为 <b>system / AI / user</b> 身份的消息插到所有提示词最前面；原始 user 消息不替换。每套方案可通过内部占位符 <code>{{input}}</code> 精确放置输入内容；不写占位符时，网关会把输入自动追加到方案尾部。<br><br><b>三态与输入搬运相同</b>：不开、只在当前通道实际走假流时开启、或无论真/假流都开启。方案会持久化在控制台状态中，可固定选择或随机抽取。最新输入不是纯文本时会自动跳过，避免丢失多模态内容。</div>
+        <div id="h_top_input" class="helpbox"><b>作用</b>：把最新 user 纯文本复制进一套内容方案，作为 <b>system / AI / user</b> 身份的消息插到所有提示词最前面；原始 user 消息不替换。每套方案可通过内部占位符 <code>{{input}}</code> 精确放置输入内容；不写占位符时，网关会把输入自动追加到方案尾部。<br><br><b>三态与输入搬运相同</b>：不开、只在当前通道实际走假流时开启、或无论真/假流都开启；Cookie 文本通道选择“只在假流开”会自动按全请求开启。方案会持久化在控制台状态中，可固定选择或随机抽取。最新输入不是纯文本时会自动跳过，避免丢失多模态内容。</div>
       </div>
 
       <!-- 开关 -->

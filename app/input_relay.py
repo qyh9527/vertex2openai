@@ -64,10 +64,20 @@ def get_input_relay_config(settings: Mapping[str, Any]) -> tuple[Optional[InputR
     ), None
 
 
-def input_relay_active_for_stream(config: InputRelayConfig, is_fake_stream: bool) -> bool:
-    """按控制台三态模式判断当前请求是否应用搬运。"""
+def input_relay_active_for_stream(
+    config: InputRelayConfig,
+    is_fake_stream: bool,
+    treat_fake_only_as_always: bool = False,
+) -> bool:
+    """按控制台三态模式判断当前请求是否应用搬运。
+
+    Cookie 文本通道没有 `fake-` 假流实现。调用方可设
+    ``treat_fake_only_as_always=True``，把用户选择的「只在假流开」在该通道
+    降级为全请求开启，而不是静默变成永远不开。
+    """
     return config.mode == MODE_ALWAYS or (
-        config.mode == MODE_FAKE_STREAM_ONLY and is_fake_stream
+        config.mode == MODE_FAKE_STREAM_ONLY
+        and (is_fake_stream or treat_fake_only_as_always)
     )
 
 

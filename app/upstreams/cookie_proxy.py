@@ -1372,12 +1372,13 @@ class CookieProxyUpstream(BaseUpstream):
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        # Cookie 文本通道没有 fake- 假流式；仅生图流会在本通道强制走“收全再分块”的假流式。
+        # Cookie 文本通道没有 fake- 假流式；为避免「只在假流开」在此永久失效，
+        # 该模式在 Cookie 直接按全请求开启处理；生图的强制假流仍是同一结果。
         _is_fake_stream = bool(request_obj.stream and _profile["is_image"])
         _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
         _top_input_active = bool(
             _top_input_config and top_input_injection_active_for_stream(
-                _top_input_config, _is_fake_stream))
+                _top_input_config, _is_fake_stream, treat_fake_only_as_always=True))
         if _top_input_config_note:
             print(_top_input_config_note)
         if _top_input_active:
@@ -1391,7 +1392,7 @@ class CookieProxyUpstream(BaseUpstream):
         _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
         _relay_is_active = bool(
             _relay_config and input_relay_active_for_stream(
-                _relay_config, _is_fake_stream))
+                _relay_config, _is_fake_stream, treat_fake_only_as_always=True))
         if _relay_config_note:
             print(_relay_config_note)
         if _relay_is_active:
