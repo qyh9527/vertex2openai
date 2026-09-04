@@ -44,6 +44,18 @@ from message_processing import (
 from logger import stats
 from api_helpers import get_retry_settings, FAKE_PREFIX
 from anti_truncation import is_enabled_for_request, get_enabled_field
+from input_relay import (
+    RelayBlockStreamStripper,
+    apply_input_relay,
+    get_input_relay_config,
+    input_relay_active_for_stream,
+    strip_generated_relay_blocks,
+)
+from top_input_injection import (
+    apply_top_input_injection,
+    get_top_input_injection_config,
+    top_input_injection_active_for_stream,
+)
 from failover import UpstreamUnstartedError
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -1360,6 +1372,35 @@ class CookieProxyUpstream(BaseUpstream):
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
         _inj_settings = app_state.get_effective_settings(base_model_name)
+        # Cookie 文本通道没有 fake- 假流式；仅生图流会在本通道强制走“收全再分块”的假流式。
+        _is_fake_stream = bool(request_obj.stream and _profile["is_image"])
+        _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
+        _top_input_active = bool(
+            _top_input_config and top_input_injection_active_for_stream(
+                _top_input_config, _is_fake_stream))
+        if _top_input_config_note:
+            print(_top_input_config_note)
+        if _top_input_active:
+            _top_messages, _top_notes = apply_top_input_injection(
+                request_obj.messages, _top_input_config)
+            for _top_note in _top_notes:
+                print(_top_note)
+            if _top_messages is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _top_messages})
+
+        _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
+        _relay_is_active = bool(
+            _relay_config and input_relay_active_for_stream(
+                _relay_config, _is_fake_stream))
+        if _relay_config_note:
+            print(_relay_config_note)
+        if _relay_is_active:
+            _relayed_messages, _relay_notes = apply_input_relay(request_obj.messages, _relay_config)
+            for _relay_note in _relay_notes:
+                print(_relay_note)
+            if _relayed_messages is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
+        _relay_strip_tag = (_relay_config.tag if _relay_is_active and _relay_config.strip_generated else None)
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
             system_text=_inj_settings.get("inject_system_instruction", ""),
@@ -1453,6 +1494,8 @@ class CookieProxyUpstream(BaseUpstream):
                     return
                 yield _make_openai_chunk(response_id, model_display, role="assistant")
                 full_text = res.get("full_text") or ""
+                if _relay_strip_tag:
+                    full_text = strip_generated_relay_blocks(full_text, _relay_strip_tag)
                 if prefill_text:
                     full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                 if res.get("reasoning_text"):
@@ -1523,6 +1566,8 @@ class CookieProxyUpstream(BaseUpstream):
                         blocked_msg = None
                         sampler = _RawSampler()
                         deduper = PrefillDeduper(prefill_text)
+                        relay_stripper = (RelayBlockStreamStripper(_relay_strip_tag)
+                                          if _relay_strip_tag else None)
 
                         # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                         async for status, data in _execute_stream_request_generator(
@@ -1568,6 +1613,12 @@ class CookieProxyUpstream(BaseUpstream):
                                     yield _make_openai_chunk(response_id, model_display, extra_content=extra)
 
                             elif status in ("text", "thought", "image", "api_error_text"):
+                                if status == "text" and relay_stripper is not None:
+                                    # 标记为收到过模型正文，即使配置要求把整段标签块都剥掉，也不误报“无正文”。
+                                    got_text = True
+                                    data = relay_stripper.feed(data)
+                                    if not data:
+                                        continue
                                 if not has_yielded_to_client:
                                     print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
@@ -1673,10 +1724,20 @@ class CookieProxyUpstream(BaseUpstream):
 
                         # 预填充去重器里可能还攒着开头的一小段（短回复场景）
                         tail = deduper.flush()
+                        if tail and relay_stripper is not None:
+                            tail = relay_stripper.feed(tail)
                         if tail:
                             stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
                             stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
                             yield _make_openai_chunk(response_id, model_display, content=tail)
+
+                        # 若模型只输出了半截配置标签，流式剥离器要 fail-open 原样放行，不能吞字。
+                        if relay_stripper is not None:
+                            relay_tail = relay_stripper.flush()
+                            if relay_tail:
+                                stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                stream_ordinary_metadata.append(ordinary_part_metadata("text", relay_tail, None))
+                                yield _make_openai_chunk(response_id, model_display, content=relay_tail)
 
                         if got_text or got_tool_call:
                             stats.add_success()
@@ -1804,6 +1865,9 @@ class CookieProxyUpstream(BaseUpstream):
                     finish_raw = None
                     blocked_msg = None
                     sampler = _RawSampler()
+                    relay_stripper = (RelayBlockStreamStripper(_relay_strip_tag)
+                                      if _relay_strip_tag else None)
+                    relay_had_text = False
 
                     class _FakeResponse:
                         def __init__(self, text):
@@ -1816,6 +1880,11 @@ class CookieProxyUpstream(BaseUpstream):
                         sampler.add(obj)
                         for event_type, data in _extract_from_results(obj):
                             if event_type == "text":
+                                if relay_stripper is not None:
+                                    relay_had_text = True
+                                    data = relay_stripper.feed(data)
+                                    if not data:
+                                        continue
                                 full_text += data
                                 part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
                                 ordinary_metadata.append(ordinary_part_metadata("text", data, None))
@@ -1861,8 +1930,15 @@ class CookieProxyUpstream(BaseUpstream):
                         await asyncio.sleep(wait_sec)
                         continue
 
+                    if relay_stripper is not None:
+                        relay_tail = relay_stripper.flush()
+                        if relay_tail:
+                            full_text += relay_tail
+                            part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                            ordinary_metadata.append(ordinary_part_metadata("text", relay_tail, None))
+
                     got_text = bool(full_text.strip())
-                    got_output = got_text or bool(tool_calls)
+                    got_output = got_text or bool(tool_calls) or relay_had_text
                     elapsed = time.time() - start_time
 
                     if got_output:

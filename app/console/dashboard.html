@@ -537,6 +537,36 @@
         </div>
       </div>
 
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3 mb-3">
+          <div class="text-sm font-semibold">输入搬运<span class="text-xs text-neutral-400" style="font-weight:400">（全局）</span><span class="helpq" onclick="hlp(this,'h_relay')">?</span></div>
+          <select id="input_relay_mode" class="inp" style="max-width:160px"><option value="off">不开</option><option value="fake_stream_only">只在假流开</option><option value="always">无论真/假流都开</option></select>
+        </div>
+        <div class="grid grid-cols-1 gap-3">
+          <div><div class="lbl mb-1">匹配标签名</div><input id="input_relay_tag" type="text" class="inp" placeholder="留空 = 不启用；只填元素名，不含尖括号"></div>
+          <div><div class="lbl mb-1">替换占位语</div><textarea id="input_relay_placeholder" rows="2" class="inp log" placeholder="留空 = 不启用"></textarea></div>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">剥离模型生成的同名已闭合块</span><label class="switch"><input type="checkbox" id="input_relay_strip_generated"><span class="slider"></span></label></div>
+        </div>
+        <div id="h_relay" class="helpbox"><b>三态开关</b>：「不开」严格不改请求；「只在假流开」仅在该通道实际使用假流式时生效；「无论真/假流都开」则每次请求均生效。Cookie 文本通道本身不支持 <code>fake-</code> 假流式，选“只在假流开”时不会对它的普通文本请求改写。<br><br><b>用途</b>：客户端把最新输入完整包在上面配置的 XML 元素里（宏会先由客户端替换为真实文本），网关便提取元素内载荷，<b>追加到前一条 assistant 消息尾部</b>，再把 user 消息替换为这里的占位语。只做楼尾追加，不支持其它插入位置。<br><br><b>安全护栏</b>：标签与占位语没有任何默认值；模式不是“不开”但任一留空，网关严格不改请求。标签必须独占整条最新 user 纯文本，且前面必须存在一条普通 assistant 消息；图片、多段内容、工具调用历史或夹带标签外文字都会跳过，避免静默丢上下文。标签名仅允许字母/下划线开头及字母数字、<code>_ . : -</code>，最长 64 字。<br><br><b>剥离输出</b>：打开后，模型自己生成的同名、已闭合块不会回传给客户端；流式标签跨分块也能识别。模型若输出半截未闭合块，流结束时会原样放行，不会吞字。</div>
+      </div>
+
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3 mb-3">
+          <div class="text-sm font-semibold">顶部输入注入<span class="text-xs text-neutral-400" style="font-weight:400">（全局）</span><span class="helpq" onclick="hlp(this,'h_top_input')">?</span></div>
+          <select id="top_input_injection_mode" class="inp" style="max-width:160px"><option value="off">不开</option><option value="fake_stream_only">只在假流开</option><option value="always">无论真/假流都开</option></select>
+        </div>
+        <div class="grid grid-cols-1 gap-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex min-w-0 flex-1 items-center gap-2"><span class="lbl shrink-0">固定方案</span><select id="top_input_injection_selected_plan_id" class="inp min-w-0"></select></div>
+            <div class="flex items-center gap-2"><span class="text-sm whitespace-nowrap">随机抽取<span class="helpq" onclick="hlp(this,'h_top_random')">?</span></span><label class="switch"><input type="checkbox" id="top_input_injection_random"><span class="slider"></span></label></div>
+          </div>
+          <div id="h_top_random" class="helpbox">随机模式会从所有有效方案中抽取一套。它让每轮请求前缀发生变化，通常会降低上游隐式上下文缓存命中率；仅在确实需要变体时打开。</div>
+          <div id="top_input_injection_plan_list" class="space-y-3"></div>
+          <button type="button" class="btn-ghost px-3 py-2 text-sm w-full" onclick="addTopInputInjectionPlan()">＋ 新增内容方案</button>
+        </div>
+        <div id="h_top_input" class="helpbox"><b>作用</b>：把最新 user 纯文本复制进一套内容方案，作为 <b>system / AI / user</b> 身份的消息插到所有提示词最前面；原始 user 消息不替换。每套方案可通过内部占位符 <code>{{input}}</code> 精确放置输入内容；不写占位符时，网关会把输入自动追加到方案尾部。<br><br><b>三态与输入搬运相同</b>：不开、只在当前通道实际走假流时开启、或无论真/假流都开启。方案会持久化在控制台状态中，可固定选择或随机抽取。最新输入不是纯文本时会自动跳过，避免丢失多模态内容。</div>
+      </div>
+
       <!-- 开关 -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
@@ -697,6 +727,7 @@ function renderChannelRoutes(){
 }
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
+let TOP_INPUT_INJECTION_PLANS = [];
 const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
@@ -1157,6 +1188,58 @@ async function saveHybridConfig(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
+function topInputPlanId(){
+  if(window.crypto&&crypto.randomUUID) return crypto.randomUUID();
+  return 'top-input-'+Date.now()+'-'+Math.random().toString(36).slice(2,10);
+}
+function topInputPlanLabel(plan,index){ return (plan.name||'').trim() || ('方案 '+(index+1)); }
+function renderTopInputInjectionPlans(){
+  const list=$('top_input_injection_plan_list');
+  const picker=$('top_input_injection_selected_plan_id');
+  if(!list||!picker) return;
+  const previous=picker.value;
+  list.replaceChildren(); picker.replaceChildren();
+  if(!TOP_INPUT_INJECTION_PLANS.length){
+    const empty=document.createElement('div');
+    empty.className='rounded-lg border border-dashed border-neutral-200 px-3 py-3 text-xs text-neutral-400';
+    empty.textContent='暂无方案；新增后填写内容并保存全局设置。';
+    list.appendChild(empty);
+    picker.appendChild(new Option('暂无有效方案',''));
+    return;
+  }
+  TOP_INPUT_INJECTION_PLANS.forEach((plan,index)=>{
+    picker.appendChild(new Option(topInputPlanLabel(plan,index),plan.id));
+    const card=document.createElement('div');
+    card.className='rounded-xl border border-neutral-200 bg-neutral-50/60 p-3 space-y-2';
+    const head=document.createElement('div'); head.className='flex items-center gap-2';
+    const name=document.createElement('input'); name.className='inp min-w-0 flex-1';
+    name.value=plan.name||''; name.placeholder='方案名称（仅控制台显示）';
+    name.addEventListener('change',()=>{ plan.name=name.value; renderTopInputInjectionPlans(); });
+    const remove=document.createElement('button'); remove.type='button'; remove.className='btn-ghost shrink-0 px-2.5 py-2 text-xs text-rose-600'; remove.textContent='删除';
+    remove.addEventListener('click',()=>{ TOP_INPUT_INJECTION_PLANS=TOP_INPUT_INJECTION_PLANS.filter(p=>p.id!==plan.id); renderTopInputInjectionPlans(); });
+    head.append(name,remove);
+    const meta=document.createElement('div'); meta.className='flex items-center gap-2';
+    const roleLabel=document.createElement('span'); roleLabel.className='lbl shrink-0'; roleLabel.textContent='注入身份';
+    const role=document.createElement('select'); role.className='inp'; role.style.maxWidth='180px';
+    [['system','系统 system'],['assistant','AI assistant'],['user','用户 user']].forEach(([value,text])=>role.appendChild(new Option(text,value)));
+    role.value=['system','assistant','user'].includes(plan.role)?plan.role:'system';
+    role.addEventListener('change',()=>{ plan.role=role.value; });
+    meta.append(roleLabel,role);
+    const content=document.createElement('textarea'); content.rows=4; content.className='inp log';
+    content.value=plan.content||''; content.placeholder='提示词内容；可用 {{input}} 放置最新输入';
+    content.addEventListener('input',()=>{ plan.content=content.value; });
+    const hint=document.createElement('div'); hint.className='text-xs text-neutral-400';
+    hint.textContent='未使用 {{input}} 时，网关会在内容末尾追加最新输入。';
+    card.append(head,meta,content,hint); list.appendChild(card);
+  });
+  const selected=TOP_INPUT_INJECTION_PLANS.some(p=>p.id===previous)?previous:TOP_INPUT_INJECTION_PLANS[0].id;
+  picker.value=selected;
+}
+function addTopInputInjectionPlan(){
+  TOP_INPUT_INJECTION_PLANS.push({id:topInputPlanId(),name:'方案 '+(TOP_INPUT_INJECTION_PLANS.length+1),role:'system',content:''});
+  renderTopInputInjectionPlans();
+}
+
 /* ---------- Params ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
@@ -1164,8 +1247,11 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_random'].forEach(k=>setV(k,s[k]));
+    TOP_INPUT_INJECTION_PLANS=Array.isArray(s.top_input_injection_plans)?s.top_input_injection_plans.filter(p=>p&&typeof p==='object').map(p=>({...p})):[];
+    renderTopInputInjectionPlans();
+    if(TOP_INPUT_INJECTION_PLANS.some(p=>p.id===s.top_input_injection_selected_plan_id)) $('top_input_injection_selected_plan_id').value=s.top_input_injection_selected_plan_id;
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1380,6 +1466,14 @@ async function saveSettings(){
     client_reuse:$('client_reuse').checked,
     client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
     anti_truncation_field:($('anti_truncation_field').value||'').trim() || 'anti_truncation',
+    input_relay_mode:$('input_relay_mode').value,
+    input_relay_tag:($('input_relay_tag').value||'').trim(),
+    input_relay_placeholder:$('input_relay_placeholder').value||'',
+    input_relay_strip_generated:$('input_relay_strip_generated').checked,
+    top_input_injection_mode:$('top_input_injection_mode').value,
+    top_input_injection_plans:TOP_INPUT_INJECTION_PLANS.map(p=>({id:p.id,name:p.name||'',role:p.role||'system',content:p.content||''})),
+    top_input_injection_selected_plan_id:$('top_input_injection_selected_plan_id').value||'',
+    top_input_injection_random:$('top_input_injection_random').checked,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,

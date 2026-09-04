@@ -41,6 +41,7 @@ from anti_truncation import (
     strip_synthetic_from_openai_dict,
     strip_synthetic_from_stream_chunk,
 )
+from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 
 # 引入报错重试统计器
 from logger import stats
@@ -316,6 +317,60 @@ async def _chunk_openai_response_dict_for_sse(
 
     yield "data: [DONE]\n\n"
 
+def _strip_input_relay_from_openai_dict(openai_dict: Dict[str, Any], tag: str) -> Dict[str, Any]:
+    """从非流式/假流式响应正文剥离配置的输入搬运标签块。"""
+    if not tag:
+        return openai_dict
+    try:
+        for choice in (openai_dict.get("choices") or []):
+            msg = choice.get("message") or {}
+            if isinstance(msg.get("content"), str):
+                msg["content"] = strip_generated_relay_blocks(msg["content"], tag)
+    except Exception:
+        pass
+    return openai_dict
+
+
+def _strip_input_relay_from_sse_chunk(sse_line: str, stripper: RelayBlockStreamStripper) -> Optional[str]:
+    """从单个 SSE delta 的正文剥离搬运块，支持标签跨 chunk 切分。"""
+    try:
+        if not sse_line.startswith("data: "):
+            return sse_line
+        payload = json.loads(sse_line[len("data: "):].strip())
+        choices = payload.get("choices") or []
+        if not choices:
+            return sse_line
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if not isinstance(content, str) or not content:
+            return sse_line
+        out = stripper.feed(content)
+        if out:
+            delta["content"] = out
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        delta.pop("content", None)
+        if delta or choice.get("finish_reason"):
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return None
+    except Exception:
+        return sse_line
+
+
+def _input_relay_sse_text(response_id: str, request_obj: OpenAIRequest, content: str) -> str:
+    """为流式剥离器在流末放行的尾部文本构造标准 OpenAI SSE delta。"""
+    payload = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": request_obj.model,
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str, Any]:
     """把预填充文本拼回到最终输出开头（预填充智能兼容用，带重叠去重）。"""
     if not prefill_text:
@@ -420,6 +475,7 @@ async def gemini_fake_stream_generator(
     failover_mode: bool = False,
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
+    input_relay_strip_tag: Optional[str] = None,
 ):
     print(f"🌊 [假流式] 已开始通过 {channel_call_text(channel_name)} 调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -512,6 +568,9 @@ async def gemini_fake_stream_generator(
                       "本次未生效（如实透传普通输出）。")
             openai_response_dict = strip_synthetic_from_openai_dict(
                 openai_response_dict, synthetic_tool_name)
+        if input_relay_strip_tag:
+            openai_response_dict = _strip_input_relay_from_openai_dict(
+                openai_response_dict, input_relay_strip_tag)
         _prepend_prefill(openai_response_dict, prefill_text)
 
         if hasattr(raw_gemini_response, "prompt_feedback") and \
@@ -589,6 +648,7 @@ async def execute_gemini_call(
     force_fake_streaming: bool = False,
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
+    input_relay_strip_tag: Optional[str] = None,
 ):
     fallback_client = None
 
@@ -629,6 +689,7 @@ async def execute_gemini_call(
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
                     channel_name=channel_name, synthetic_tool_name=synthetic_tool_name,
+                    input_relay_strip_tag=input_relay_strip_tag,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -647,6 +708,10 @@ async def execute_gemini_call(
                 # 全程未命中合成调用则流末把缓冲 flush 出去当兜底（防截断未生效时正文不丢）。
                 side_buffer: list = []
                 side_emitted = False               # 缓冲已 flush（防重复输出）
+                input_relay_stripper = (
+                    RelayBlockStreamStripper(input_relay_strip_tag)
+                    if input_relay_strip_tag else None
+                )
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -721,6 +786,11 @@ async def execute_gemini_call(
                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                     if sse_chunk is None:
                                         continue  # 正文暂存于去重器，跳过空 chunk
+                                if input_relay_stripper is not None:
+                                    sse_chunk = _strip_input_relay_from_sse_chunk(
+                                        sse_chunk, input_relay_stripper)
+                                    if sse_chunk is None:
+                                        continue  # 正文属于待判定/待剥离的标签块
                                 if synthetic_tool_name and not synthetic_seen and not side_emitted:
                                     # 合成调用尚未出现：普通文本先入 side-buffer 不透传
                                     #（命中合成即丢弃、流末未命中则 flush 兜底）
@@ -747,9 +817,17 @@ async def execute_gemini_call(
                         # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
                         if deduper is not None and not deduper.done:
                             tail = deduper.flush()
+                            if tail and input_relay_stripper is not None:
+                                tail = input_relay_stripper.feed(tail)
                             if tail:
-                                _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
-                                yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+                                yield _input_relay_sse_text(response_id_for_stream, request_obj, tail)
+
+                        # 流式标签剥离器会保留“可能跨 chunk 的开标签”尾巴；流结束时原样放行
+                        # 未闭合内容（fail-open），避免把网络中断/模型半截输出静默吃掉。
+                        if input_relay_stripper is not None:
+                            relay_tail = input_relay_stripper.flush()
+                            if relay_tail:
+                                yield _input_relay_sse_text(response_id_for_stream, request_obj, relay_tail)
 
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk,
@@ -944,5 +1022,8 @@ async def execute_gemini_call(
                       "本次未生效（如实透传普通输出）。")
             openai_response_content = strip_synthetic_from_openai_dict(
                 openai_response_content, synthetic_tool_name)
+        if input_relay_strip_tag:
+            openai_response_content = _strip_input_relay_from_openai_dict(
+                openai_response_content, input_relay_strip_tag)
         _prepend_prefill(openai_response_content, prefill_text)
         return JSONResponse(content=openai_response_content)

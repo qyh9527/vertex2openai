@@ -21,6 +21,12 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
+from input_relay import apply_input_relay, get_input_relay_config, input_relay_active_for_stream
+from top_input_injection import (
+    apply_top_input_injection,
+    get_top_input_injection_config,
+    top_input_injection_active_for_stream,
+)
 from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 from runtime_state import app_state
@@ -425,6 +431,35 @@ class ExpressSDKUpstream(BaseUpstream):
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
 
+        _is_fake_stream = bool(request_obj.stream and (is_fake or is_image_model))
+        _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
+        _top_input_active = bool(
+            _top_input_config and top_input_injection_active_for_stream(
+                _top_input_config, _is_fake_stream))
+        if _top_input_config_note:
+            print(_top_input_config_note)
+        if _top_input_active:
+            _top_messages, _top_notes = apply_top_input_injection(
+                request_obj.messages, _top_input_config)
+            for _top_note in _top_notes:
+                print(_top_note)
+            if _top_messages is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _top_messages})
+
+        _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
+        _relay_is_active = bool(
+            _relay_config and input_relay_active_for_stream(
+                _relay_config, _is_fake_stream))
+        if _relay_config_note:
+            print(_relay_config_note)
+        if _relay_is_active:
+            _relayed_messages, _relay_notes = apply_input_relay(request_obj.messages, _relay_config)
+            for _relay_note in _relay_notes:
+                print(_relay_note)
+            if _relayed_messages is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
+        _relay_strip_tag = (_relay_config.tag if _relay_is_active and _relay_config.strip_generated else None)
+
         # 预填充智能兼容：按控制台模式 + 模型能力处理末尾 assistant 预填充（新模型自动生效）
         # - 2.5 及更早（允许 model 结尾）：原生透传，模型直接续写；
         # - 3.x（拒绝 model 结尾）：转成续写指令；
@@ -549,4 +584,5 @@ class ExpressSDKUpstream(BaseUpstream):
             fallback_client_factory=fallback_client_factory,
             channel_name=self.channel_name,
             synthetic_tool_name=synthetic_tool_name,
+            input_relay_strip_tag=_relay_strip_tag,
         )

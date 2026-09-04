@@ -176,6 +176,24 @@ DEFAULT_SETTINGS = {
     # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
     "inject_system_instruction": "",
     "inject_prefill": "",
+    # ===== 可配置输入搬运（默认关闭；标签与占位语绝无内置默认）=====
+    # input_relay_mode：off=关闭；fake_stream_only=仅假流式；always=无论真/假流式都启用。
+    # 仅当最新 user 文本完整包在 input_relay_tag 标签中时，才把其载荷追加到前一条
+    # assistant 消息尾部，并把该 user 文本换成 input_relay_placeholder。
+    # 标签名与占位语任一留空时严格空操作；二者均由控制台配置，避免预设任何 XML 约定。
+    "input_relay_mode": "off",
+    "input_relay_tag": "",
+    "input_relay_placeholder": "",
+    # 是否从模型输出中剥离同名、已闭合的块；流式采用有界 fail-open 缓冲，避免吞半截文本。
+    "input_relay_strip_generated": False,
+    # ===== 顶部输入注入（默认关闭；方案列表由控制台持久化）=====
+    # 将最新 user 纯文本复制进所选方案，并按方案 role 插入整个消息列表最前面；不替换原 user。
+    # mode 同输入搬运：off | fake_stream_only | always。方案模板可用 {{input}} 放置原文；
+    # 若省略该占位符，原文自动追加到模板结尾。random=true 会随机选方案，可能降低缓存命中。
+    "top_input_injection_mode": "off",
+    "top_input_injection_plans": [],
+    "top_input_injection_selected_plan_id": "",
+    "top_input_injection_random": False,
     # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
     # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
     # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。
