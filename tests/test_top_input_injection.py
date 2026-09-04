@@ -1,10 +1,9 @@
 """顶部注入的纯逻辑测试。"""
 
 import top_input_injection as top_input
-from input_relay import MODE_ALWAYS
 from models import OpenAIMessage
 from top_input_injection import (
-    INPUT_PLACEHOLDER,
+    MODE_ALWAYS,
     MODE_NON_VERTEX_ONLY,
     TopInputInjectionConfig,
     TopInputPlan,
@@ -15,8 +14,8 @@ from top_input_injection import (
 
 
 PLANS = (
-    TopInputPlan("p-system", "系统方案", "system", "顶部规则：" + INPUT_PLACEHOLDER),
-    TopInputPlan("p-ai", "AI 方案", "assistant", "AI 看到的原始输入"),
+    TopInputPlan("p-system", "系统方案", "system", "顶部规则：固定方案"),
+    TopInputPlan("p-ai", "AI 方案", "assistant", "AI 固定前缀"),
 )
 
 
@@ -78,7 +77,7 @@ class TestApplyTopInputInjection:
 
         assert len(updated) == len(messages)
         assert updated[0].role == "system"
-        assert updated[0].content == "顶部规则：真实输入\n原始系统提示"
+        assert updated[0].content == "顶部规则：固定方案\n原始系统提示"
         assert updated[1:] == messages[1:]
         assert "系统方案" in notes[0]
         assert "并入" in notes[0]
@@ -94,15 +93,41 @@ class TestApplyTopInputInjection:
 
         assert len(updated) == 2
         assert updated[0].role == "model"
-        assert updated[0].content == "AI 看到的原始输入\n\n真实输入\n原始 AI 前缀"
+        assert updated[0].content == "AI 固定前缀\n原始 AI 前缀"
 
-    def test_appends_input_when_template_has_no_placeholder(self):
-        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-ai", False)
+    def test_injects_exact_plan_content_without_reading_user_input(self):
+        config = TopInputInjectionConfig(
+            MODE_ALWAYS,
+            (TopInputPlan("literal", "原样方案", "assistant", "方案 {{input}} 原样保留"),),
+            "literal",
+            False,
+        )
 
         updated, _ = apply_top_input_injection(_messages("真实输入"), config)
 
         assert updated[0].role == "assistant"
-        assert updated[0].content == "AI 看到的原始输入\n\n真实输入"
+        assert updated[0].content == "方案 {{input}} 原样保留"
+
+    def test_injects_even_when_user_message_is_multimodal(self):
+        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
+        messages = _messages()
+        messages[-1] = OpenAIMessage(role="user", content=[{"type": "text", "text": "多段"}])
+
+        updated, _ = apply_top_input_injection(messages, config)
+
+        assert updated[0].content == "顶部规则：固定方案\n原始系统提示"
+        assert updated[1:] == messages[1:]
+
+    def test_injects_when_request_has_no_user_message(self):
+        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-ai", False)
+        messages = [OpenAIMessage(role="system", content="原始系统提示")]
+
+        updated, _ = apply_top_input_injection(messages, config)
+
+        assert [(message.role, message.content) for message in updated] == [
+            ("assistant", "AI 固定前缀"),
+            ("system", "原始系统提示"),
+        ]
 
     def test_random_mode_selects_a_persisted_plan(self, monkeypatch):
         config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", True)
@@ -113,13 +138,3 @@ class TestApplyTopInputInjection:
         assert updated[0].role == "assistant"
         assert "AI 方案" in notes[0]
         assert "随机" in notes[0]
-
-    def test_multimodal_latest_user_is_not_rewritten(self):
-        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
-        messages = _messages()
-        messages[-1] = OpenAIMessage(role="user", content=[{"type": "text", "text": "多段"}])
-
-        updated, notes = apply_top_input_injection(messages, config)
-
-        assert updated is messages
-        assert "不是非空纯文本" in notes[0]

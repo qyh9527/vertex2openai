@@ -47,3 +47,10 @@ def test_dashboard_error_categories_panel():
     assert "ERROR_CATS=d.error_categories||{}" in DASHBOARD_HTML
     assert "function renderErrorCats()" in DASHBOARD_HTML
     assert "error-cat-list" in DASHBOARD_HTML
+
+
+def test_dashboard_top_injection_is_independent_from_input_relay():
+    """顶部注入应只原样置顶方案，不能暗含输入模板或自动追加语义。"""
+    assert "顶部方案正文（按原文注入，不解析宏）" in DASHBOARD_HTML
+    assert "方案正文会原样注入到 messages 第 1 条。" in DASHBOARD_HTML
+    assert "未使用 {{input}} 时" not in DASHBOARD_HTML

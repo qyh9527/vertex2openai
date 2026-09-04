@@ -1,8 +1,7 @@
-"""可配置的顶部注入（Top Input Injection）。
+"""可配置的顶部注入（Top Injection）。
 
-把最新 user 纯文本复制进控制台维护的模板方案，并作为 system / assistant / user
-消息插在整个 OpenAI 消息序列开头。它不替换原 user 消息，故与普通问答、工具往返
-和输入搬运可以独立组合；未完整配置时严格空操作。
+把控制台维护的内容方案作为 system / assistant / user 消息插在整个 OpenAI
+消息序列开头。它不读取或改写 user 输入，也不依赖输入搬运；未完整配置时严格空操作。
 """
 
 from __future__ import annotations
@@ -12,7 +11,9 @@ import secrets
 from typing import Any, Mapping, Optional
 
 from models import OpenAIMessage
-from input_relay import MODE_ALWAYS, MODE_OFF
+
+MODE_OFF = "off"
+MODE_ALWAYS = "always"
 
 MODE_NON_VERTEX_ONLY = "non_vertex_only"
 _LEGACY_FAKE_STREAM_ONLY = "fake_stream_only"
@@ -21,7 +22,6 @@ SETTING_MODE = "top_input_injection_mode"
 SETTING_PLANS = "top_input_injection_plans"
 SETTING_SELECTED_PLAN_ID = "top_input_injection_selected_plan_id"
 SETTING_RANDOM = "top_input_injection_random"
-INPUT_PLACEHOLDER = "{{input}}"
 MAX_PLANS = 32
 MAX_PLAN_CONTENT_CHARS = 100_000
 
@@ -137,34 +137,24 @@ def _choose_plan(config: TopInputInjectionConfig) -> TopInputPlan:
     )
 
 
-def _render_plan(plan: TopInputPlan, latest_user_text: str) -> str:
-    """渲染模板；未使用内部占位符时将原始输入追加在模板尾部。"""
-    if INPUT_PLACEHOLDER in plan.content:
-        return plan.content.replace(INPUT_PLACEHOLDER, latest_user_text)
-    return f"{plan.content.rstrip()}\n\n{latest_user_text}"
+def _render_plan(plan: TopInputPlan) -> str:
+    """返回方案正文原文，不解析宏或占位符。"""
+    return plan.content
 
 
 def apply_top_input_injection(
     messages: list[OpenAIMessage],
     config: TopInputInjectionConfig,
 ) -> tuple[list[OpenAIMessage], list[str]]:
-    """把所选方案渲染为 messages 第 1 条，必要时与原第一条同角色消息融合。
+    """把所选方案原样置于 messages 第 1 条，必要时与同角色首条消息融合。
 
-    原始 user 消息绝不替换；其余消息对象也不原地修改，便于混合通道故障转移复用。
+    不读取、不替换、也不依赖原始 user 消息；其余消息对象不原地修改，便于混合
+    通道故障转移复用。
     """
-    source = next((
-        message for message in reversed(messages)
-        if str(getattr(message, "role", "")).lower() == "user"
-    ), None)
-    if source is None:
-        return messages, ["ℹ️ [顶部注入] 未找到 user 消息，未改写。"]
-    if not isinstance(source.content, str) or not source.content.strip():
-        return messages, ["ℹ️ [顶部注入] 最新 user 消息不是非空纯文本，未改写（避免丢失图片/多段内容）。"]
-
     plan = _choose_plan(config)
-    injected_content = _render_plan(plan, source.content)
+    injected_content = _render_plan(plan)
     if not injected_content.strip():
-        return messages, ["ℹ️ [顶部注入] 所选方案渲染为空，未改写。"]
+        return messages, ["ℹ️ [顶部注入] 所选方案为空，未改写。"]
 
     injected = OpenAIMessage(role=plan.role, content=injected_content)
     first = messages[0] if messages else None

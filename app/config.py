@@ -188,8 +188,9 @@ DEFAULT_SETTINGS = {
     "input_relay_strip_generated": False,
     # ===== 顶部注入（默认关闭；方案列表由控制台持久化）=====
     # mode：off=关闭；always=所有实际候选通道；non_vertex_only=仅 Express/Cookie 的底层路由。
-    # 将最新 user 纯文本复制进所选方案，并按方案 role 放在 messages 第 1 条；与原第 1 条同 role 时用换行融合，不替换原 user。
-    # 若省略该占位符，原文自动追加到模板结尾。random=true 会随机选方案，可能降低缓存命中。
+    # 所选方案正文原样按其 role 放在 messages 第 1 条；与原第 1 条同 role 时用换行融合。
+    # 不读取、不复制、不替换 user 输入，不解析宏或占位符，和输入搬运完全独立。
+    # random=true 会随机选方案，可能降低缓存命中。
     "top_input_injection_mode": "off",
     "top_input_injection_plans": [],
     "top_input_injection_selected_plan_id": "",
