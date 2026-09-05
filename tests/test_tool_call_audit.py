@@ -89,7 +89,9 @@ class TestAdjacentSameRoleMerge:
             OpenAIMessage(role="assistant", content="答"),
         ]
         roles = self._contents_roles(messages)
-        assert roles == ["user", "model"]
+        # 前两轮仍不合并（本用例考察点）；3.x 模型以 model 轮收尾会被轮次兜底
+        # 自动补一句 user 推动语（见 test_model_turn_guard.py），故末尾多一个 user。
+        assert roles == ["user", "model", "user"]
 
 
 class TestStreamFinishReasonToolCalls:

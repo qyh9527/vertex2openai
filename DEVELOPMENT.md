@@ -24,6 +24,18 @@
 
 上游管线当前先执行顶部注入，再独立执行输入搬运，随后处理控制台 system / prefill 注入与预填充兼容。这个执行顺序仅是消息变换的顺序，**不构成两项功能的逻辑依赖**。
 
+## Gemini 3.x model 轮次兜底
+
+Gemini 3.x 要求 `contents` 以 user 轮结束；否则上游返回 `400 Requests ending with a model turn are not supported.`。`apply_prefill_compat` 主要处理末尾 assistant 纯文本预填充，但以下请求形状也会在转换后生成 model 轮：
+
+- 末尾 assistant 带悬空 `tool_calls`；
+- 末尾 assistant 只有 `reasoning_content` 或思考签名，没有普通文本；
+- 前端直接发送 `role=model`。
+
+因此不能只在预填充识别层继续增加形状分支。`create_gemini_prompt`（Express/SA 共用）和 Cookie 的 `_convert_messages_to_contents` 都在转换出口检查最终 role：当模型能力档案的 `requires_user_last_turn` 为真且末轮是 model 时，补一条极短 user 推动语 `MODEL_TURN_GUARD_NUDGE`。2.5 及更早允许 model 结尾，不触发该兜底；触发时记录 `🩹 [轮次兜底]`。这条兜底只改变发给 Gemini 的 contents，不修改 OpenAI 请求对象，也不影响预填充文本回拼。
+
+相关回归位于 `tests/test_model_turn_guard.py`（6 个形状/兼容性用例）和 `tests/test_tool_call_audit.py`。出站调试打开时，Express 额外打印请求消息数与末条 OpenAI role，便于区分“预填充未检测到”与“转换后仍为 model 结尾”。
+
 ## 修改检查清单
 
 修改任一能力时：

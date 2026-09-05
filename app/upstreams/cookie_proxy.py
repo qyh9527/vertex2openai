@@ -28,6 +28,7 @@ import config as app_config
 import model_capabilities as mc
 from message_processing import (
     DEFAULT_IMAGE_PREFILL_NUDGE,
+    MODEL_TURN_GUARD_NUDGE,
     _create_safety_ratings_html,
     apply_console_injection,
     apply_prefill_compat,
@@ -660,6 +661,20 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
             merged.append(c)
 
     system_text = "\n".join(t for t in system_parts if t) if system_parts else None
+
+    # 3.x 轮次兜底（与 create_gemini_prompt 出口同型）：batchGraphql 同样拒绝以
+    # model 轮结尾的请求。悬空 tool_calls / 仅 reasoning_content / role=model
+    # 等形状会漏过预填充兼容但转换后仍是 model 轮，出口处直接补 user 推动语。
+    if merged and merged[-1]["role"] == "model":
+        try:
+            needs_user_last = mc.get_profile(model_name).get("requires_user_last_turn", False)
+        except Exception:
+            needs_user_last = False
+        if needs_user_last:
+            merged.append({"role": "user", "parts": [{"text": MODEL_TURN_GUARD_NUDGE}]})
+            print("🩹 [轮次兜底] 转换后请求以 model 轮结尾（该模型不支持），"
+                  "已自动补一句 user 推动语绕开 400。")
+
     return merged, system_text
 
 

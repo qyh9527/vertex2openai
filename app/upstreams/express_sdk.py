@@ -571,6 +571,7 @@ class ExpressSDKUpstream(BaseUpstream):
             if synthetic_tool_name:
                 _shape.append(f"防截断合成工具={synthetic_tool_name}")
             _shape.append(f"预填充={'有（' + str(len(prefill_text)) + ' 字）' if prefill_text else '无'}")
+            _shape.append(f"请求消息数={len(request_obj.messages)}（末条 role={request_obj.messages[-1].role if request_obj.messages else '无'}）")
             print(f"🔎 [出站调试] {channel_display_name(self.channel_name)} 请求形状：{'；'.join(_shape)}")
 
         return await execute_gemini_call(

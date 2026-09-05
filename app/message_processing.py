@@ -368,6 +368,9 @@ DEFAULT_IMAGE_PREFILL_NUDGE = (
     "[继续] 按上面说的风格与要求，直接输出图片本身，不要输出任何文字描述或字符画。"
 )
 
+# 3.x 轮次兜底用的极短 user 推动语：与 keep_turn 的收尾同型，越短越不干扰原请求。
+MODEL_TURN_GUARD_NUDGE = "[继续] 从你上一条继续，不要重复已写内容，不要任何前言或解释。"
+
 
 def apply_console_injection(
     messages: List[OpenAIMessage],
@@ -894,6 +897,24 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
     if not merged_messages:
         merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
+
+    # 3.x 兜底：上游拒绝「以 model 轮结尾」的请求（400 Requests ending with a
+    # model turn are not supported）。预填充兼容只处理「末尾 assistant 纯文本」
+    # 这一种形状；末尾是悬空 tool_calls、仅 reasoning_content、仅思考签名或
+    # role 本身就是 model 的消息都会漏过它，但转换后仍是 model 轮（实测三通道
+    # 通杀）。这里在出口处直接看转换结果（不再猜进站形状）：对要求 user 收尾
+    # 的模型，发现以 model 轮结束就补一句极短 user 推动语，与 keep_turn 的
+    # 处理同型；2.5 及更早（允许 model 结尾）不受影响。
+    if merged_messages[-1].role == "model":
+        try:
+            needs_user_last = mc.get_profile(model_name).get("requires_user_last_turn", False)
+        except Exception:
+            needs_user_last = False
+        if needs_user_last:
+            merged_messages.append(types.Content(
+                role="user", parts=[types.Part.from_text(text=MODEL_TURN_GUARD_NUDGE)]))
+            print("🩹 [轮次兜底] 转换后请求以 model 轮结尾（该模型不支持），"
+                  "已自动补一句 user 推动语绕开 400。")
 
     return merged_messages
 
