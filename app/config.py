@@ -187,14 +187,14 @@ DEFAULT_SETTINGS = {
     # 是否从模型输出中剥离同名、已闭合的块；流式采用有界 fail-open 缓冲，避免吞半截文本。
     "input_relay_strip_generated": False,
     # ===== 顶部注入（默认关闭；方案列表由控制台持久化）=====
-    # mode：off=关闭；always=所有实际候选通道；non_vertex_only=仅 Express/Cookie 的底层路由。
+    # mode：off=关闭；always=开启（所有实际候选通道均注入）。
     # 所选方案正文原样按其 role 放在 messages 第 1 条；与原第 1 条同 role 时用换行融合。
     # 不读取、不复制、不替换 user 输入，不解析宏或占位符，和输入搬运完全独立。
-    # random=true 会随机选方案，可能降低缓存命中。
+    # random：off=固定；always=全路由随机；non_vertex_only=Express/Cookie 随机、SA 固定。
     "top_input_injection_mode": "off",
     "top_input_injection_plans": [],
     "top_input_injection_selected_plan_id": "",
-    "top_input_injection_random": False,
+    "top_input_injection_random": "off",
     # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
     # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
     # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。

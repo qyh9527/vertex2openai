@@ -57,15 +57,16 @@ class TestTopInputInjectionConfig:
             ],
         })
         assert note is None
-        assert config.mode == MODE_NON_VERTEX_ONLY
+        assert config.mode == MODE_ALWAYS
+        assert config.random_mode == MODE_NON_VERTEX_ONLY
 
     def test_channel_gating_uses_actual_candidate_route(self):
-        non_vertex_only = TopInputInjectionConfig(MODE_NON_VERTEX_ONLY, PLANS, "p-system", False)
-        always = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", False)
-        assert top_input_injection_active_for_channel(non_vertex_only, "express")
-        assert top_input_injection_active_for_channel(non_vertex_only, "cookie")
-        assert not top_input_injection_active_for_channel(non_vertex_only, "vertex")
-        assert top_input_injection_active_for_channel(always, "vertex")
+        config = TopInputInjectionConfig(MODE_ALWAYS, PLANS, "p-system", MODE_NON_VERTEX_ONLY)
+        for channel in ("express", "cookie", "vertex"):
+            assert top_input_injection_active_for_channel(config, channel)
+        assert top_input.random_active_for_channel(config, "express")
+        assert top_input.random_active_for_channel(config, "cookie")
+        assert not top_input.random_active_for_channel(config, "vertex")
 
 
 class TestApplyTopInputInjection:

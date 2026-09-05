@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   openai-to-gemini:
-    image: ghcr.io/bad-woman/vertex2openai:latest
+    image: ghcr.io/qyh9527/vertex2openai:latest
     container_name: vertex2openai
     ports:
       - "8050:7860"

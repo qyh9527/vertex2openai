@@ -33,13 +33,13 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   `/<channel>/v1`，其中三个简短渠道名为 `express`（Express API Key）、`cookie`（Cookie 直连）、`vertex`（服务账号 SA）。
   例如 `http://127.0.0.1:8050/vertex/v1`；该前缀下同时提供 `/models` 与 `/chat/completions`。
   不使用前缀时，`/v1` 仍完全按控制台当前通道策略执行。
-- **管理控制台（浅色风格，单文件，免构建）**
+- **管理控制台（浅色风格，静态 HTML/JS，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
   - 标准模式 / Cookie 直连 / 服务账号 / **混合自动（三通道故障转移）** 在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **可配置输入搬运**：从客户端用自定义 XML 包裹的最新输入中提取载荷，追加到前一条 assistant 消息尾部，并替换 user 消息；支持“不开 / 只在假流开 / 无论真假流都开”三态。标签与占位语都留空默认，必须由控制台显式配置。
-  - **顶部注入**：将控制台持久化的自定义方案正文原样放在请求 `messages` 首位；可选 system / AI / user 身份，并可按实际路由限定 Express/Cookie 或全开。它不读取、复制或替换 user 输入，不解析 `{{input}}` 等宏，与输入搬运完全独立。
+  - **顶部注入**：将控制台持久化的自定义方案正文原样放在请求 `messages` 首位；可选 system / AI / user 身份，总开关只有打开/关闭。随机抽取独立提供关闭、全部随机、仅 Express/Cookie 随机三态；第三态下实际 SA 路由仍注入固定方案。它不读取、复制或替换 user 输入，不解析 `{{input}}` 等宏，与输入搬运完全独立。
   - **实时监控**：运行日志推流（含**持久化历史回放** + 「📌 自动滚动」开关）、健康度图表（成功/错误环形占比，重试单列展示，避免把“额外尝试”误画成请求结果）、**Token 用量统计已持久化**（`STATE_DIR/stats.json`，重建容器不丢）+ **每日趋势堆叠柱状图**（7/30 天切换；稀疏日期自动补齐窗口、Prompt/Completion 双色分层、悬停/聚焦查看每日明细）+ **缓存命中率**（隐式上下文缓存 90% 折扣是否生效，命中即省钱）+ **估算美刀花费**（按官方按量价，见下方「用量与花费统计」）。Token 比例条按真实数值动态渲染；Cookie 私有接口通常不返回可靠用量，token/缓存/花费统计仅标准 Express / 服务账号通道计入。
   - **防截断（Anti-Truncation）**：下游请求体加 `"anti_truncation": true`（字段名可在控制台自定义）即对**该请求**启用"合成传输工具"包装——指示模型把最终回答放进工具参数输出，绕开重提示词场景（酒馆复杂预设/长历史）下的回答截断，代理透明还原为 `assistant.content`，真实工具调用不受影响（仅文本/Chat 模型适用）。
   - **模型列表手动管理**：模型列表**不再自动拉取**远程配置（曾启动时 + `/v1/models` 每 3600s 自动刷新）；控制台「🌐 获取远程模型」手动刷新（结果持久化到磁盘）、「📝 编辑模型」弹窗添加/删除**自定义模型**（持久化，合并进 `/v1/models`）。
@@ -60,7 +60,14 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 ## 快速开始（本地 Docker）
 
-编辑 `docker-compose.yml`，设置初始环境变量：
+部署本分支请使用 `qyh9527/vertex2openai`，不要克隆原作者仓库或拉取原作者镜像（不含本分支功能）：
+
+```bash
+git clone https://github.com/qyh9527/vertex2openai.git
+cd vertex2openai
+```
+
+自带 `docker-compose.yml` 使用 `ghcr.io/qyh9527/vertex2openai:latest`。编辑其中的初始环境变量：
 
 ```yaml
 environment:
@@ -71,6 +78,7 @@ environment:
 启动：
 
 ```bash
+docker compose pull
 docker compose up -d
 ```
 
@@ -89,7 +97,7 @@ http://localhost:8050
 | `ROUNDROBIN` | 否 | `false` | 多 Express Key 轮询(`true`)或随机(`false`)。可在控制台热改。 |
 | `FAKE_STREAMING` | 否 | `false` | 假流式开关：开启后 `/v1/models` 为每个模型注册 `fake-<模型名>` 条目，客户端选中即对该请求强制假流式（其余模型保持真实流式）；生图模型始终强制假流式。可在控制台热改。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
-| `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
+| `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；修改远程文件后需在控制台手动刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
 | `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
@@ -108,7 +116,7 @@ http://localhost:8050
 
 ## 行为变更说明（整改后）
 
-按 `REFACTOR_PLAN.md` 完成整改后，以下行为与旧版本不同，升级时请注意：
+以下是相较早期版本的行为变化，升级时请注意：
 
 | 项目 | 旧行为 | 新行为 |
 |---|---|---|
@@ -143,15 +151,15 @@ http://localhost:8050
 - 有请求级写法的参数：请求体字段优先。标准字段 `temperature`/`top_p`/`max_tokens` 等，扩展字段 `reasoning_effort`、`thinking_budget`、`image_size`、`aspect_ratio`/`ar`。客户端不传时依次回退到"该模型专属 → 控制台全局 → 模型默认"。
 - 两个例外：
   1. **"模型不支持"优先级最高**（最后一步裁剪）：目标模型不支持的参数，无论来自请求、专属还是全局都会被移除（避免 400）。
-  2. **全局项无请求级/专属写法**：图压缩、重试、假流式、轮询、安全分显示、预填充模式与压制开关、续写模板、Cookie 调试仅由控制台全局决定。
+  2. **全局项无请求级/专属写法**：图压缩、重试、假流式、轮询、安全分显示、预填充模式与压制开关、输入搬运、顶部注入、Cookie 调试仅由控制台全局决定（续写指令模板支持按模型覆盖）。
 
 ### 按模型单独保存参数（per-model overrides）
 
-模型参数面板顶部选择模型后，可为**当前所选模型**单独保存专属值——支持覆盖的三类：**思考（档位/预算）、生图（分辨率/比例）、采样默认（temperature/top_p/max_tokens）**。
+模型参数面板顶部选择模型后，可为**当前所选模型**保存思考、生图、采样、system/预填充注入、续写指令及思维链守卫等专属参数；以控制台「① 按模型参数」区为准。
 
-- **保存为该模型专属**：只把上述三类字段存成该模型的专属配置；下拉框中该模型名后会显示 `★`，并出现"已有专属参数"徽章。
+- **保存为该模型专属**：保存「① 按模型参数」区字段；下拉框中该模型名后会显示 `★`，并出现“已有专属参数”徽章。
 - **清除该模型专属**：删除该模型专属配置，回退到全局默认。
-- 底部"保存设置"按钮保存**全局默认 + 基础设施项**；当所选模型已有专属配置时，它**不会**用面板里显示的专属值覆盖全局（避免误操作），只保存基础设施项。
+- 底部“保存全局设置”只保存「② 全局设置」区，不修改「① 按模型参数」区；要修改全局模型参数，请顶部选择“＊ 全局默认”并使用上方“保存为全局默认”。
 - 基础设施项（图压缩/重试/假流式/预填充模式与压制/安全分/Cookie 调试）不支持按模型覆盖，始终全局唯一。
 
 ### 按模型能力自动裁剪（`app/model_capabilities.py`，依据官方文档）
@@ -172,7 +180,7 @@ http://localhost:8050
   - **按模型能力自动选策略**：2.5 及更早模型允许以 model 轮次结尾 → **原生透传**，模型直接续写你的预填充，最忠实；3.x 拒绝 → 自动把末尾 assistant 预填充转成末尾 user 的"续写指令"（模板可在控制台自定义）。两种情况都会把预填充文本**拼回输出开头**，并对模型复述的重叠部分**自动去重**。
   - **预填充时压制原生思考（"卡思维链"，默认开启）**：酒馆预设通常自带思维链，靠预填充卡掉模型原生思考、让预设的思维链接管。开启后，检测到预填充即把思考压到该模型最低并**不回传思考**：3.x 压到 `minimal`（`pro` 无 minimal 则 `low`，官方规定 3.x 无法完全关闭思考）；2.5-flash 预算设 `0` **完全关闭**、2.5-pro 降到最低 `128`。**单次请求显式传 `reasoning_effort` / `thinking_budget` 时不压制**（请求优先）。可在控制台关闭此开关恢复模型原生思考。
   - **与模型名无关，新模型自动生效**。
-- **可选输入处理**：控制台可配置输入搬运与顶部注入。顶部注入只将所选持久化方案的正文原样置于请求 `messages` 首位，可按实际路由限定 Express/Cookie 或全开；它不读取或改写 user 输入，也不解析宏，和输入搬运独立。两项默认关闭，未完成各自所需配置时不改变请求。
+- **可选输入处理**：控制台可配置输入搬运与顶部注入。顶部注入只将所选持久化方案的正文原样置于请求 `messages` 首位，开启后所有路由均注入；只有随机抽取按实际 Express/Cookie 路由限定时，SA 使用固定方案；它不读取或改写 user 输入，也不解析宏，和输入搬运独立。两项默认关闭，未完成各自所需配置时不改变请求。
 - **新增/未来模型**：按家族/版本模式自动归类；未知/未来型号按"最新代"前向安全处理（自动移除已废弃采样参数、走预填充兼容）。
 
 ---
@@ -260,7 +268,7 @@ Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `function
 > - **条款风险**：以自动化方式访问非公开接口，可能与 Google Cloud 的使用条款相冲突，存在账号被限制或处置的风险。请仅用自有账号、自担风险。
 > - **凭证敏感度极高**：配置的 Cookie 含 `__Secure-1PSID` 等完整会话凭证，等价于该 Google 账号的完整访问权。请勿把本服务部署到公开可访问的地方，务必设置强 `API_KEY`。
 >
-> 如果你需要的是稳定、可长期依赖的方案，请使用标准模式（Express API Key）。
+> 如果需要官方接口与更稳定的兼容性，请使用 Express API Key 或服务账号（Vertex SA）通道。
 
 在控制台切换到 **Agent Platform Studio (Cookie 直连反代)**，需配置 **Cookie** 与 **Project ID**：
 
@@ -406,14 +414,14 @@ curl http://localhost:8050/v1/chat/completions \
 **混合自动可配置（「混合自动」标签页）**：
 - **参与通道开关**：3 个通道各自勾选是否参与（至少要勾一个）。
 - **调度方式**：`priority` 按配置顺序尝试（默认，保持旧行为）；`random` 每次新请求都对已勾选通道做等概率随机排列，再按该排列故障转移。要启用三渠道随机，勾选 Express、Cookie、服务账号三个通道。随机是概率意义上的负载均衡，不承诺严格轮流；熔断中的通道仍会被跳过。
-- **参与通道顺序**：固定优先级模式下可拖动/调整顺序；随机模式下该顺序仅作为参与列表，不决定首选通道。
+- **参与通道顺序**：固定优先级模式下用 ↑↓ 调整顺序；随机模式下该顺序仅作为参与列表，不决定首选通道。
 - **优先级顺序**：↑↓ 调整尝试顺序（越靠上越先尝试）。
 - **每通道独立重试次数**：各通道可单独设"失败后的内部重试上限"（留空 = 用全局 `retry_max`）——例如 Express 只重试 2 次就切走、Cookie 可重试 8 次扛限流。
 - **PayGo 流量等级**：`auto / off / standard / flex / priority` + `paygo_only` 开关（作用于 Express 与服务账号两通道，见下方「PayGo 流量等级」）。
 
 **故障转移规则**：
 - 仅对 429 / 500 / 502 / 503 / 504（限流、上游繁忙）类错误切换通道；400 / 401 / 403（配置、鉴权、权限问题）如实报错不切换——切换也不会变好。
-- Cookie 会话失效（Permission Denied）在混合模式下也会自动切其它通道，日志会提示你刷新 Cookie。
+- **Cookie 权限错误**：HTTP 401/403 不保证跨通道重试；先区分项目权限、计费与会话失效，再按日志修复。
 - **流式响应**：只有「尚未向客户端发出任何内容」时才会切换（SSE 心跳不计入）。一旦正文开始输出，错误只能如实收尾——SSE 流中途无法切换上游。
 - **熔断保护**：任一通道连续失败 `failover_threshold` 次（默认 3）后冷却 `failover_cooldown_seconds` 秒（默认 60），冷却期间请求自动走另一条通道，避免限流风暴反复撞墙；成功后立即恢复。熔断按通道独立计数。
 - 通道未配置凭证（无 Express Key / 无 Cookie / 无服务账号）会被路由层自动剔除，不会进入失败重试循环。
@@ -476,16 +484,16 @@ curl http://localhost:8050/v1/chat/completions \
 
 不依赖原作者的镜像，自己改代码、自己构建、1Panel 一键升级：
 
-1. **Fork 本仓库**到你的 GitHub 账号，clone 后改代码 push（可加 `git remote add upstream https://github.com/bad-woman/vertex2openai` 定期合并原作者的更新）。
-2. **无需自建 CI**：fork 仓库已自带上游的 GitHub Actions（`.github/workflows/docker-image.yml`，GHCR CI），push 到 main 即自动构建并推送 `ghcr.io/你的用户名/vertex2openai:latest`。fork 仓库保持 public 则包公开，VPS 拉取免登录。
+1. **Fork `qyh9527/vertex2openai`**到你的 GitHub 账号，clone 后改代码 push（可加 `git remote add upstream https://github.com/bad-woman/vertex2openai` 定期合并原作者的更新）。
+2. **CI 已配置**：本分支的 `.github/workflows/docker-image.yml` 依次执行测试、Docker 构建和发布；PR 不发布镜像，main 推送通过前两项后才发布 `latest` 与提交 SHA 标签。自行 fork 后需启用 Actions，并检查 GHCR 包的可见性；仓库公开不代表包一定公开，私有包拉取需登录。
 3. **VPS 上改一次**：把 `docker-compose.yml` 的 `image` 改为 `ghcr.io/你的用户名/vertex2openai:latest`，用 1Panel 重建容器。
 4. **以后日常**：改代码 → push → Actions 自动出镜像 → 1Panel 点「重建/升级」拉取新 latest → 完成。
 
 **数据不丢**：Cookie、Project ID 与全部控制台设置持久化在挂载卷 `./data:/app/data`（`web_state.json`），升级镜像/重建容器都保留，无需 sqlite。
 
-### 定期合并原作者更新（upstream 同步）
+### 可选：维护者合并原作者更新（非部署要求）
 
-Fork 后的仓库默认配置：
+`bad-woman/vertex2openai` 仅作为原作者代码来源，不是本分支的部署仓库。普通升级只需拉取本分支镜像；以下命令仅供主动维护代码差异时使用：
 
 ```bash
 git remote add upstream https://github.com/bad-woman/vertex2openai.git   # 一次即可
@@ -499,7 +507,7 @@ git merge upstream/main      # 或 git rebase upstream/main
 git push origin main         # 推送后 GHCR CI 自动重新构建镜像
 ```
 
-⚠️ **冲突提示**：上游更新可能与你改过的文件冲突（本项目常见于 `app/routes/chat_api.py`、`app/api_helpers.py`、`app/main.py` 等）。遇到冲突时手动解决后重新提交即可；合并后跑一遍「本地开发与检查」的语法检查再推。
+⚠️ **冲突提示**：上游更新可能与你改过的文件冲突（本项目常见于 `app/routes/chat_api.py`、`app/api_helpers.py`、`app/main.py` 等）。遇到冲突时手动解决后重新提交即可；合并后运行完整 pytest 与 compileall，再推送。
 
 ---
 
@@ -521,7 +529,7 @@ git push origin main         # 推送后 GHCR CI 自动重新构建镜像
 # 语法检查
 python -m compileall app
 
-# 自动化测试（Python 3.11 venv，与 Docker 环境一致；系统 Python 3.14 环境是坏的别用）
+# 自动化测试（推荐 Python 3.11 venv，与 Docker 环境一致）
 py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r app\requirements.txt pytest pytest-asyncio
 .venv\Scripts\python.exe -m pytest tests -q

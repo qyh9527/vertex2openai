@@ -440,7 +440,7 @@ class ExpressSDKUpstream(BaseUpstream):
             print(_top_input_config_note)
         if _top_input_active:
             _top_messages, _top_notes = apply_top_input_injection(
-                request_obj.messages, _top_input_config)
+                request_obj.messages, _top_input_config, channel=self.channel_name)
             for _top_note in _top_notes:
                 print(_top_note)
             if _top_messages is not request_obj.messages:

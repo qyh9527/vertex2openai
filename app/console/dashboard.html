@@ -551,20 +551,20 @@
       </div>
 
       <div class="card p-5">
-        <div class="flex items-center justify-between gap-3 mb-3">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
           <div class="text-sm font-semibold">顶部注入<span class="text-xs text-neutral-400" style="font-weight:400">（全局）</span><span class="helpq" onclick="hlp(this,'h_top_input')">?</span></div>
-          <select id="top_input_injection_mode" class="inp" style="max-width:180px"><option value="off">不开</option><option value="always">全打开</option><option value="non_vertex_only">仅 Express / Cookie 路由</option></select>
+          <select id="top_input_injection_mode" class="inp" style="max-width:180px"><option value="off">关闭</option><option value="always">打开</option></select>
         </div>
         <div class="grid grid-cols-1 gap-3">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="flex min-w-0 flex-1 items-center gap-2"><span class="lbl shrink-0">固定方案</span><select id="top_input_injection_selected_plan_id" class="inp min-w-0"></select></div>
-            <div class="flex items-center gap-2"><span class="text-sm whitespace-nowrap">随机抽取<span class="helpq" onclick="hlp(this,'h_top_random')">?</span></span><label class="switch"><input type="checkbox" id="top_input_injection_random"><span class="slider"></span></label></div>
+            <div class="flex w-full flex-wrap items-center gap-2"><span class="text-sm whitespace-nowrap">随机抽取<span class="helpq" onclick="hlp(this,'h_top_random')">?</span></span><select id="top_input_injection_random" class="inp min-w-0" style="max-width:240px"><option value="off">关闭 · 使用固定方案</option><option value="always">打开 · 所有路由随机</option><option value="non_vertex_only">仅 Express / Cookie 随机</option></select></div>
           </div>
-          <div id="h_top_random" class="helpbox">随机模式会从所有有效方案中抽取一套。它让每轮请求前缀发生变化，通常会降低上游隐式上下文缓存命中率；仅在确实需要变体时打开。</div>
+          <div id="h_top_random" class="helpbox">随机抽取有三态：关闭时所有路由使用固定方案；打开时所有路由随机；仅 Express / Cookie 随机时，实际 SA（vertex）路由仍注入固定方案。判断实际执行的三种路由，不读取四选一上游调用策略。随机模式会从所有有效方案中抽取一套。它让每轮请求前缀发生变化，通常会降低上游隐式上下文缓存命中率；仅在确实需要变体时打开。</div>
           <div id="top_input_injection_plan_list" class="space-y-3"></div>
           <button type="button" class="btn-ghost px-3 py-2 text-sm w-full" onclick="addTopInputInjectionPlan()">＋ 新增顶部方案</button>
         </div>
-        <div id="h_top_input" class="helpbox"><b>作用</b>：把所选方案的<b>原始正文</b>作为 <b>system / AI / user</b> 身份放进请求体 <code>messages</code> 的第 1 条；不读取、不复制、不替换最新 user 输入，和「输入搬运」没有逻辑关联。若方案身份与原 messages 第 1 条身份相同（例如都是 system），网关会将方案正文放前、原正文放后，并用一个换行合并成同一条消息。方案正文不解析网关或客户端宏；例如 <code>{{input}}</code> 会作为普通文本原样注入。<br><br><b>三态</b>：不开、全打开、或仅在底层实际路由到 Express / Cookie 时打开。这里判断的是每次请求实际选中的候选通道，不读取「通道与凭证」页面的四选一策略；hybrid 的某次尝试若转到 Vertex SA，本次不会注入。方案会持久化在控制台状态中，可固定选择或随机抽取。</div>
+        <div id="h_top_input" class="helpbox"><b>作用</b>：把所选方案的<b>原始正文</b>作为 <b>system / AI / user</b> 身份放进请求体 <code>messages</code> 的第 1 条；不读取、不复制、不替换最新 user 输入，和「输入搬运」没有逻辑关联。若方案身份与原 messages 第 1 条身份相同（例如都是 system），网关会将方案正文放前、原正文放后，并用一个换行合并成同一条消息。方案正文不解析网关或客户端宏；例如 <code>{{input}}</code> 会作为普通文本原样注入。<br><br><b>总开关</b>：只有打开与关闭；打开时三种实际路由均注入。路由限定只控制随机抽取，不控制是否注入；hybrid 的某次尝试若转到 Vertex SA，且随机设为“仅 Express / Cookie”，本次使用固定方案。方案会持久化在控制台状态中，可固定选择或随机抽取。</div>
       </div>
 
       <!-- 开关 -->
@@ -1247,9 +1247,12 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_random'].forEach(k=>setV(k,s[k]));
-    if(s.top_input_injection_mode==='fake_stream_only') setV('top_input_injection_mode','non_vertex_only');
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated'].forEach(k=>setV(k,s[k]));
+    const legacyTop=['fake_stream_only','non_vertex_only'].includes(s.top_input_injection_mode);
+    if(legacyTop) setV('top_input_injection_mode','always');
+    const randomValue=String(s.top_input_injection_random??'off').trim().toLowerCase();
+    setV('top_input_injection_random',legacyTop?'non_vertex_only':(['off','always','non_vertex_only'].includes(randomValue)?randomValue:(['1','true','yes','on'].includes(randomValue)?'always':'off')));
     TOP_INPUT_INJECTION_PLANS=Array.isArray(s.top_input_injection_plans)?s.top_input_injection_plans.filter(p=>p&&typeof p==='object').map(p=>({...p})):[];
     renderTopInputInjectionPlans();
     if(TOP_INPUT_INJECTION_PLANS.some(p=>p.id===s.top_input_injection_selected_plan_id)) $('top_input_injection_selected_plan_id').value=s.top_input_injection_selected_plan_id;
@@ -1474,7 +1477,7 @@ async function saveSettings(){
     top_input_injection_mode:$('top_input_injection_mode').value,
     top_input_injection_plans:TOP_INPUT_INJECTION_PLANS.map(p=>({id:p.id,name:p.name||'',role:p.role||'system',content:p.content||''})),
     top_input_injection_selected_plan_id:$('top_input_injection_selected_plan_id').value||'',
-    top_input_injection_random:$('top_input_injection_random').checked,
+    top_input_injection_random:$('top_input_injection_random').value,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,

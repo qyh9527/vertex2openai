@@ -43,13 +43,20 @@ class TopInputInjectionConfig:
     mode: str
     plans: tuple[TopInputPlan, ...]
     selected_plan_id: str
-    random_enabled: bool
+    random_mode: str
 
 
-def _as_bool(value: Any) -> bool:
+def normalize_random_mode(value: Any) -> str:
+    """兼容旧布尔值；非法值退回固定方案。"""
+    if value is True:
+        return MODE_ALWAYS
     if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
+        value = value.strip().lower()
+        if value in (MODE_OFF, MODE_ALWAYS, MODE_NON_VERTEX_ONLY):
+            return value
+        if value in ("1", "true", "yes", "on"):
+            return MODE_ALWAYS
+    return MODE_OFF
 
 
 def _normalize_role(value: Any) -> Optional[str]:
@@ -93,12 +100,14 @@ def get_top_input_injection_config(
 ) -> tuple[Optional[TopInputInjectionConfig], Optional[str]]:
     """读取顶部注入设置；模式关闭或无有效方案时返回空配置。"""
     mode = str(settings.get(SETTING_MODE) or MODE_OFF).strip().lower()
-    # 该功能此前短暂使用 fake_stream_only；语义升级后平滑映射为“仅非 Vertex SA 路由”。
-    if mode == _LEGACY_FAKE_STREAM_ONLY:
-        mode = MODE_NON_VERTEX_ONLY
+    random_mode = normalize_random_mode(settings.get(SETTING_RANDOM))
+    # 旧路由限定档迁移为开启注入、仅 Express/Cookie 随机；SA 固定注入。
+    if mode in (_LEGACY_FAKE_STREAM_ONLY, MODE_NON_VERTEX_ONLY):
+        mode = MODE_ALWAYS
+        random_mode = MODE_NON_VERTEX_ONLY
     if mode == MODE_OFF:
         return None, None
-    if mode not in (MODE_NON_VERTEX_ONLY, MODE_ALWAYS):
+    if mode != MODE_ALWAYS:
         return None, "⛔ [顶部注入] 模式无效，已保持空操作。"
 
     plans = _read_plans(settings.get(SETTING_PLANS))
@@ -108,7 +117,7 @@ def get_top_input_injection_config(
         mode=mode,
         plans=plans,
         selected_plan_id=str(settings.get(SETTING_SELECTED_PLAN_ID) or "").strip(),
-        random_enabled=_as_bool(settings.get(SETTING_RANDOM, False)),
+        random_mode=random_mode,
     ), None
 
 
@@ -116,20 +125,21 @@ def top_input_injection_active_for_channel(
     config: TopInputInjectionConfig,
     channel: str,
 ) -> bool:
-    """按实际路由到的候选通道判断顶部注入是否生效。
+    """注入只受总开关控制，任何实际通道都可注入。"""
+    return config.mode == MODE_ALWAYS
 
-    ``non_vertex_only`` 判断发生在 upstream 内部：hybrid 请求先到 Express/Cookie
-    就启用，真实转到 Vertex SA 时不启用，不依赖控制台的四选一策略字段。
-    """
-    normalized_channel = str(channel or "").strip().lower()
-    return config.mode == MODE_ALWAYS or (
-        config.mode == MODE_NON_VERTEX_ONLY
-        and normalized_channel in ("express", "cookie")
+
+def random_active_for_channel(config: TopInputInjectionConfig, channel: str) -> bool:
+    """随机按实际候选通道判断，不读取四选一上游策略。"""
+    mode = normalize_random_mode(config.random_mode)
+    return mode == MODE_ALWAYS or (
+        mode == MODE_NON_VERTEX_ONLY
+        and str(channel or "").strip().lower() in ("express", "cookie")
     )
 
 
-def _choose_plan(config: TopInputInjectionConfig) -> TopInputPlan:
-    if config.random_enabled:
+def _choose_plan(config: TopInputInjectionConfig, random_enabled: bool) -> TopInputPlan:
+    if random_enabled:
         return secrets.choice(config.plans)
     return next(
         (plan for plan in config.plans if plan.plan_id == config.selected_plan_id),
@@ -145,13 +155,17 @@ def _render_plan(plan: TopInputPlan) -> str:
 def apply_top_input_injection(
     messages: list[OpenAIMessage],
     config: TopInputInjectionConfig,
+    channel: str = "",
 ) -> tuple[list[OpenAIMessage], list[str]]:
     """把所选方案原样置于 messages 第 1 条，必要时与同角色首条消息融合。
 
     不读取、不替换、也不依赖原始 user 消息；其余消息对象不原地修改，便于混合
     通道故障转移复用。
     """
-    plan = _choose_plan(config)
+    if config.mode != MODE_ALWAYS:
+        return messages, []
+    random_enabled = random_active_for_channel(config, channel)
+    plan = _choose_plan(config, random_enabled)
     injected_content = _render_plan(plan)
     if not injected_content.strip():
         return messages, ["ℹ️ [顶部注入] 所选方案为空，未改写。"]
@@ -166,10 +180,10 @@ def apply_top_input_injection(
         return [merged, *messages[1:]], [
             f"✅ [顶部注入] 已以 {plan.role} 身份将方案「{plan.name}」"
             f"并入 messages 第 1 条（{len(injected_content)} 字，"
-            f"{'随机' if config.random_enabled else '指定'}选择）。"
+            f"{'随机' if random_enabled else '指定'}选择）。"
         ]
 
     return [injected, *messages], [
         f"✅ [顶部注入] 已以 {plan.role} 身份插入 messages 第 1 条方案「{plan.name}」"
-        f"（{len(injected_content)} 字，{'随机' if config.random_enabled else '指定'}选择）。"
+        f"（{len(injected_content)} 字，{'随机' if random_enabled else '指定'}选择）。"
     ]

@@ -16,8 +16,11 @@
 - 方案正文按原样注入；网关不渲染任何顶部注入宏或占位符。
 - `{{input}}` 不是顶部注入变量，出现在方案中会作为普通文本发送给上游。
 - 顶部注入不要求请求中存在 user 消息；最新 user 为多模态内容时同样照常注入。
-- 方案选择可固定或随机；随机选择可能降低上游隐式缓存命中率。
-- `non_vertex_only` 必须按上游实际候选通道判断：仅 Express 与 Cookie 生效，Vertex SA 不生效；不得依据控制台当前总策略字段推断。
+- 主开关 `top_input_injection_mode` 仅 `off` / `always`：关闭或打开注入。
+- 随机选择使用原持久化键 `top_input_injection_random`，现为三态字符串：`off` 全部固定、`always` 全部随机、`non_vertex_only` 仅实际 Express/Cookie 随机，实际 Vertex SA 仍注入固定方案。
+- Express/SA 共享执行路径传入 `self.channel_name`，Cookie 传入 `cookie`。不读取控制台的 express/cookie/vertex/hybrid 四选一策略；hybrid 转到 SA 时须重新按固定方案处理原请求。
+- 旧随机布尔值 true/false 兼容为 always/off；旧主开关 non_vertex_only 或 fake_stream_only 兼容为 always + 随机 non_vertex_only。前端回显与后端读取同步转换，保存后写入新值。
+- 随机选择可能降低隐式缓存命中率，SA 固定方案可保持前缀稳定。
 
 上游管线当前先执行顶部注入，再独立执行输入搬运，随后处理控制台 system / prefill 注入与预填充兼容。这个执行顺序仅是消息变换的顺序，**不构成两项功能的逻辑依赖**。
 

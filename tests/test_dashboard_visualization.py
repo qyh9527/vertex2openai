@@ -54,3 +54,15 @@ def test_dashboard_top_injection_is_independent_from_input_relay():
     assert "顶部方案正文（按原文注入，不解析宏）" in DASHBOARD_HTML
     assert "方案正文会原样注入到 messages 第 1 条。" in DASHBOARD_HTML
     assert "未使用 {{input}} 时" not in DASHBOARD_HTML
+
+
+def test_top_injection_has_binary_switch_and_ternary_random():
+    import re
+    def values(element_id):
+        select = re.search(r'<select id="' + element_id + r'"[^>]*>(.*?)</select>', DASHBOARD_HTML, re.S)
+        assert select
+        return re.findall(r'<option value="([^"]+)"', select.group(1))
+    assert values('top_input_injection_mode') == ['off', 'always']
+    assert values('top_input_injection_random') == ['off', 'always', 'non_vertex_only']
+    assert "top_input_injection_random:$('top_input_injection_random').value" in DASHBOARD_HTML
+    assert "top_input_injection_random:$('top_input_injection_random').checked" not in DASHBOARD_HTML
