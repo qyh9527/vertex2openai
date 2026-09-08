@@ -44,6 +44,7 @@ from message_processing import (
 )
 from logger import stats
 from api_helpers import get_retry_settings, FAKE_PREFIX
+from usage_mapping import map_usage, with_usage_null
 from anti_truncation import is_enabled_for_request, get_enabled_field
 from input_relay import (
     RelayBlockStreamStripper,
@@ -1023,11 +1024,7 @@ def _map_usage(usage_meta: dict | None) -> dict:
     不再打印 💰 统计行——大盘的 token 统计仅由标准（Express）通道计入；
     Cookie 通道的成功数改由 stats.add_success() 单独计入。
     """
-    usage_meta = usage_meta or {}
-    p = int(usage_meta.get("promptTokenCount", 0) or 0)
-    c = int(usage_meta.get("candidatesTokenCount", 0) or 0)
-    t = int(usage_meta.get("totalTokenCount", p + c) or (p + c))
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+    return map_usage(usage_meta)
 
 
 # ========== OpenAI SSE 格式化 ==========
@@ -1520,12 +1517,13 @@ class CookieProxyUpstream(BaseUpstream):
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
                 stats.add_success()
                 usage = _map_usage(res.get("usage_meta"))
+                yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                 if want_usage:
                     yield _make_usage_chunk(response_id, model_display, usage)
-                yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                 yield "data: [DONE]\n\n"
                 print(f"✅ [Studio] {base_model_name} | 生图假流式完成")
-            return StreamingResponse(image_fake_stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                with_usage_null(image_fake_stream(), want_usage), media_type="text/event-stream")
 
         # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========
         if is_stream:
@@ -1800,7 +1798,8 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                         return
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                with_usage_null(stream_generator(), want_usage), media_type="text/event-stream")
 
         # ========== 非流式处理 ==========
         else:

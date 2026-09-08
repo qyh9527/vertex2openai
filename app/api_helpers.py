@@ -35,6 +35,7 @@ from config import VERTEX_REASONING_TAG
 
 import model_capabilities as mc
 from runtime_state import app_state
+from usage_mapping import map_usage, with_usage_null
 from failover import UpstreamUnstartedError
 from anti_truncation import (
     has_synthetic_tool_call,
@@ -173,14 +174,9 @@ def report_client_failure(client, kind: str = "conn", reason: str = "") -> None:
 
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
-    """从 SDK 响应里取 (prompt, completion, total) token 数。"""
-    um = getattr(resp, "usage_metadata", None)
-    if not um:
-        return 0, 0, 0
-    p_tk = getattr(um, "prompt_token_count", 0) or 0
-    c_tk = getattr(um, "candidates_token_count", 0) or 0
-    t_tk = getattr(um, "total_token_count", None) or (p_tk + c_tk)
-    return p_tk, c_tk, t_tk
+    """从 SDK 响应里取 (prompt, completion 含思考, total) token 数。"""
+    usage = map_usage(getattr(resp, "usage_metadata", None))
+    return usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
 
 
 def _extract_cached_tokens(resp: Any) -> int:
@@ -188,10 +184,8 @@ def _extract_cached_tokens(resp: Any) -> int:
 
     服务账号（标准 Vertex）通道的隐式缓存默认开启（90% 折扣）；此值用于统计缓存命中率。
     """
-    um = getattr(resp, "usage_metadata", None)
-    if not um:
-        return 0
-    return int(getattr(um, "cached_content_token_count", 0) or 0)
+    usage = map_usage(getattr(resp, "usage_metadata", None))
+    return usage["prompt_tokens_details"]["cached_tokens"]
 
 
 def _effective_pricing_tier() -> str:
@@ -210,14 +204,15 @@ def _record_usage(resp: Any, model_name: str = "") -> dict:
         value = getattr(traffic_type, "value", None) or str(traffic_type)
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    p_tk, c_tk, t_tk = _extract_usage(resp)
+    usage = map_usage(usage_metadata)
+    p_tk, c_tk, t_tk = usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
     if p_tk or c_tk:
-        cached = _extract_cached_tokens(resp)
+        cached = usage["prompt_tokens_details"]["cached_tokens"]
         stats.add_tokens(p_tk, c_tk, cached=cached, model=model_name,
                          tier=_effective_pricing_tier())
         cache_note = f" | 缓存命中: {cached}" if cached else ""
         print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens{cache_note}")
-    return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
+    return usage
 
 
 def wants_usage(request_obj: Any) -> bool:
@@ -246,7 +241,8 @@ def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
     response_id_override: Optional[str] = None, 
-    model_name_override: Optional[str] = None
+    model_name_override: Optional[str] = None,
+    include_usage: bool = False,
 ):
     resp_id = response_id_override or openai_response_dict.get("id", f"chatcmpl-fakestream-{int(time.time())}")
     model_name = model_name_override or openai_response_dict.get("model", "unknown")
@@ -315,6 +311,8 @@ async def _chunk_openai_response_dict_for_sse(
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
 
+    if include_usage:
+        yield make_usage_chunk(resp_id, model_name, openai_response_dict.get("usage") or map_usage())
     yield "data: [DONE]\n\n"
 
 def _strip_input_relay_from_openai_dict(openai_dict: Dict[str, Any], tag: str) -> Dict[str, Any]:
@@ -497,6 +495,7 @@ async def gemini_fake_stream_generator(
     api_call_task = None
     raw_gemini_response = None
     last_error = None
+    response_id = f"chatcmpl-fakestream-{time.time_ns()}"
 
     try:
         for attempt in range(max_retries + 1):
@@ -515,7 +514,7 @@ async def gemini_fake_stream_generator(
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
             while not api_call_task.done():
                 if outer_keep_alive_interval > 0:
-                    keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
+                    keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
                                        "created": int(time.time()), "model": request_obj.model,
                                        "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
                     yield f"data: {json.dumps(keep_alive_data)}\n\n"
@@ -549,7 +548,7 @@ async def gemini_fake_stream_generator(
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
                             return
                         if outer_keep_alive_interval > 0:
-                            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
+                            keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
                                                "created": int(time.time()), "model": request_obj.model,
                                                "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
                             yield f"data: {json.dumps(keep_alive_data)}\n\n"
@@ -586,8 +585,9 @@ async def gemini_fake_stream_generator(
             raise ValueError(block_message)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
-            openai_response_dict=openai_response_dict
-        ):
+            openai_response_dict=openai_response_dict,
+            response_id_override=response_id,
+            include_usage=wants_usage(request_obj),        ):
             yield chunk_sse
 
     except asyncio.CancelledError:
@@ -684,13 +684,13 @@ async def execute_gemini_call(
             if is_image_request:
                  print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
-                gemini_fake_stream_generator(
+                with_usage_null(gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
                     channel_name=channel_name, synthetic_tool_name=synthetic_tool_name,
                     input_relay_strip_tag=input_relay_strip_tag,
-                ), media_type="text/event-stream"
+                ), wants_usage(request_obj)), media_type="text/event-stream"
             )
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
@@ -739,13 +739,16 @@ async def execute_gemini_call(
                             _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
                             yield f"data: {json.dumps(_pf)}\n\n"
 
-                        final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
-                        final_cached_tk = 0
+                        final_usage = map_usage()
+                        pending_finishes = {}
 
                         async for chunk_item_call in stream_gen_obj:
                             if getattr(chunk_item_call, "usage_metadata", None):
-                                final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
-                                final_cached_tk = _extract_cached_tokens(chunk_item_call)
+                                final_usage = map_usage(chunk_item_call.usage_metadata)
+                                # 纯用量块不代表已向客户端输出正文；安全反馈仍交由转换器处理。
+                                if (not getattr(chunk_item_call, "candidates", None)
+                                        and not getattr(chunk_item_call, "prompt_feedback", None)):
+                                    continue
 
                             # 防截断：剥离合成工具 part，把 content 作为正文 delta 直接输出。
                             # 合成调用不进入 ToolCallIndexer，finish_reason 判定只反映真实工具；
@@ -772,6 +775,10 @@ async def execute_gemini_call(
                                     for _sc in _syn_contents:
                                         _syn_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
                                         yield f"data: {json.dumps(_syn_payload, ensure_ascii=False)}\n\n"
+                                if chunk_item_call is None:
+                                    # 合成正文已单独发出，但同块的 finish_reason 不能随 part 一起丢失。
+                                    chunk_item_call = _orig_chunk.model_copy(deep=True)
+                                    chunk_item_call.candidates[0].content.parts = []
                             if chunk_item_call is None:
                                 continue
 
@@ -800,6 +807,17 @@ async def execute_gemini_call(
                                     if _sideheld is not False:
                                         sse_chunk = _sideheld  # 剥掉正文后的剩余信息照常透传
                                     # False（非正文 chunk）原样透传
+                                if synthetic_tool_name or input_relay_stripper is not None:
+                                    # 输出过滤器仍可能攒着正文；结束块必须等所有尾部文本放行后再发。
+                                    payload = json.loads(sse_chunk[len("data: "):])
+                                    choice = payload["choices"][0]
+                                    if choice.get("finish_reason"):
+                                        pending_finishes[choice["index"]] = {
+                                            **payload, "choices": [{**choice, "delta": {}}]}
+                                        choice["finish_reason"] = None
+                                        if not choice.get("delta"):
+                                            continue
+                                        sse_chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                                 yield sse_chunk
 
                         # 防截断已启用但全程未出现合成工具调用：模型没走合成通道，本次防截断未生效
@@ -829,6 +847,13 @@ async def execute_gemini_call(
                             if relay_tail:
                                 yield _input_relay_sse_text(response_id_for_stream, request_obj, relay_tail)
 
+                        for finish in pending_finishes.values():
+                            yield f"data: {json.dumps(finish, ensure_ascii=False)}\n\n"
+
+                        final_p_tk = final_usage["prompt_tokens"]
+                        final_c_tk = final_usage["completion_tokens"]
+                        final_t_tk = final_usage["total_tokens"]
+                        final_cached_tk = final_usage["prompt_tokens_details"]["cached_tokens"]
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk,
                                              cached=final_cached_tk, model=request_obj.model,
@@ -838,11 +863,7 @@ async def execute_gemini_call(
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
                         if wants_usage(request_obj):
-                            yield make_usage_chunk(response_id_for_stream, request_obj.model, {
-                                "prompt_tokens": final_p_tk,
-                                "completion_tokens": final_c_tk,
-                                "total_tokens": final_t_tk,
-                            })
+                            yield make_usage_chunk(response_id_for_stream, request_obj.model, final_usage)
 
                         yield "data: [DONE]\n\n"
                         return
@@ -918,7 +939,10 @@ async def execute_gemini_call(
                         yield "data: [DONE]\n\n"
                         return
 
-            return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
+            return StreamingResponse(
+                with_usage_null(_gemini_real_stream_generator_inner(), wants_usage(request_obj)),
+                media_type="text/event-stream",
+            )
     else: # Non-streaming
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
         max_retries, backoff_sec = get_retry_settings(channel_name)

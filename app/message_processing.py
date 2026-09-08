@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
+from usage_mapping import map_usage
 from signature_store import (
     signature_store,
     SKIP_VALIDATOR_SENTINEL,
@@ -1298,19 +1299,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     else: 
          choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
 
-    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if hasattr(gemini_response_obj, "usage_metadata"):
-        um = gemini_response_obj.usage_metadata
-        if hasattr(um, "prompt_token_count"): usage_data["prompt_tokens"] = um.prompt_token_count
-        if hasattr(um, "candidates_token_count"):
-            usage_data["completion_tokens"] = um.candidates_token_count
-            if hasattr(um, "total_token_count"): usage_data["total_tokens"] = um.total_token_count
-            else: usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
-        elif hasattr(um, "total_token_count"): 
-             usage_data["total_tokens"] = um.total_token_count
-             if usage_data["prompt_tokens"] > 0 and usage_data["total_tokens"] > usage_data["prompt_tokens"]:
-                 usage_data["completion_tokens"] = usage_data["total_tokens"] - usage_data["prompt_tokens"]
-        else: usage_data["total_tokens"] = usage_data["prompt_tokens"] 
+    usage_data = map_usage(getattr(gemini_response_obj, "usage_metadata", None))
 
     return {
         "id": base_id, "object": "chat.completion", "created": response_timestamp,

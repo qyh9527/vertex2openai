@@ -394,6 +394,41 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 用量与花费统计
 
+### 客户端标准 usage
+
+非流式响应始终包含 `usage`。流式请求需显式开启：
+
+```json
+{
+  "model": "gemini-3.6-flash",
+  "messages": [{"role": "user", "content": "你好"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+```
+
+Express / 服务账号的真流式、`fake-` 假流式，以及 Cookie 真流式/生图假流式，均在正常收尾时按 **内容 → finish_reason → usage 尾块 → `[DONE]`** 输出。用量尾块的 `choices` 为 `[]`，全请求只发送一次（多候选亦然）；其余普通数据块的 `usage` 为 `null`。不传 `include_usage` 或设为 `false` 时不发送用量尾块。连接中断、错误或取消时不保证收到尾块，不能把缺少尾块理解为零消耗。
+
+三通道统一映射为以下字段（示例数值）：
+
+```json
+{
+  "prompt_tokens": 100,
+  "completion_tokens": 50,
+  "total_tokens": 150,
+  "prompt_tokens_details": {"cached_tokens": 40},
+  "completion_tokens_details": {"reasoning_tokens": 30}
+}
+```
+
+- `prompt_tokens` 已包含缓存命中令牌；`cached_tokens` 是其中的子集，不重复相加。
+- `completion_tokens` = Gemini 的候选输出令牌 + 思考令牌；`reasoning_tokens` 是其中的思考部分，不再额外叠加。是否显示思考正文不影响实际消耗映射。
+- `total_tokens` 优先保留上游真实值，缺失时回退为输入 + 输出。上游总数还可能包含工具使用提示令牌，因此不强行用“总数减输入”猜测输出。
+- 缺失/空值按零处理，**不根据正文长度估算**。Cookie 私有接口通常不回传用量，此时返回零；有数据时正常映射，但仍不计入控制台 token/花费大盘。
+- SDK 的用量累计和费用估算同步使用包含思考的输出数；不追溯改写历史统计。
+
+### 控制台统计
+
 - **Token 用量**：标准 Express / 服务账号通道请求后由上游回传的 `usageMetadata` 累计（Cookie 私有接口通常不回传，不计入）。持久化在 `STATE_DIR/stats.json`，重建容器不丢；首页展示累计数字、**按实际输入/输出比例动态更新的 Token 条**，以及最近 7/30 天每日趋势。趋势图无论实际只积累了几天数据，都会补齐完整日期窗口，避免单日数据拉成整块柱；每一天以 **Prompt（蓝）/ Completion（橙）** 堆叠柱呈现，鼠标悬停或键盘聚焦可查看 token 与请求明细。
 - **缓存命中率**：`usageMetadata.cachedContentTokenCount` 报告命中上下文缓存的输入 token。**服务账号（标准 Vertex）通道默认开启隐式缓存（90% 折扣）**，命中率 = 缓存命中 / 输入 token——命中率越高越省钱。
 - **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值，官方调价后请更新 `MODEL_PRICING`（3.7/3.6-flash 的 introductory 价 2027-01 到期）。
