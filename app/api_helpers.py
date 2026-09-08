@@ -283,7 +283,7 @@ async def _chunk_openai_response_dict_for_sse(
                 chunk_size = max(1, len(content_to_chunk))
             else:
                 chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
-            if not content_to_chunk and not reasoning_content:
+            if not content_to_chunk and not reasoning_content and not message.get("tool_calls"):
                 yield _sse({"content": ""})
             else:
                 for i in range(0, len(content_to_chunk), chunk_size):

@@ -265,6 +265,16 @@ async def test_usage_with_prompt_block_is_not_silently_skipped(monkeypatch):
     assert converter.call_args.args[0] is blocked
 
 
+async def test_thought_only_response_passes_validity_check():
+    """思考型模型只回思考（parts 为空但有 usage）时不应报"无有效内容"。"""
+    um = sdk_meta({"promptTokenCount": 3, "candidatesTokenCount": 700,
+                   "thoughtsTokenCount": 700, "totalTokenCount": 703})
+    resp_obj = types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(role="model", parts=[]))],
+        usage_metadata=um)
+    assert helpers.is_gemini_response_valid(resp_obj)
+
+
 async def test_usage_null_wrapper_preserves_large_content_and_closes_source():
     text = 'data:image/png;base64,' + 'x' * 1_000_000 + ' "choices": [] "usage": {}'
     closed = []

@@ -365,6 +365,10 @@ def is_gemini_response_valid(response: Any) -> bool:
                     if getattr(part, "function_call", None) is not None: return True
                     if getattr(part, "inline_data", None) is not None: return True
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip(): return True
+            # 思考型模型可能只回思考（parts 为空或全是 thought），此时有 usage 即视为有效
+            if getattr(response, "usage_metadata", None):
+                um = response.usage_metadata
+                if (getattr(um, "candidates_token_count", 0) or 0) > 0: return True
     return False
 class ToolCallIndexer:
     """一次流式响应内，为 tool_calls 分配稳定递增的 index（P0-3）。
