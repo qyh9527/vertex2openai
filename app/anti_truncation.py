@@ -837,7 +837,7 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
         args = getattr(fc, "args", None)
 
         # ① 合成工具（首片带名字；后续无名分片见 ③）
-        if tool_name and name == tool_name:
+        if tool_name and is_synthetic_part(part, tool_name):
             cs.synthetic_seen = True
             cs.mode = "synthetic"
             changed = True
