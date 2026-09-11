@@ -533,7 +533,11 @@
         <div class="text-sm font-semibold mb-3">防截断（Anti-Truncation）</div>
         <div class="space-y-3">
           <div class="flex items-center justify-between"><span class="text-sm">启用字段名<span class="helpq" onclick="hlp(this,'h_ant')">?</span></span><input id="anti_truncation_field" type="text" class="inp" style="width:190px"></div>
-          <div id="h_ant" class="helpbox"><b>是什么</b>：重提示词场景（酒馆复杂预设/角色卡/超长历史）下模型回答经常被 <code>max_output_tokens</code> 提前截断、丢尾巴坏格式。开启后，代理给请求注入一个请求级唯一的<b>合成传输工具</b>（<code>v2o_emit_&lt;随机数&gt;</code>），指示模型把<b>最终可见回答放进该工具调用的 content 参数输出</b>（Function Call 通道），从而绕开普通文本生成通道的截断；代理收到响应后<b>解构还原为标准 assistant.content</b>，对客户端完全透明，真实工具调用原样保留。<br><br><b>怎么用</b>：下游请求体加「启用字段名」字段（默认 <code>anti_truncation</code>）置 <code>true</code>，即对该请求启用；不启用时完全不影响。字段名可改成客户端不冲突的名字。<br><br><b>注意事项</b>：仅对文本/Chat 模型生效（生图/音频等自动忽略）；需要模型支持工具调用；与 <code>tool_choice=none</code> 冲突时以 <code>auto</code> 覆盖（否则合成工具不会被调用、防截断失效）；回答以工具参数整体输出、首字比普通流式略慢；不同模型对"工具输出"的截断保护效果不同，若发现仍被截断可配合调大「默认输出上限」。</div>
+          <div class="flex items-center justify-between"><span class="text-sm">真流式增量下发<span class="helpq" onclick="hlp(this,'h_ant_inc')">?</span></span><input id="anti_truncation_partial_args" type="checkbox" class="chk"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">真流式缓冲阈值（字节）<span class="helpq" onclick="hlp(this,'h_ant_buf')">?</span></span><input id="anti_truncation_side_buffer_bytes" type="number" min="0" class="inp" style="width:190px"></div>
+          <div id="h_ant_inc" class="helpbox">开启后，代理请求上游把工具参数<b>分片</b>返回（<code>stream_function_call_arguments</code>），合成正文因此可以<b>逐片实时输出</b>——开防截断的真流式不再"憋到最后一次性刷全文"。关掉则退回整段下发（功能不变，只是首字延迟变差）。上游若不支持该字段，代理会<b>自动降级</b>并打一行告警，无需手工关。</div>
+          <div id="h_ant_buf" class="helpbox"><b>0（默认）= 完全直通</b>：普通正文立刻下发，首字延迟最低；代价是模型若先吐一段普通文本再调用合成工具，客户端会看到"前置文本 + 合成正文"两段并存。<br><b>大于 0</b>：先把普通文本扣住，攒够该字节数即整批放行并<b>永久转为直通</b>；若期间命中合成调用则丢弃缓冲（正文以合成 content 为准，单来源原则），全程未命中则流末放行兜底（正文不丢）。合成正文本身从不进缓冲，始终实时下发。</div>
+          <div id="h_ant" class="helpbox"><b>是什么</b>：重提示词场景（酒馆复杂预设/角色卡/超长历史）下模型回答经常被 <code>max_output_tokens</code> 提前截断、丢尾巴坏格式。开启后，代理给请求注入一个请求级唯一的<b>合成传输工具</b>（<code>v2o_emit_&lt;随机数&gt;</code>），指示模型把<b>最终可见回答放进该工具调用的 content 参数输出</b>（Function Call 通道），从而绕开普通文本生成通道的截断；代理收到响应后<b>解构还原为标准 assistant.content</b>，对客户端完全透明，真实工具调用原样保留。<br><br><b>怎么用</b>：下游请求体加「启用字段名」字段（默认 <code>anti_truncation</code>）置 <code>true</code>，即对该请求启用；不启用时完全不影响。字段名可改成客户端不冲突的名字。<br><br><b>注意事项</b>：仅对文本/Chat 模型生效（生图/音频等自动忽略）；需要模型支持工具调用；与 <code>tool_choice=none</code> 冲突时以 <code>auto</code> 覆盖（否则合成工具不会被调用、防截断失效）；回答以工具参数输出（已开启「真流式增量下发」时仍是逐片实时输出，首字与普通流式接近）；不同模型对"工具输出"的截断保护效果不同，若发现仍被截断可配合调大「默认输出上限」。</div>
         </div>
       </div>
 
@@ -1247,8 +1251,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','anti_truncation_side_buffer_bytes','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','anti_truncation_partial_args'].forEach(k=>setV(k,s[k]));
     const legacyTop=['fake_stream_only','non_vertex_only'].includes(s.top_input_injection_mode);
     if(legacyTop) setV('top_input_injection_mode','always');
     const randomValue=String(s.top_input_injection_random??'off').trim().toLowerCase();
@@ -1470,6 +1474,8 @@ async function saveSettings(){
     client_reuse:$('client_reuse').checked,
     client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
     anti_truncation_field:($('anti_truncation_field').value||'').trim() || 'anti_truncation',
+    anti_truncation_partial_args:$('anti_truncation_partial_args').checked,
+    anti_truncation_side_buffer_bytes:numOr('anti_truncation_side_buffer_bytes',0),
     input_relay_mode:$('input_relay_mode').value,
     input_relay_tag:($('input_relay_tag').value||'').trim(),
     input_relay_placeholder:$('input_relay_placeholder').value||'',

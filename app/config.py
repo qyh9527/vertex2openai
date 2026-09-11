@@ -104,6 +104,17 @@ DEFAULT_SETTINGS = {
     # 请求体带该字段且为 true 即对本请求启用防截断包装（模型回答改走合成工具参数输出，
     # 绕开重提示词场景下的截断）。字段名可自定义以兼容不同客户端/避免撞名。
     "anti_truncation_field": "anti_truncation",
+    # anti_truncation_partial_args：真流式增量参数下发（stream_function_call_arguments）。
+    # 开（默认）= 请求上游把 functionCall 参数按片返回，合成正文逐片实时输出（真·逐字流式）；
+    # 关 = 参数一次给全，正文等整段生成完一次性刷出（首字延迟差）。上游不支持该字段时
+    # 进程内自动降级为整段下发并打告警，无需手工关。
+    "anti_truncation_partial_args": True,
+    # anti_truncation_side_buffer_bytes：真流式 side-buffer 字节阈值（对齐 1.0.9 的取舍）。
+    # 0（默认）= 完全直通，普通正文立刻下发，首字延迟最低；代价是模型若先吐一段普通文本
+    #            再调合成工具，客户端会看到"前置文本 + 合成正文"两段并存。
+    # >0 = 先把普通文本扣住，攒够该字节数即整批放行并永久转直通；命中合成调用则丢弃缓冲
+    #      （单来源原则），全程未命中则流末 flush 兜底（正文不丢）。
+    "anti_truncation_side_buffer_bytes": 0,
     # ===== 第三通道：服务账号（Vertex SA，标准 Vertex AI 认证）=====
     # 混合自动的可配置行为（hybrid 策略下生效）：
     #   hybrid_channels          参与混合自动的通道及优先级顺序（有序列表，只取存在的通道键）

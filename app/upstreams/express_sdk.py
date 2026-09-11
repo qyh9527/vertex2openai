@@ -31,7 +31,9 @@ from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
-from anti_truncation import is_enabled_for_request, inject_request, get_enabled_field
+from anti_truncation import (is_enabled_for_request, inject_request, get_enabled_field,
+                            enable_stream_partial_args, partial_args_enabled,
+                            partial_args_supported)
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -529,6 +531,18 @@ class ExpressSDKUpstream(BaseUpstream):
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
+        # 3.33 真流式增量参数下发：请求上游把 functionCall 参数按片返回
+        # （FunctionCall.partial_args），合成工具的正文于是可以边收边吐，
+        # 而不是等整段生成完一次性刷出来。仅真流式有意义（假流式本就是整段拿到后重放）。
+        # 上游若不认这个字段，note_partial_args_unsupported 会在本进程内自动降级回整段下发。
+        partial_args_on = False
+        if synthetic_tool_name and request_obj.stream and not is_fake and not is_image_model:
+            if partial_args_enabled():
+                partial_args_on = enable_stream_partial_args(gen_config_dict)
+                if partial_args_on:
+                    print(f"⚡ [防截断] 已启用真流式增量参数下发（stream_function_call_arguments），"
+                          f"合成正文将逐片实时输出（{channel_display_name(self.channel_name)} 通道）。")
+
         _tools_disabled = isinstance(request_obj.tool_choice, str) and request_obj.tool_choice.lower() == "none"
         if is_grounded_search and not _tools_disabled:
             search_tool = {"google_search": {}}
@@ -570,6 +584,8 @@ class ExpressSDKUpstream(BaseUpstream):
             _shape.append(f"response_mime_type={gen_config_dict.get('response_mime_type') or '无'}")
             if synthetic_tool_name:
                 _shape.append(f"防截断合成工具={synthetic_tool_name}")
+                _shape.append(f"增量参数下发={'开' if partial_args_on else '关'}"
+                              f"{'（上游已降级）' if not partial_args_supported() else ''}")
             _shape.append(f"预填充={'有（' + str(len(prefill_text)) + ' 字）' if prefill_text else '无'}")
             _shape.append(f"请求消息数={len(request_obj.messages)}（末条 role={request_obj.messages[-1].role if request_obj.messages else '无'}）")
             print(f"🔎 [出站调试] {channel_display_name(self.channel_name)} 请求形状：{'；'.join(_shape)}")

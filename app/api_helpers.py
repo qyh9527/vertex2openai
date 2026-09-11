@@ -41,6 +41,10 @@ from anti_truncation import (
     has_synthetic_tool_call,
     strip_synthetic_from_openai_dict,
     strip_synthetic_from_stream_chunk,
+    StreamPartialState,
+    transform_stream_chunk,
+    note_partial_args_unsupported,
+    SETTING_SIDE_BUFFER,
 )
 from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 
@@ -701,13 +705,22 @@ async def execute_gemini_call(
                 has_yielded = False    # 是否已向客户端输出过正文/工具调用（重试与故障转移的唯一判断依据）
                 prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
                 synthetic_seen = False            # 防截断：本次流式是否出现过合成工具调用（流末用于"未生效"提示）
-                synthetic_empty_warned = False    # 防截断：空 content 只告警一次，避免刷屏
-                # 防截断 side-buffer（参考 Antigravity-gateway stream.go）：合成工具出现之前的
-                # 普通文本 delta 先进旁路缓冲不直接透传——一旦命中合成调用即丢弃缓冲
-                # （单来源原则：避免客户端看到"普通文本 + 合成正文"两段并存）；
-                # 全程未命中合成调用则流末把缓冲 flush 出去当兜底（防截断未生效时正文不丢）。
+                # 防截断 side-buffer（对齐 Antigravity-gateway 1.0.9）：阈值 0 = 完全直通不缓冲，
+                # 正文立刻下发（首字延迟最低，代价是模型若先吐普通文本再调合成工具，客户端会看到两段）；
+                # >0 = 攒到该字节数即整批放行并永久转直通（保留"命中合成即丢弃/流末 flush"语义）。
+                # 注：合成正文本身从不进 side-buffer，它是直接下发的。
+                try:
+                    side_buffer_bytes = int(app_state.get_setting(
+                        SETTING_SIDE_BUFFER,
+                        app_config.DEFAULT_SETTINGS.get(SETTING_SIDE_BUFFER, 0)) or 0)
+                except (TypeError, ValueError):
+                    side_buffer_bytes = 0
+                side_buffering = bool(synthetic_tool_name) and side_buffer_bytes > 0
                 side_buffer: list = []
                 side_emitted = False               # 缓冲已 flush（防重复输出）
+                # 真流式增量参数状态机（3.33）：合成正文逐片实时下发，
+                # 真实工具调用的分片参数累积完成后按原样一次性交给转换管线。
+                partial_state = StreamPartialState(synthetic_tool_name) if synthetic_tool_name else None
                 input_relay_stripper = (
                     RelayBlockStreamStripper(input_relay_strip_tag)
                     if input_relay_strip_tag else None
@@ -751,34 +764,36 @@ async def execute_gemini_call(
                                     continue
 
                             # 防截断：剥离合成工具 part，把 content 作为正文 delta 直接输出。
+                            # 上游开了增量参数下发时，合成工具的 $.content 是**分片**到达的，
+                            # 这里逐片即时下发（真·逐字流式）；分片形状见 anti_truncation.StreamPartialState。
                             # 合成调用不进入 ToolCallIndexer，finish_reason 判定只反映真实工具；
                             # 输出过合成正文即置 has_yielded（后续重试/故障转移以此为出流依据）。
-                            if synthetic_tool_name:
+                            if partial_state is not None:
                                 _orig_chunk = chunk_item_call
-                                chunk_item_call, _syn_contents = strip_synthetic_from_stream_chunk(
-                                    chunk_item_call, 0, synthetic_tool_name)
-                                # 返回 None（全合成 part）或新副本（混有真实 part）= 本 chunk 含合成调用；
-                                # 原样返回同一对象 = 本 chunk 无合成 part。
-                                if chunk_item_call is None or chunk_item_call is not _orig_chunk:
-                                    synthetic_seen = True
+                                chunk_item_call, _syn_contents = transform_stream_chunk(
+                                    chunk_item_call, 0, partial_state)
+                                synthetic_seen = partial_state.synthetic_seen
+                                if _syn_contents:
                                     if side_buffer and not side_emitted:
                                         # 命中合成调用：丢弃此前缓冲的普通文本（单来源原则）
                                         print(f"⚠️ [防截断] 模型在调用合成工具前输出了 {sum(len(s) for s in side_buffer)} "
                                               "字普通文本，已丢弃（正文以合成 content 为准）。")
                                         side_buffer = []
-                                    if not _syn_contents and not synthetic_empty_warned:
-                                        synthetic_empty_warned = True
-                                        print("⚠️ [防截断] 流式出现合成工具调用但 content 为空，"
-                                              "已剥离该部分（正文以真实输出为准）。")
-                                if _syn_contents:
                                     has_yielded = True
                                     for _sc in _syn_contents:
                                         _syn_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
                                         yield f"data: {json.dumps(_syn_payload, ensure_ascii=False)}\n\n"
                                 if chunk_item_call is None:
-                                    # 合成正文已单独发出，但同块的 finish_reason 不能随 part 一起丢失。
-                                    chunk_item_call = _orig_chunk.model_copy(deep=True)
-                                    chunk_item_call.candidates[0].content.parts = []
+                                    # 本 chunk 的 parts 已被全部扣下/剥离：若它还带着 finish_reason /
+                                    # 安全评分这类块级信息，就不能整块丢掉，用空 parts 的副本继续往下走。
+                                    _cand0 = (_orig_chunk.candidates or [None])[0] if getattr(_orig_chunk, "candidates", None) else None
+                                    if _cand0 is None or not getattr(_cand0, "finish_reason", None):
+                                        continue
+                                    try:
+                                        chunk_item_call = _orig_chunk.model_copy(deep=True)
+                                        chunk_item_call.candidates[0].content.parts = []
+                                    except Exception:
+                                        continue
                             if chunk_item_call is None:
                                 continue
 
@@ -798,15 +813,23 @@ async def execute_gemini_call(
                                         sse_chunk, input_relay_stripper)
                                     if sse_chunk is None:
                                         continue  # 正文属于待判定/待剥离的标签块
-                                if synthetic_tool_name and not synthetic_seen and not side_emitted:
-                                    # 合成调用尚未出现：普通文本先入 side-buffer 不透传
-                                    #（命中合成即丢弃、流末未命中则 flush 兜底）
-                                    _sideheld = _try_buffer_side_text(sse_chunk, side_buffer)
-                                    if _sideheld is None:
-                                        continue      # 纯正文 chunk：已整条吞下
-                                    if _sideheld is not False:
-                                        sse_chunk = _sideheld  # 剥掉正文后的剩余信息照常透传
-                                    # False（非正文 chunk）原样透传
+                                if side_buffering and not synthetic_seen and not side_emitted:
+                                    # 缓冲已攒够阈值：整批放行并永久转直通（首字延迟优先，对齐上游 1.0.9）
+                                    if side_buffer and sum(len(s) for s in side_buffer) >= side_buffer_bytes:
+                                        side_emitted = True
+                                        for _sc in side_buffer:
+                                            _sb_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
+                                            yield f"data: {json.dumps(_sb_payload, ensure_ascii=False)}\n\n"
+                                        side_buffer = []
+                                    else:
+                                        # 合成调用尚未出现：普通文本先入 side-buffer 不透传
+                                        #（命中合成即丢弃、流末未命中则 flush 兜底）
+                                        _sideheld = _try_buffer_side_text(sse_chunk, side_buffer)
+                                        if _sideheld is None:
+                                            continue      # 纯正文 chunk：已整条吞下
+                                        if _sideheld is not False:
+                                            sse_chunk = _sideheld  # 剥掉正文后的剩余信息照常透传
+                                        # False（非正文 chunk）原样透传
                                 if synthetic_tool_name or input_relay_stripper is not None:
                                     # 输出过滤器仍可能攒着正文；结束块必须等所有尾部文本放行后再发。
                                     payload = json.loads(sse_chunk[len("data: "):])
@@ -820,10 +843,33 @@ async def execute_gemini_call(
                                         sse_chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                                 yield sse_chunk
 
+                        # 真流式增量参数：上游把调用拆成片但流结束时仍有未收尾的真实工具调用
+                        # （上游异常截流），把已累积的参数补成完整 part 发出去，避免整通调用丢失。
+                        if partial_state is not None:
+                            for _pc_idx, _pc_part in partial_state.flush_pending_real():
+                                try:
+                                    _tail_chunk = types.GenerateContentResponse(
+                                        candidates=[types.Candidate(
+                                            content=types.Content(role="model", parts=[_pc_part]))])
+                                    # 单候选构造：candidate_count>1 在 Gemini 3.x 已不支持，
+                                    # 索引按 0 交给转换管线（与 _pc_idx 一致时才是常见路径）。
+                                    _tail_sse = convert_chunk_to_openai(
+                                        _tail_chunk, request_obj.model, response_id_for_stream,
+                                        _pc_idx, indexer=tool_indexer)
+                                    has_yielded = True
+                                    yield _tail_sse
+                                except Exception as e_tail:
+                                    print(f"⚠️ [防截断] 未收尾的真实工具调用补发失败：{e_tail}")
+
                         # 防截断已启用但全程未出现合成工具调用：模型没走合成通道，本次防截断未生效
                         if synthetic_tool_name and not synthetic_seen:
                             print(f"⚠️ [防截断] 请求已启用防截断但全程未出现合成工具调用（{synthetic_tool_name}），"
                                   "本次未生效（如实透传普通输出）。")
+                        # 合成调用出现但一个字正文都没解出来：正文只能以普通输出为准
+                        elif (partial_state is not None and synthetic_seen
+                                and not partial_state.synthetic_content_seen):
+                            print("⚠️ [防截断] 流式出现合成工具调用但未解出任何 content，"
+                                  "已剥离该调用（正文以真实输出为准）。")
                         # 未命中合成调用：flush side-buffer 当兜底（正文不丢）
                         if synthetic_tool_name and not synthetic_seen and side_buffer and not side_emitted:
                             side_emitted = True
@@ -872,6 +918,9 @@ async def execute_gemini_call(
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
+                        # 上游若不认 stream_function_call_arguments（老模型/区域），
+                        # 本进程内自动降级为整段下发，后续请求不再带该字段（重启恢复）。
+                        note_partial_args_unsupported(e_stream_call)
                         if isinstance(e_stream_call, httpx.TransportError):
                             report_client_failure(current_client, kind="conn")
                         error_str = str(e_stream_call).lower()

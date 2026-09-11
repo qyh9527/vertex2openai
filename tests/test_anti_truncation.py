@@ -11,7 +11,9 @@ from anti_truncation import (
     generate_synthetic_tool_name, build_synthetic_tool, build_control_message,
     inject_request, is_enabled_for_request, extract_content_from_args,
     has_synthetic_tool_call, strip_synthetic_from_openai_dict, strip_synthetic_from_stream_chunk,
-    TOOL_PREFIX,
+    TOOL_PREFIX, SETTING_PARTIAL_ARGS,
+    enable_stream_partial_args, partial_args_enabled, partial_args_supported,
+    note_partial_args_unsupported,
 )
 from fastapi.responses import StreamingResponse
 from google.genai import types
@@ -138,8 +140,238 @@ class TestExtractContent:
         assert extract_content_from_args(deep) is None
 
     def test_non_string_content_rejected(self):
+        """顶层 content 不是字符串时不当作正文（数值/布尔/列表一律跳过）。"""
         assert extract_content_from_args({"content": 123}) is None
-        assert extract_content_from_args({"content": {"text": "x"}}) is None
+        assert extract_content_from_args({"content": True}) is None
+        assert extract_content_from_args({"content": ["a"]}) is None
+
+    def test_nested_content_under_object_value(self):
+        """content 的值被包成对象、正文在里面：递归兜底能找到（3.33 行为变化）。"""
+        assert extract_content_from_args({"content": {"text": "x"}}) == "x"
+
+    def test_alternative_content_keys(self):
+        """模型不按声明的 content 写、改用同义键：键名扩展后仍能提取（C）。"""
+        for key in ("text", "answer", "response", "result", "output", "message"):
+            assert extract_content_from_args({key: "同义键正文"}) == "同义键正文"
+
+    def test_structural_repair_unclosed_string(self):
+        """JSON 未闭合字符串：结构修复后仍能提取（C）。"""
+        assert extract_content_from_args('{"content": "半截正文') == "半截正文"
+
+    def test_structural_repair_trailing_comma_and_braces(self):
+        """尾逗号 / 缺右括号：结构修复补齐（C）。"""
+        assert extract_content_from_args('{"content": "补括号",') == "补括号"
+        assert extract_content_from_args('{"content": "缺右括号"') == "缺右括号"
+
+    def test_scan_fallback_on_broken_json(self):
+        """整体解析救不回来时，有界扫描直接取值（C）。"""
+        assert extract_content_from_args('{"a": [1,2} "content": "扫描到的正文"') == "扫描到的正文"
+
+    def test_size_cap_rejects_huge_args(self):
+        """畸形超大参数直接放弃提取，不吃内存（C）。"""
+        from anti_truncation import MAX_ARGS_BYTES
+        assert extract_content_from_args('{"content": "' + "a" * (MAX_ARGS_BYTES + 10)) is None
+
+
+class TestStreamPartialArgs:
+    """真流式增量参数下发（3.33，对齐 Antigravity-gateway 1.0.9）。
+
+    线上实测分片形状（Express / SA 两通道一致）：
+      首片   name/id/思考签名齐全、无参数（will_continue=True）
+      中间片 name 为空，partial_args=[(json_path, string_value, will_continue)]
+      结束片 partial_args=[(json_path, "", None)]
+      收尾片 空的 functionCall part，随后才是 finish_reason
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_partial_args_flag(self):
+        import anti_truncation
+        yield
+        anti_truncation._PARTIAL_ARGS_SUPPORTED = True
+
+    def _make_stream(self, stream_chunks):
+        req = OpenAIRequest(model="gemini-3.6-flash",
+                            messages=[{"role": "user", "content": "hi"}], stream=True)
+        client = FakeClient(stream_chunks=stream_chunks)
+        prompt = create_gemini_prompt(req.messages)
+        return client, req, prompt
+
+    async def _run(self, client, req, prompt, synthetic_tool_name):
+        from api_helpers import execute_gemini_call
+        resp = await execute_gemini_call(
+            client, "gemini-3.6-flash", lambda m: prompt, {}, req,
+            synthetic_tool_name=synthetic_tool_name)
+        return "".join([c async for c in resp.body_iterator])
+
+    def _content_pieces(self, sse_text):
+        out = []
+        for line in sse_text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            for choice in json.loads(payload).get("choices", []):
+                c = (choice.get("delta") or {}).get("content")
+                if c:
+                    out.append(c)
+        return out
+
+    @staticmethod
+    def _fc_part(name=None, partials=None, will_continue=None, args=None):
+        return types.Part(function_call=types.FunctionCall(
+            name=name, args=args, will_continue=will_continue, partial_args=partials))
+
+    @staticmethod
+    def _pa(path, value, will_continue=True):
+        return types.PartialArg(json_path=path, string_value=value, will_continue=will_continue)
+
+    @staticmethod
+    def _chunk(parts, finish=None):
+        return types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(parts=parts, role="model"), finish_reason=finish)])
+
+    async def test_synthetic_fragments_streamed_piece_by_piece(self):
+        """合成正文按分片逐条下发（真·逐字流式），工具名不泄漏。"""
+        syn = "v2o_emit_x"
+        chunks = [
+            self._chunk([self._fc_part(name=syn, will_continue=True)]),
+            self._chunk([self._fc_part(partials=[self._pa("$.content", "第一段")])]),
+            self._chunk([self._fc_part(partials=[self._pa("$.content", "第二段")])]),
+            self._chunk([self._fc_part(partials=[self._pa("$.content", "", None)])]),
+            self._chunk([self._fc_part()]),
+            self._chunk([], finish=types.FinishReason.STOP),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        pieces = self._content_pieces(body)
+        assert pieces == ["第一段", "第二段"]      # 分两次到达 = 增量生效
+        assert "v2o_emit" not in body
+
+    async def test_complete_args_ignored_after_fragments(self):
+        """同一调用既有分片又有完整参数时不重复输出（防重复正文）。"""
+        syn = "v2o_emit_x"
+        chunks = [
+            self._chunk([self._fc_part(name=syn, will_continue=True)]),
+            self._chunk([self._fc_part(partials=[self._pa("$.content", "分片正文")])]),
+            self._chunk([self._fc_part(name=syn, args={"content": "整段正文"})]),
+            self._chunk([], finish=types.FinishReason.STOP),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        assert self._content_pieces(body) == ["分片正文"]
+
+    async def test_complete_args_still_works_without_fragments(self):
+        """上游忽略增量开关、参数一次给全：走既有整段提取路径（降级兼容）。"""
+        syn = "v2o_emit_x"
+        chunks = [
+            self._chunk([self._fc_part(name=syn, args={"content": "整段正文"})]),
+            self._chunk([], finish=types.FinishReason.STOP),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        assert self._content_pieces(body) == ["整段正文"]
+
+    async def test_unknown_json_path_fail_open(self):
+        """认不出的 json_path 也照常吐出（宁可多吐，不能静默丢正文）。"""
+        syn = "v2o_emit_x"
+        chunks = [
+            self._chunk([self._fc_part(name=syn, will_continue=True)]),
+            self._chunk([self._fc_part(partials=[self._pa("$.answer", "正文来自其他键")])]),
+            self._chunk([], finish=types.FinishReason.STOP),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        assert self._content_pieces(body) == ["正文来自其他键"]
+
+    async def test_real_tool_call_fragments_reassembled(self):
+        """真实工具调用的分片参数累积成完整 arguments，签名/名称原样保留。"""
+        chunks = [
+            self._chunk([self._fc_part(name="get_weather", will_continue=True)]),
+            self._chunk([self._fc_part(partials=[self._pa("$.city", "北京")])]),
+            self._chunk([self._fc_part(partials=[self._pa("$.city", "", None)])]),
+            self._chunk([self._fc_part()]),
+            self._chunk([], finish=types.FinishReason.STOP),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, "v2o_emit_x")
+        calls = []
+        finish = None
+        for line in body.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            for choice in json.loads(payload).get("choices", []):
+                calls.extend((choice.get("delta") or {}).get("tool_calls") or [])
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "北京"}
+        assert finish == "tool_calls"
+
+    async def test_pending_real_call_flushed_at_stream_end(self):
+        """上游截流、真实调用没收尾：流末仍把已累积的参数补发出去（不整通丢失）。"""
+        chunks = [
+            self._chunk([self._fc_part(name="get_weather", will_continue=True)]),
+            self._chunk([self._fc_part(partials=[self._pa("$.city", "上海")])]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, "v2o_emit_x")
+        calls = [tc for line in body.splitlines() if line.startswith("data: ")
+                 for payload in [line[len("data: "):].strip()]
+                 if payload and payload != "[DONE]"
+                 for choice in json.loads(payload).get("choices", [])
+                 for tc in ((choice.get("delta") or {}).get("tool_calls") or [])]
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "上海"}
+
+
+class TestPartialArgsCapability:
+    """增量参数下发的开关与自动降级。"""
+
+    @pytest.fixture(autouse=True)
+    def _restore_flag(self):
+        import anti_truncation
+        yield
+        anti_truncation._PARTIAL_ARGS_SUPPORTED = True
+
+    def test_enable_is_idempotent_and_keeps_mode(self):
+        cfg = {"tool_config": {"function_calling_config": {
+            "mode": "ANY", "allowed_function_names": ["get_weather"]}}}
+        assert enable_stream_partial_args(cfg) is True
+        assert enable_stream_partial_args(cfg) is True
+        fcc = cfg["tool_config"]["function_calling_config"]
+        assert fcc["stream_function_call_arguments"] is True
+        assert fcc["mode"] == "ANY"                       # 不覆盖下游意图
+        assert fcc["allowed_function_names"] == ["get_weather"]
+
+    def test_enable_creates_tool_config_when_absent(self):
+        cfg = {}
+        assert enable_stream_partial_args(cfg) is True
+        assert cfg["tool_config"]["function_calling_config"]["mode"] == "AUTO"
+
+    def test_unsupported_error_degrades_process_wide(self):
+        import anti_truncation
+        assert partial_args_enabled() is True
+        assert note_partial_args_unsupported(
+            "400 INVALID_ARGUMENT: Unknown field streamFunctionCallArguments") is True
+        assert partial_args_supported() is False
+        assert partial_args_enabled() is False
+        # 再次命中不再重复告警（已降级）
+        assert note_partial_args_unsupported("partial_args not supported") is False
+
+    def test_unrelated_error_does_not_degrade(self):
+        assert note_partial_args_unsupported("429 RESOURCE_EXHAUSTED quota") is False
+        assert partial_args_supported() is True
+
+    def test_setting_off_disables(self):
+        assert partial_args_enabled({SETTING_PARTIAL_ARGS: False}) is False
+        assert partial_args_enabled({SETTING_PARTIAL_ARGS: "false"}) is False
+        assert partial_args_enabled({SETTING_PARTIAL_ARGS: True}) is True
 
 
 class TestStripOpenaiDict:
@@ -323,11 +555,23 @@ class TestPersistence:
 
 
 class TestStreamSideBuffer:
-    """真流式 side-buffer（参考 Antigravity-gateway stream.go）：
-    - 合成调用出现前的普通文本先入缓冲，命中合成调用即丢弃（单来源原则）；
-    - 全程未命中合成调用则流末 flush 兜底（防截断未生效时正文不丢）；
+    """真流式 side-buffer（对齐 Antigravity-gateway 1.0.9）：
+    - 默认阈值 0 = **完全直通**，正文立刻下发（首字延迟优先），前置文本照常可见；
+    - 阈值 >0：合成调用出现前的普通文本先入缓冲，命中合成调用即丢弃（单来源原则）、
+      攒够阈值即整批放行并永久转直通、流末未命中则 flush 兜底（正文不丢）；
     - 未启用防截断（无 synthetic_tool_name）时零行为变化，正文直接透传。
     """
+
+    @pytest.fixture(autouse=True)
+    def _restore_settings(self):
+        from runtime_state import app_state
+        yield
+        app_state.update_settings({"anti_truncation_side_buffer_bytes": 0,
+                                   "anti_truncation_partial_args": True})
+
+    def _set_side_buffer(self, value):
+        from runtime_state import app_state
+        app_state.update_settings({"anti_truncation_side_buffer_bytes": value})
 
     def _make_stream(self, stream_chunks):
         from api_helpers import execute_gemini_call
@@ -359,9 +603,26 @@ class TestStreamSideBuffer:
                     out.append(c)
         return "".join(out)
 
-    async def test_preamble_text_dropped_on_synthetic_hit(self):
-        """模型先吐几个字再调合成工具：普通文本必须被丢弃，只输出合成正文。"""
+    async def test_preamble_text_passthrough_by_default(self):
+        """默认 side-buffer=0（直通）：模型先吐的几个字照常下发，不吞正文、零额外延迟。"""
         syn = "v2o_emit_x"
+        chunks = [
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="开头几个字")], role="model"))]),
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(function_call=types.FunctionCall(
+                    name=syn, args={"content": "合成正文"}))], role="model"))]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        content = self._collect_content(body)
+        assert content == "开头几个字合成正文"
+        assert "v2o_emit" not in body  # 合成工具名绝不泄漏给下游
+
+    async def test_preamble_text_dropped_when_buffer_enabled(self):
+        """阈值 >0：先扣住普通文本，命中合成调用即丢弃，只输出合成正文（单来源原则）。"""
+        syn = "v2o_emit_x"
+        self._set_side_buffer(10000)
         chunks = [
             types.GenerateContentResponse(candidates=[types.Candidate(
                 content=types.Content(parts=[types.Part(text="开头几个字")], role="model"))]),
@@ -374,6 +635,22 @@ class TestStreamSideBuffer:
         content = self._collect_content(body)
         assert content == "合成正文"
         assert "开头几个字" not in content
+
+    async def test_side_buffer_threshold_flushes_and_goes_passthrough(self):
+        """攒够阈值即整批放行并永久转直通：后续正文不再被扣住（阈值档的延迟上限）。"""
+        syn = "v2o_emit_x"
+        self._set_side_buffer(3)
+        chunks = [
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="开头几个字")], role="model"))]),
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[types.Part(text="后续正文")], role="model"))]),
+            types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(parts=[]), finish_reason=types.FinishReason.STOP)]),
+        ]
+        client, req, prompt = self._make_stream(chunks)
+        body = await self._run(client, req, prompt, syn)
+        assert self._collect_content(body) == "开头几个字后续正文"
 
     async def test_buffer_flushed_when_no_synthetic_hit(self):
         """全程未命中合成调用：缓冲的普通文本流末完整 flush（防截断未生效正文不丢）。"""
