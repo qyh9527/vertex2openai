@@ -116,7 +116,7 @@ def test_no_credentials_anywhere_yields_empty():
 # ---------- 标签（只露掩码，绝不回显完整凭证）----------
 
 def test_labels_never_expose_full_credentials():
-    long_key = "AQ.Ab8RN6" + "x" * 40
+    long_key = "FAKE-KEY-FOR-TEST-000000000000000000000000000000000000"
     key_label = _label_key(long_key, 0)
     assert long_key not in key_label
     assert key_label.startswith("Key #1")
