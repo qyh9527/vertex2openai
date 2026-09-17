@@ -201,6 +201,30 @@
 
   <!-- Channel -->
   <section id="view-channel" class="hidden">
+    <!-- 渠道探活：独立模块，回答「这条凭证现在还能不能用」 -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <div class="lbl mb-0">渠道探活<span class="helpq" onclick="hlp(this,'h_probe')">?</span></div>
+        <span class="pill pill-accent" id="probe-status" style="text-transform:none">未探活</span>
+      </div>
+      <p class="text-xs text-neutral-500 leading-relaxed mb-3">对<b>每一条</b>凭证做两级检查：先本地结构校验（零消耗），再真发一次最小上游请求（<code>max_output_tokens=1</code>，只为确认「调得通」，不产生有效内容）。能查出本地查不出的问题：Cookie 过期、项目未开计费、Key 被吊销、Project ID 填错、区域没有该模型。</p>
+      <div id="h_probe" class="helpbox"><b>原理</b>：每条凭证单独探，结果逐条列出 ✅/❌、耗时与失败原因——多 Key / 多账号时能直接定位是哪一条坏了。<br><br>
+      <b>两级判定</b>：① 本地结构校验（毫秒级、零消耗）挡掉格式就不对的凭证，避免只拿到一句看不懂的上游报错；② 真实最小请求（每条凭证 1 次、<code>max_output_tokens=1</code>）确认凭证在线上确实可用。只有第②级能发现「本地合法但线上已失效」。<br><br>
+      <b>只读</b>：不写状态文件、不进 Client 复用池、不碰熔断计数、不计入请求统计；每条凭证用临时 Client，探完即关。<br><br>
+      <b>Cookie 通道</b>：走与正式请求逐字同构的 <code>batchGraphql</code> 请求体，并复用正式路径的错误归类——HTTP 200 里包着的 GraphQL 错误信封（Cookie 失效 / 项目未开计费）同样会被判为失败，不会因为状态码是 200 就误报通过。<br><br>
+      <b>模型选择</b>：探活只需要一个最小模型。留空 = 自动挑最快的一档（<code>flash-lite</code> 优先）；生图模型会被自动排除（探活不该真的生成一张图）。<br><br>
+      <b>限额</b>：一次探活的请求数 = 勾选通道下凭证条数之和，并发 4、单条 20s 超时（26s 硬兜底）。凭证多时请分批探。</div>
+      <div class="flex flex-wrap items-center gap-3 mb-3">
+        <div class="flex flex-wrap items-center gap-3 text-sm">
+          <label class="flex items-center gap-2"><input type="checkbox" class="probe-chan" value="express" checked><span>Express API Key</span></label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="probe-chan" value="cookie" checked><span>Cookie 直连</span></label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="probe-chan" value="vertex" checked><span>服务账号</span></label>
+        </div>
+        <select id="probe-model" class="inp" style="min-width:200px;max-width:240px"><option value="">探活模型：自动（最快的一档）</option></select>
+        <button class="btn px-4 py-2 text-sm" id="probe-run" onclick="runChannelProbe()">开始探活</button>
+      </div>
+      <div id="probe-result" class="space-y-2"></div>
+    </div>
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
         <div class="lbl mb-0">三种独立渠道接口</div>
@@ -988,6 +1012,78 @@ function parseCookies(str){
   if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
   return str;
 }
+/* ---- 渠道探活 ---- */
+/* 结果里带用户输入的凭证掩码与上游报错文本，一律 escapeHtml 后再进 innerHTML。 */
+function probeModelOptions(models){
+  const sel=$('probe-model'); if(!sel) return;
+  const text=(models||[]).filter(m=>!/image/i.test(m));
+  sel.innerHTML='<option value="">探活模型：自动（最快的一档）</option>'
+    +text.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+}
+function probeMs(ms){
+  if(ms==null) return '';
+  return ms<1000 ? ms+' ms' : (ms/1000).toFixed(1)+' s';
+}
+function renderProbeResult(d){
+  const box=$('probe-result'); if(!box) return;
+  box.innerHTML='';
+  const head=document.createElement('div');
+  head.className='text-xs text-neutral-500 leading-relaxed';
+  head.textContent=`探活模型 ${d.model||'—'}（${d.summary.ok}/${d.summary.total} 条通过，耗时 ${d.elapsed_sec}s）`
+    +(d.model_note?`　${d.model_note}`:'');
+  box.appendChild(head);
+  (d.channels||[]).forEach(ch=>{
+    const card=document.createElement('div');
+    card.className='border rounded-lg p-3 '+(ch.ok?'border-emerald-200 bg-emerald-50/40':'border-rose-200 bg-rose-50/40');
+    const title=document.createElement('div');
+    title.className='flex flex-wrap items-center gap-2 text-sm font-semibold mb-2';
+    title.innerHTML=`<span>${escapeHtml(ch.display)}</span>`
+      +`<span class="pill" style="text-transform:none">${escapeHtml(ch.message)}</span>`;
+    card.appendChild(title);
+    (ch.credentials||[]).forEach(c=>{
+      const row=document.createElement('div');
+      row.className='text-xs leading-relaxed mb-1.5 last:mb-0';
+      const icon=c.ok?'✅':'❌';
+      const stage=c.stage==='local'?'本地校验':'上游请求';
+      const parts=[`<b>${icon} ${escapeHtml(c.label)}</b>`,`<span class="text-neutral-400">[${stage}${c.latency_ms?' · '+probeMs(c.latency_ms):''}]</span>`];
+      /* 上游报错含换行提示，用 white-space:pre-wrap 保留分段 */
+      const body=document.createElement('span');
+      body.style.whiteSpace='pre-wrap';
+      body.className=c.ok?'text-emerald-700':'text-rose-700';
+      body.textContent=' '+c.message;
+      row.innerHTML=parts.join(' ');
+      row.appendChild(body);
+      card.appendChild(row);
+    });
+    if(!(ch.credentials||[]).length){
+      const empty=document.createElement('div');
+      empty.className='text-xs text-neutral-400';
+      empty.textContent='未配置凭证，未发起请求。';
+      card.appendChild(empty);
+    }
+    box.appendChild(card);
+  });
+}
+async function runChannelProbe(){
+  const btn=$('probe-run');
+  const channels=[...document.querySelectorAll('.probe-chan')].filter(e=>e.checked).map(e=>e.value);
+  if(!channels.length){ toast('请至少勾选一个通道'); return; }
+  const box=$('probe-result');
+  $('probe-status').textContent='探活中…';
+  btn.disabled=true; btn.textContent='探活中…';
+  box.innerHTML='<div class="text-xs text-neutral-400 py-2">正在逐条探测凭证，请稍候（凭证多时需要十几秒）…</div>';
+  try{
+    const r=await fetch('/api/channel-probe',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channels, model:$('probe-model').value||''})});
+    const d=await r.json();
+    if(!r.ok){ box.innerHTML=''; toast('❌ '+(d.error||'探活失败')); $('probe-status').textContent='探活失败'; return; }
+    renderProbeResult(d);
+    $('probe-status').textContent = d.summary.failed===0
+      ? `全部通过（${d.summary.ok}/${d.summary.total}）`
+      : `${d.summary.failed} 条异常 / 共 ${d.summary.total} 条`;
+  }catch(e){ box.innerHTML=''; toast('❌ 网络请求失败'); $('probe-status').textContent='探活失败'; }
+  finally{ btn.disabled=false; btn.textContent='开始探活'; }
+}
 function extractProject(pid){
   pid=(pid||'').trim();
   const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/);
@@ -1272,6 +1368,7 @@ async function loadParams(){
     OVERRIDES=c.overrides||{};
     $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
       + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
+    probeModelOptions(c.models||[]);
     renderCaps();
   }catch(e){}
 }

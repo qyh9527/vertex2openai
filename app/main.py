@@ -423,6 +423,21 @@ async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_
     return JSONResponse(content={"status": "success", "channel_strategy": strategy})
 
 
+class ChannelProbeBody(BaseModel):
+    channels: list[str] = []   # 空 = 探全部三通道
+    model: str = ""            # 空 = 自动挑一个最快的非生图模型
+
+
+@app.post("/api/channel-probe")
+async def channel_probe_api(body: ChannelProbeBody, _auth: bool = Depends(require_auth)):
+    """全渠道最小探活：逐条凭证做「本地结构校验 + 真实最小请求」。
+
+    只读操作：不写状态文件、不进 Client 复用池、不碰熔断计数、不计入请求统计。
+    """
+    from channel_probe import probe_all
+    return JSONResponse(content=await probe_all(body.channels, body.model))
+
+
 @app.get("/api/settings")
 async def get_settings_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=app_state.get_settings())

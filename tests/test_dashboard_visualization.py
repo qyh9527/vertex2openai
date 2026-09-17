@@ -49,6 +49,24 @@ def test_dashboard_error_categories_panel():
     assert "error-cat-list" in DASHBOARD_HTML
 
 
+def test_dashboard_channel_probe_card():
+    """渠道探活卡片：三通道勾选 + 探活模型下拉 + 开始探活，结果按通道逐条凭证渲染。"""
+    assert "渠道探活" in DASHBOARD_HTML
+    assert 'id="probe-result"' in DASHBOARD_HTML
+    assert 'id="probe-model"' in DASHBOARD_HTML
+    assert 'class="probe-chan" value="express"' in DASHBOARD_HTML
+    assert 'class="probe-chan" value="cookie"' in DASHBOARD_HTML
+    assert 'class="probe-chan" value="vertex"' in DASHBOARD_HTML
+    assert "async function runChannelProbe()" in DASHBOARD_HTML
+    assert "function renderProbeResult(d)" in DASHBOARD_HTML
+    assert "'/api/channel-probe'" in DASHBOARD_HTML
+    # 结果里含凭证掩码与上游报错文本，必须转义后再进 innerHTML
+    assert "escapeHtml(c.label)" in DASHBOARD_HTML
+    assert "body.textContent=' '+c.message" in DASHBOARD_HTML
+    # 上游报错的多行提示靠 pre-wrap 保留分段
+    assert "body.style.whiteSpace='pre-wrap'" in DASHBOARD_HTML
+
+
 def test_dashboard_top_injection_is_independent_from_input_relay():
     """顶部注入应只原样置顶方案，不能暗含输入模板或自动追加语义。"""
     assert "顶部方案正文（按原文注入，不解析宏）" in DASHBOARD_HTML
