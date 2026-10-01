@@ -68,5 +68,6 @@ class OpenAIRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     # 流式用量开关（OpenAI: {"include_usage": true}）
     stream_options: dict[str, Any] | None = None
+    compatibility_report: bool = False
 
     model_config = ConfigDict(extra='allow')

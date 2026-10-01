@@ -178,7 +178,7 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
         else:
             code = 500
     return code, msg
-def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
+def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     
     system_texts = []
@@ -328,7 +328,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             config["max_output_tokens"] = settings["default_max_tokens"]
 
     # 按模型家族剥离不支持的采样参数（例如 Gemini 3.x 弃用 temperature/top_p/top_k、不支持 candidate_count）
-    mc.sanitize_sampling(config, profile)
+    mc.sanitize_sampling(config, profile, reporter=reporter)
 
     if tools_list:
         config["tools"] = tools_list

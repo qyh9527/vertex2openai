@@ -62,6 +62,13 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **断连即停**：客户端断开后立即停止上游调用与重试。
 - **中文运行日志**：密钥轮询、上游调用、重试退避、权限报错、Token 统计等均为中文实时说明。
 
+## 参数兼容诊断（Express / Vertex SA）
+
+- `gemini-3.8-flash` 的 `temperature/top_p/top_k/candidate_count` 始终剥离，控制台「强制保留」不能覆盖硬限制；完整资源路径、`fake-` 和 `-search` 别名同样生效。
+- 跟随请求模式下，没有显式 `reasoning_effort` 且 `thinking_budget=0` 时，3.8 使用最低合法 `thinking_level=low`；显式 effort 优先，控制台强制/off 模式保持原契约。非零 budget 不猜测换算为 level。
+- 默认只输出一次脱敏字段摘要日志。单次请求加 `"compatibility_report": true`，可在响应的 `extra_content.vertex2openai.conversion_report` 查看路径、动作、原因及通道；非流式附在 message，流式附在唯一结束块的 delta，失败附在 error。报告不保存字段值，不改变签名、usage 尾块和 `[DONE]` 顺序。Cookie 本轮未接入该报告。
+- 新安装的内置目录包含 `gemini-3.8-flash`。已有 `STATE_DIR/models.json` 和自定义列表保持原样；升级后若列表没有 3.8，在控制台「编辑模型」添加即可。目录可发现不代表账号/区域已获得该型号权限。
+
 ## 快速开始（本地 Docker）
 
 部署本分支请使用 `qyh9527/vertex2openai`，不要克隆原作者仓库或拉取原作者镜像（不含本分支功能）：

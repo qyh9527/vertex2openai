@@ -183,6 +183,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "thinking_levels": levels,
             "default_level": default_level,
             "allowed_sampling": allowed,
+            "hard_disallowed_sampling": ({"temperature", "top_p", "top_k", "candidate_count"}
+                                         if name.split("/")[-1].removeprefix("fake-") == "gemini-3.8-flash" else set()),
             "sampling_advice": "deprecated" if temp_dep else "recommend_default",
             "supports_search": True,
             "requires_user_last_turn": True,
@@ -258,7 +260,7 @@ def _extra(request: Any, key: str) -> Any:
 
 
 def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
-                     prefill_active: bool = False) -> Dict[str, Any]:
+                     prefill_active: bool = False, reporter=None) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
     返回 {"mode": None} 或 {"mode":"level","level":..} 或 {"mode":"budget","budget":..}
@@ -299,6 +301,10 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     req_effort = None if ignore_client else _effort(request)
     req_budget = None if ignore_client else _extra(request, "thinking_budget")
     include_thoughts = not suppress
+    if reporter is not None and ignore_client:
+        for field in ("reasoning_effort", "thinking_budget"):
+            if _extra(request, field) is not None:
+                reporter.record(field, "omitted", "console_or_prefill_overrides_request")
 
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]
@@ -306,12 +312,21 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
             # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
             return {"mode": "level", "level": _clamp_level("minimal", levels),
                     "include_thoughts": False}
-        level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
+        zero_budget = req_budget == 0 and not isinstance(req_budget, bool)
+        if zero_budget and req_effort not in (*_LEVEL_ORDER, "off"):
+            req_effort = None
+        if reporter is not None and req_budget is not None:
+            reporter.record("thinking_budget", "normalized" if zero_budget and not req_effort else "unsupported",
+                            "zero_budget_mapped_to_lowest_supported_level" if zero_budget and not req_effort
+                            else "budget_not_directly_mappable_to_level")
+        level = req_effort or ("minimal" if zero_budget else None) or settings.get("thinking_g3_level") or prof.get("default_level", "high")
         level = str(level).lower()
         if level in ("off", "none"):
             level = "minimal"
         # 统一就近向下夹取：Pro 上选 minimal 得到 low，而不是被抬成 high
         level = _clamp_level(level, levels)
+        if reporter is not None and req_effort and level != req_effort:
+            reporter.record("reasoning_effort", "normalized", "clamped_to_supported_thinking_level")
         return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
     # budget（2.5）
@@ -376,16 +391,21 @@ def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> 
         if prof.get("family") == "g3":
             allowed.discard("candidate_count")
         prof["sampling_advice"] = "recommend_default"
+    allowed -= prof.get("hard_disallowed_sampling", set())
+    if prof.get("hard_disallowed_sampling"):
+        prof["sampling_advice"] = "deprecated"
     prof["allowed_sampling"] = allowed
     return prof
 
 
-def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any], reporter=None) -> Dict[str, Any]:
     """按档案剥离不支持的采样参数（防止未来 3.x 传弃用参数直接 400）。"""
     allowed = profile.get("allowed_sampling", set())
     for key in list(config.keys()):
         if key in SAMPLING_KEYS and key not in allowed:
             config.pop(key, None)
+            if reporter is not None:
+                reporter.record("generation_config." + key, "omitted", "target_model_disallows_sampling")
     return config
 
 
@@ -502,6 +522,7 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         "is_image": prof["is_image"],
         "thinking": thinking,
         "sampling": sorted(prof["allowed_sampling"]),
+        "hard_disallowed_sampling": sorted(prof.get("hard_disallowed_sampling", set())),
         "sampling_advice": prof.get("sampling_advice"),
         "image_aspect_ratios": sorted(prof.get("image_aspect_ratios", set())),
         "image_sizes": sorted(prof.get("image_sizes", set())),

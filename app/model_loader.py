@@ -22,6 +22,7 @@ _LOCAL_MODEL_FILE_CANDIDATES = [
 
 # 内置兜底模型列表：磁盘缓存与本地 vertexModels.json 都不可用时使用，保证 /v1/models 绝不返回空。
 _DEFAULT_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",

@@ -547,6 +547,7 @@ async def gemini_fake_stream_generator(
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
     input_relay_strip_tag: Optional[str] = None,
+    conversion_report=None,
 ):
     print(f"🌊 [假流式] 已开始通过 {channel_call_text(channel_name)} 调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -631,6 +632,8 @@ async def gemini_fake_stream_generator(
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
 
+        if conversion_report is not None:
+            conversion_report.inspect_response(raw_gemini_response)
         prompt_end = _classify_prompt_feedback(raw_gemini_response)
         if prompt_end and prompt_end.error_type:
             raise GenerationEndError(prompt_end)
@@ -730,6 +733,77 @@ def is_location_pin_failure(err: Any) -> bool:
 
 
 async def execute_gemini_call(
+    current_client: Any, model_to_call: str,
+    prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]],
+    gen_config_dict: Dict[str, Any], request_obj: OpenAIRequest,
+    is_auto_attempt: bool = False, fastapi_request: Optional[Any] = None,
+    prefill_text: str = "", fallback_model: Optional[str] = None,
+    fallback_client_factory: Optional[Callable[[], Any]] = None,
+    failover_mode: bool = False, force_fake_streaming: bool = False,
+    channel_name: Optional[str] = None, synthetic_tool_name: Optional[str] = None,
+    input_relay_strip_tag: Optional[str] = None, conversion_report=None,
+):
+    from conversion_report import ConversionReport
+
+    report = conversion_report if conversion_report is not None else ConversionReport(channel_name)
+    report.inspect_request(request_obj)
+    try:
+        response = await _execute_gemini_call(
+            current_client, model_to_call, prompt_func, gen_config_dict, request_obj,
+            is_auto_attempt=is_auto_attempt, fastapi_request=fastapi_request,
+            prefill_text=prefill_text, fallback_model=fallback_model,
+            fallback_client_factory=fallback_client_factory, failover_mode=failover_mode,
+            force_fake_streaming=force_fake_streaming, channel_name=channel_name,
+            synthetic_tool_name=synthetic_tool_name, input_relay_strip_tag=input_relay_strip_tag,
+            conversion_report=report)
+    except BaseException as error:
+        if request_obj.compatibility_report and isinstance(error, Exception):
+            error.conversion_report = report.to_list()
+        report.log()
+        raise
+    if isinstance(response, JSONResponse):
+        if request_obj.compatibility_report:
+            payload = json.loads(response.body)
+            if "error" in payload:
+                report.attach(payload["error"])
+            else:
+                for choice in payload.get("choices", []):
+                    report.attach(choice["message"])
+            response.body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            response.headers["content-length"] = str(len(response.body))
+        report.log()
+        return response
+    if isinstance(response, StreamingResponse):
+        iterator = response.body_iterator
+
+        async def reported_stream():
+            try:
+                async for line in iterator:
+                    text = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if request_obj.compatibility_report and text.startswith("data: {"):
+                        payload = json.loads(text[6:])
+                        if "error" in payload:
+                            report.attach(payload["error"])
+                        else:
+                            for choice in payload.get("choices", []):
+                                if choice.get("finish_reason"):
+                                    report.attach(choice.setdefault("delta", {}))
+                        line = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                    yield line
+            except Exception as error:
+                if request_obj.compatibility_report:
+                    error.conversion_report = report.to_list()
+                raise
+            finally:
+                report.log()
+
+        response.body_iterator = reported_stream()
+        return response
+    report.log()
+    return response
+
+
+async def _execute_gemini_call(
     current_client: Any,
     model_to_call: str,
     prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]],
@@ -745,6 +819,7 @@ async def execute_gemini_call(
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
     input_relay_strip_tag: Optional[str] = None,
+    conversion_report=None,
 ):
     fallback_client = None
 
@@ -786,6 +861,7 @@ async def execute_gemini_call(
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
                     channel_name=channel_name, synthetic_tool_name=synthetic_tool_name,
                     input_relay_strip_tag=input_relay_strip_tag,
+                    conversion_report=conversion_report,
                 ), wants_usage(request_obj)), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -820,7 +896,10 @@ async def execute_gemini_call(
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
+                report_checkpoint = conversion_report.checkpoint() if conversion_report is not None else None
                 for attempt in range(max_retries + 1):
+                    if conversion_report is not None:
+                        conversion_report.reset(report_checkpoint)
                     # 客户端断开则停止重试，避免无谓的上游调用
                     if await _client_gone():
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
@@ -853,6 +932,8 @@ async def execute_gemini_call(
                         prompt_feedback_terminal = False
 
                         async for chunk_item_call in stream_gen_obj:
+                            if conversion_report is not None:
+                                conversion_report.inspect_response(chunk_item_call)
                             raw_candidates = getattr(chunk_item_call, "candidates", None) or []
                             raw_feedback_end = _classify_prompt_feedback(chunk_item_call)
                             if raw_feedback_end and raw_feedback_end.error_type:
@@ -1212,6 +1293,8 @@ async def execute_gemini_call(
                     502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
             )
 
+        if conversion_report is not None:
+            conversion_report.inspect_response(response_obj_call)
         prompt_end = _classify_prompt_feedback(response_obj_call)
         if prompt_end and prompt_end.error_type:
             return _generation_end_error_response(GenerationEndError(prompt_end))

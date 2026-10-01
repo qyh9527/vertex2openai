@@ -82,6 +82,16 @@ def _explicit_exception_category(error):
     return _known_category(getattr(error, "category", None))
 
 
+def _attach_exception_report(response, error):
+    report = getattr(error, "conversion_report", None)
+    if report is not None:
+        payload = json.loads(response.body)
+        payload["error"].setdefault("extra_content", {}).setdefault("vertex2openai", {})["conversion_report"] = report
+        response.body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        response.headers["content-length"] = str(len(response.body))
+    return response
+
+
 def _explicit_exception_response(error, category):
     code = getattr(error, "code", None) or getattr(error, "status_code", None)
     if not isinstance(code, int) or not 400 <= code <= 599:
@@ -97,7 +107,7 @@ def _explicit_exception_response(error, category):
     finish_reason = getattr(error, "upstream_finish_reason", None)
     if finish_reason is not None:
         error_payload["upstream_finish_reason"] = finish_reason
-    return JSONResponse(status_code=code, content=payload)
+    return _attach_exception_report(JSONResponse(status_code=code, content=payload), error)
 
 
 def _channel_order(strategy: str) -> list:
@@ -396,7 +406,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 last_status, last_msg = 503, str(e)
                 continue
             # 无兜底通道：聚合所有尝试结果（P0-6），如实转成 OpenAI 错误响应
-            return _all_failed_response(attempts, last_status, last_msg)
+            return _attach_exception_report(_all_failed_response(attempts, last_status, last_msg), e)
         except Exception as e:
             explicit_category = _explicit_exception_category(e)
             if explicit_category is not None and not outcome_mod.category_switchable(
@@ -419,7 +429,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             if not remaining_channels(channels, idx):
                 attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
                                  "category": outcome_mod.classify_exception(e)})
-                return _all_failed_response(attempts, 503, str(e))
+                return _attach_exception_report(_all_failed_response(attempts, 503, str(e)), e)
             raise
 
     # 全部通道尝试完毕仍失败：聚合每个通道的具体错误（P0-6）
@@ -534,7 +544,9 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         breaker.report_failure(primary_channel)
         if not remaining:
             print(f"❌ [故障转移] {channel_display_name(primary_channel)} 通道未出流失败且无兜底通道（{str(e)[:120]}）。")
-            yield f"data: {json.dumps(create_openai_error_response(502, str(e)[:500], 'upstream_error'))}\n\n"
+            payload = _attach_exception_report(
+                JSONResponse(content=create_openai_error_response(502, str(e)[:500], 'upstream_error')), e)
+            yield f"data: {payload.body.decode('utf-8')}\n\n"
             yield "data: [DONE]\n\n"
             return
         print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式未出流失败（{str(e)[:120]}），"
@@ -571,7 +583,7 @@ async def _chat_completions_with_strategy(fastapi_request: Request, request: Ope
             return _explicit_exception_response(e, explicit_category)
         code, msg = extract_upstream_error(e)
         print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
-        return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
+        return _attach_exception_report(JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error")), e)
 
 
 @router.post("/v1/chat/completions")

@@ -29,6 +29,7 @@ from top_input_injection import (
 )
 from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
+from conversion_report import ConversionReport
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
 from anti_truncation import (is_enabled_for_request, inject_request, get_enabled_field,
@@ -212,13 +213,14 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
                            prefill_active: bool = False,
-                           channel_name: Optional[str] = None) -> dict | None:
+                           channel_name: Optional[str] = None, reporter=None) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
     if is_image_model:
         return None
 
     settings = app_state.get_effective_settings(base_model_name)
-    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
+    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active,
+                            reporter=reporter)
     if t.get("mode") is None:
         return None
 
@@ -524,10 +526,12 @@ class ExpressSDKUpstream(BaseUpstream):
             print(f"⛔ [防截断] 本次调用下游未启用（请求体无「{at_field}」字段或值非 true）→ "
                   "走普通文本生成，重提示词场景存在 max_output_tokens 截断风险。")
 
-        gen_config_dict = create_generation_config(request_obj)
+        report = ConversionReport(self.channel_name)
+        report.inspect_request(request_obj)
+        gen_config_dict = create_generation_config(request_obj, reporter=report)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
                                                  prefill_active=prefill_active,
-                                                 channel_name=self.channel_name)
+                                                 channel_name=self.channel_name, reporter=report)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
@@ -602,4 +606,5 @@ class ExpressSDKUpstream(BaseUpstream):
             channel_name=self.channel_name,
             synthetic_tool_name=synthetic_tool_name,
             input_relay_strip_tag=_relay_strip_tag,
+            conversion_report=report,
         )
