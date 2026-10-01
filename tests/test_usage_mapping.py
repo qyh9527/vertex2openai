@@ -50,7 +50,11 @@ def test_mapping_matches_across_channels(meta, prompt, completion, total, cached
                 "completion_tokens_details": {"reasoning_tokens": thoughts}}
     sdk = sdk_meta(meta)
     assert map_usage(sdk) == _map_usage(meta) == expected
-    response = types.GenerateContentResponse(usage_metadata=sdk)
+    response = types.GenerateContentResponse(
+        candidates=[types.Candidate(
+            content=types.Content(parts=[types.Part(text="ok")], role="model"),
+            finish_reason=types.FinishReason.STOP)],
+        usage_metadata=sdk)
     assert convert_to_openai_format(response, "gemini-3.6-flash")["usage"] == expected
     assert api_helpers._extract_usage(response) == (prompt, completion, total)
     assert api_helpers._extract_cached_tokens(response) == cached

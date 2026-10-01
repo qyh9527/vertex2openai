@@ -22,6 +22,7 @@ import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from config import VERTEX_REASONING_TAG
+from outcome import classify_generation_end, normalize_finish_reason, GenerationEndError
 
 from message_processing import (
     parse_gemini_response_for_reasoning_and_content,
@@ -387,6 +388,7 @@ class ToolCallIndexer:
         self._seen_tool_calls: set[int] = set()
         self._ordinary_parts: Dict[int, list] = {}
         self._part_order: Dict[int, list] = {}
+        self._terminal_candidates: set[int] = set()
 
     def next_index(self, candidate_index: int = 0) -> int:
         i = self._next.get(candidate_index, 0)
@@ -412,6 +414,15 @@ class ToolCallIndexer:
             list(self._part_order.get(candidate_index, [])),
         )
 
+    def terminal_candidates(self) -> frozenset[int]:
+        return frozenset(self._terminal_candidates)
+
+    def has_terminal_candidate(self, candidate_index: int = 0) -> bool:
+        return candidate_index in self._terminal_candidates
+
+    def mark_terminal(self, candidate_index: int) -> None:
+        self._terminal_candidates.add(candidate_index)
+
     def has_tool_calls(self, candidate_index: int = 0) -> bool:
         return candidate_index in self._seen_tool_calls
 def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
@@ -430,16 +441,19 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
     if hasattr(chunk, "candidates") and chunk.candidates and len(chunk.candidates) > candidate_index:
         candidate = chunk.candidates[candidate_index]
-        raw_gemini_finish_reason = getattr(candidate, "finish_reason", None)
-        if raw_gemini_finish_reason:
-            if hasattr(raw_gemini_finish_reason, "name"): raw_gemini_finish_reason_str = raw_gemini_finish_reason.name.upper()
-            else: raw_gemini_finish_reason_str = str(raw_gemini_finish_reason).upper()
-
-            if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
-            elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-            elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
-            elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
-
+        parts = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
+        has_tool_calls = any(getattr(part, "function_call", None) is not None for part in parts)
+        raw_reason = getattr(candidate, "finish_reason", None)
+        end = classify_generation_end(
+            raw_reason,
+            has_tool_calls=has_tool_calls or bool(indexer and indexer.has_tool_calls(candidate_index)),
+            is_final=False,
+        )
+        if end.failure_category and end.finish_reason is None:
+            raise GenerationEndError(end)
+        openai_finish_reason = end.finish_reason
+        if end.terminal and indexer:
+            indexer.mark_terminal(candidate_index)
         # Collect every parallel call and keep signatures on their exact tool-call
         # deltas. Message-level signatures cover ordinary/signature-only Parts.
         tool_call_deltas = []
@@ -497,12 +511,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     indexer.record_tool_call(candidate_index, tc_index)
                 tool_call_deltas.append(tc)
 
-        # Google often emits the functionCall in one chunk and a final STOP in a
-        # later empty chunk. Once this candidate has produced any tool call, the
-        # OpenAI finish reason for that turn must remain tool_calls.
-        if (openai_finish_reason == "stop" and indexer
-                and indexer.has_tool_calls(candidate_index)):
-            openai_finish_reason = "tool_calls"
+        # Keep the normalized shared result authoritative; tool state is included
+        # before classification, so no post-hoc STOP rewrite is needed.
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas
@@ -552,6 +562,18 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         if google_extra:
             delta_payload["extra_content"] = {"google": google_extra}
     
+    elif getattr(chunk, "prompt_feedback", None):
+        block_reason = getattr(chunk.prompt_feedback, "block_reason", None)
+        normalized_reason = normalize_finish_reason(block_reason)
+        if normalized_reason not in ("", "BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED"):
+            end = classify_generation_end(block_reason, is_final=False)
+            if end.failure_category and end.finish_reason is None:
+                raise GenerationEndError(end)
+            openai_finish_reason = end.finish_reason
+            if end.terminal and indexer:
+                indexer.mark_terminal(candidate_index)
+            delta_payload["content"] = ""
+
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
 

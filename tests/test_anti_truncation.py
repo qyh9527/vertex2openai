@@ -328,6 +328,14 @@ class TestStreamPartialArgs:
         assert len(calls) == 1
         assert calls[0]["function"]["name"] == "get_weather"
         assert json.loads(calls[0]["function"]["arguments"]) == {"city": "上海"}
+        errors = [json.loads(line[len("data: "):])["error"]
+                  for line in body.splitlines() if line.startswith("data: {")
+                  and '"error"' in line]
+        assert len(errors) == 1
+        assert errors[0]["category"] == "empty_or_protocol"
+        assert errors[0]["upstream_finish_reason"] == ""
+        assert body.count("data: [DONE]") == 1
+        assert '"finish_reason": "stop"' not in body
 
 
 class TestPartialArgsCapability:
@@ -692,7 +700,7 @@ class TestStreamSideBuffer:
             content=types.Content(parts=[types.Part(
                 function_call=types.FunctionCall(
                     name=tool_name, args={"content": "假流式下的完整回答"}))],
-            )
+                role="model"), finish_reason=types.FinishReason.STOP,
         )])
 
         class FakeModels:

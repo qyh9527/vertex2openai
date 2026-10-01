@@ -37,8 +37,16 @@ import model_capabilities as mc
 from runtime_state import app_state
 from usage_mapping import map_usage, with_usage_null
 from failover import UpstreamUnstartedError
+from outcome import (
+    CATEGORY_HTTP_STATUS,
+    GenerationEndError,
+    category_switchable,
+    classify_generation_end,
+    normalize_finish_reason,
+)
 from anti_truncation import (
     has_synthetic_tool_call,
+    is_synthetic_part,
     strip_synthetic_from_openai_dict,
     strip_synthetic_from_stream_chunk,
     StreamPartialState,
@@ -217,6 +225,67 @@ def _record_usage(resp: Any, model_name: str = "") -> dict:
         cache_note = f" | 缓存命中: {cached}" if cached else ""
         print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens{cache_note}")
     return usage
+
+
+def _candidate_has_real_tool_calls(candidate: Any, synthetic_tool_name: Optional[str] = None) -> bool:
+    content = getattr(candidate, "content", None)
+    parts = getattr(content, "parts", None) or []
+    return any(
+        getattr(part, "function_call", None) is not None
+        and not (synthetic_tool_name and is_synthetic_part(part, synthetic_tool_name))
+        for part in parts
+    )
+
+
+def _classify_sdk_candidate(
+    candidate: Any, *, synthetic_tool_name: Optional[str] = None,
+    prior_tool_calls: bool = False, is_final: bool = False,
+):
+    return classify_generation_end(
+        getattr(candidate, "finish_reason", None),
+        has_tool_calls=(prior_tool_calls or
+                        _candidate_has_real_tool_calls(candidate, synthetic_tool_name)),
+        is_final=is_final,
+    )
+
+
+def _classify_prompt_feedback(response: Any):
+    feedback = getattr(response, "prompt_feedback", None)
+    raw_reason = getattr(feedback, "block_reason", None) if feedback else None
+    normalized = normalize_finish_reason(raw_reason)
+    if normalized in ("", "UNSPECIFIED") or normalized.endswith("_UNSPECIFIED"):
+        return None
+    return classify_generation_end(normalized, is_final=True)
+
+
+def _generation_end_error_response(error: GenerationEndError) -> JSONResponse:
+    status = error.code or 502
+    payload = _generation_end_error_payload(error)
+    return JSONResponse(status_code=status, content=payload)
+
+
+def _generation_end_error_payload(error: GenerationEndError) -> dict:
+    status = error.code or 502
+    payload = create_openai_error_response(
+        status, str(error), error.error_type or "upstream_protocol_error")
+    detail = payload["error"]
+    detail["category"] = error.category
+    detail["upstream_finish_reason"] = error.upstream_finish_reason
+    return payload
+
+
+def _generation_error_sse(error: GenerationEndError) -> str:
+    return f"data: {json.dumps(_generation_end_error_payload(error), ensure_ascii=False)}\n\n"
+
+
+_generation_end_error_sse = _generation_error_sse
+
+
+def _is_generation_error_switchable(error: BaseException) -> bool:
+    category = getattr(error, "category", None)
+    if isinstance(category, str) and category in CATEGORY_HTTP_STATUS:
+        return category_switchable(category)
+    return is_retryable_exception(error)
 
 
 def wants_usage(request_obj: Any) -> bool:
@@ -561,10 +630,41 @@ async def gemini_fake_stream_generator(
 
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
-        
+
+        prompt_end = _classify_prompt_feedback(raw_gemini_response)
+        if prompt_end and prompt_end.error_type:
+            raise GenerationEndError(prompt_end)
+        if prompt_end and prompt_end.finish_reason and not (getattr(raw_gemini_response, "candidates", None) or []):
+            candidates = []
+        else:
+            candidates = getattr(raw_gemini_response, "candidates", None) or []
+        candidate_ends = [
+            _classify_sdk_candidate(candidate, synthetic_tool_name=synthetic_tool_name,
+                                    is_final=True)
+            for candidate in candidates
+        ]
+        for end in candidate_ends:
+            if end.error_type:
+                raise GenerationEndError(end)
+        if not candidates and getattr(raw_gemini_response, "text", None) is None:
+            if prompt_end and prompt_end.finish_reason:
+                candidate_ends = [prompt_end]
+            else:
+                raise GenerationEndError(classify_generation_end(None, is_final=True))
+        if prompt_end and prompt_end.finish_reason:
+            candidate_ends = [prompt_end] * max(1, len(candidate_ends))
+        if not candidates and getattr(raw_gemini_response, "text", None) is not None:
+            candidate_ends = [classify_generation_end("STOP", is_final=True)]
+
         _record_usage(raw_gemini_response, request_obj.model)
 
-        openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
+        openai_response_dict = convert_to_openai_format(
+            raw_gemini_response, request_obj.model,
+            synthetic_tool_name=synthetic_tool_name)
+        for index, end in enumerate(candidate_ends):
+            if end.finish_reason:
+                openai_response_dict["choices"][index]["finish_reason"] = end.finish_reason
+
         if synthetic_tool_name:
             if not has_synthetic_tool_call(openai_response_dict, synthetic_tool_name):
                 print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
@@ -575,19 +675,6 @@ async def gemini_fake_stream_generator(
             openai_response_dict = _strip_input_relay_from_openai_dict(
                 openai_response_dict, input_relay_strip_tag)
         _prepend_prefill(openai_response_dict, prefill_text)
-
-        if hasattr(raw_gemini_response, "prompt_feedback") and \
-           hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
-           raw_gemini_response.prompt_feedback.block_reason:
-            block_message = f"Response blocked by Gemini safety filter: {raw_gemini_response.prompt_feedback.block_reason}"
-            if hasattr(raw_gemini_response.prompt_feedback, "block_reason_message") and \
-               raw_gemini_response.prompt_feedback.block_reason_message:
-                block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
-            # 安全策略拦截属硬错误：立即舍弃复用 Client，下次请求重建连接池
-            report_client_failure(gemini_client_instance, kind="evict",
-                                  reason=f"安全策略拦截（{raw_gemini_response.prompt_feedback.block_reason}）")
-            raise ValueError(block_message)
-
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict,
             response_id_override=response_id,
@@ -605,6 +692,10 @@ async def gemini_fake_stream_generator(
         _sa_hint = sa_channel_hint(channel_name, str(e_outer_gemini))
         if _sa_hint:
             print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
+        if isinstance(e_outer_gemini, GenerationEndError):
+            yield _generation_end_error_sse(e_outer_gemini)
+            yield "data: [DONE]\n\n"
+            return
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
@@ -616,8 +707,9 @@ async def gemini_fake_stream_generator(
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
             yield "data: [DONE]\n\n"
-        if is_auto_attempt: raise
-            
+        if is_auto_attempt:
+            raise
+
 def is_location_pin_failure(err: Any) -> bool:
     """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
 
@@ -754,8 +846,36 @@ async def execute_gemini_call(
 
                         final_usage = map_usage()
                         pending_finishes = {}
+                        seen_candidate_indexes = set()
+                        candidate_tool_calls = set()
+                        terminal_finish_reasons = {}
+                        raw_terminal_candidate_indexes = set()
+                        prompt_feedback_terminal = False
 
                         async for chunk_item_call in stream_gen_obj:
+                            raw_candidates = getattr(chunk_item_call, "candidates", None) or []
+                            raw_feedback_end = _classify_prompt_feedback(chunk_item_call)
+                            if raw_feedback_end and raw_feedback_end.error_type:
+                                raise GenerationEndError(raw_feedback_end)
+                            if raw_feedback_end and raw_feedback_end.finish_reason:
+                                prompt_feedback_terminal = True
+                            if raw_candidates:
+                                for fallback_index, raw_candidate in enumerate(raw_candidates):
+                                    candidate_index = fallback_index
+                                    seen_candidate_indexes.add(candidate_index)
+                                    if _candidate_has_real_tool_calls(
+                                            raw_candidate, synthetic_tool_name):
+                                        candidate_tool_calls.add(candidate_index)
+                                    raw_finish_reason = getattr(raw_candidate, "finish_reason", None)
+                                    raw_end = classify_generation_end(
+                                        raw_finish_reason,
+                                        has_tool_calls=(candidate_index in candidate_tool_calls),
+                                    )
+                                    if raw_end.error_type:
+                                        raise GenerationEndError(raw_end)
+                                    if raw_end.terminal:
+                                        raw_terminal_candidate_indexes.add(candidate_index)
+                                        terminal_finish_reasons[candidate_index] = raw_end.finish_reason
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_usage = map_usage(chunk_item_call.usage_metadata)
                                 # 纯用量块不代表已向客户端输出正文；安全反馈仍交由转换器处理。
@@ -800,10 +920,16 @@ async def execute_gemini_call(
                             # 支持 n>1：按候选序号逐个输出
                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
                             for ci in range(num_candidates):
-                                has_yielded = True
                                 sse_chunk = convert_chunk_to_openai(
                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
                                     indexer=tool_indexer)
+                                sse_payload = json.loads(sse_chunk[len("data: "):])
+                                choice_payload = (sse_payload.get("choices") or [{}])[0]
+                                delta_payload = choice_payload.get("delta") or {}
+                                if (delta_payload.get("content") or delta_payload.get("reasoning_content")
+                                        or delta_payload.get("tool_calls") or delta_payload.get("extra_content")
+                                        or delta_payload.get("function_call")):
+                                    has_yielded = True
                                 if deduper is not None:
                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                     if sse_chunk is None:
@@ -843,14 +969,15 @@ async def execute_gemini_call(
                                         sse_chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                                 yield sse_chunk
 
-                        # 真流式增量参数：上游把调用拆成片但流结束时仍有未收尾的真实工具调用
+                        # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
                         # （上游异常截流），把已累积的参数补成完整 part 发出去，避免整通调用丢失。
                         if partial_state is not None:
                             for _pc_idx, _pc_part in partial_state.flush_pending_real():
                                 try:
                                     _tail_chunk = types.GenerateContentResponse(
                                         candidates=[types.Candidate(
-                                            content=types.Content(role="model", parts=[_pc_part]))])
+                                            content=types.Content(role="model", parts=[_pc_part]),
+                                        )])
                                     # 单候选构造：candidate_count>1 在 Gemini 3.x 已不支持，
                                     # 索引按 0 交给转换管线（与 _pc_idx 一致时才是常见路径）。
                                     _tail_sse = convert_chunk_to_openai(
@@ -858,6 +985,9 @@ async def execute_gemini_call(
                                         _pc_idx, indexer=tool_indexer)
                                     has_yielded = True
                                     yield _tail_sse
+                                    if (terminal_finish_reasons.get(_pc_idx) in ("stop", "tool_calls")
+                                            and _pc_idx in pending_finishes):
+                                        pending_finishes[_pc_idx]["choices"][0]["finish_reason"] = "tool_calls"
                                 except Exception as e_tail:
                                     print(f"⚠️ [防截断] 未收尾的真实工具调用补发失败：{e_tail}")
 
@@ -896,6 +1026,33 @@ async def execute_gemini_call(
                         for finish in pending_finishes.values():
                             yield f"data: {json.dumps(finish, ensure_ascii=False)}\n\n"
 
+                        terminal_candidate_indexes = tool_indexer.terminal_candidates()
+                        converted_terminal_candidates = terminal_candidate_indexes & seen_candidate_indexes
+                        candidates_missing_terminal = seen_candidate_indexes - converted_terminal_candidates
+                        if candidates_missing_terminal:
+                            candidate_index = min(candidates_missing_terminal)
+                            has_open_tool_calls = tool_indexer.has_tool_calls(candidate_index)
+                            missing_end = classify_generation_end(
+                                None, has_tool_calls=has_open_tool_calls, is_final=True)
+                            if has_yielded or prefill_sent:
+                                yield _generation_end_error_sse(GenerationEndError(missing_end))
+                                yield "data: [DONE]\n\n"
+                                return
+                            raise GenerationEndError(missing_end)
+                        if not seen_candidate_indexes and not prompt_feedback_terminal:
+                            missing_end = classify_generation_end(None, is_final=True)
+                            if has_yielded or prefill_sent:
+                                yield _generation_end_error_sse(GenerationEndError(missing_end))
+                                yield "data: [DONE]\n\n"
+                                return
+                            raise GenerationEndError(missing_end)
+                        if (not seen_candidate_indexes and raw_feedback_end is not None
+                                and raw_feedback_end.finish_reason is None):
+                            missing_end = classify_generation_end(None, is_final=True)
+                            yield _generation_end_error_sse(GenerationEndError(missing_end))
+                            yield "data: [DONE]\n\n"
+                            return
+
                         final_p_tk = final_usage["prompt_tokens"]
                         final_c_tk = final_usage["completion_tokens"]
                         final_t_tk = final_usage["total_tokens"]
@@ -918,6 +1075,10 @@ async def execute_gemini_call(
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
+                        if isinstance(e_stream_call, GenerationEndError):
+                            yield _generation_end_error_sse(e_stream_call)
+                            yield "data: [DONE]\n\n"
+                            return
                         # 上游若不认 stream_function_call_arguments（老模型/区域），
                         # 本进程内自动降级为整段下发，后续请求不再带该字段（重启恢复）。
                         note_partial_args_unsupported(e_stream_call)
@@ -1051,19 +1212,35 @@ async def execute_gemini_call(
                     502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
             )
 
-        if hasattr(response_obj_call, "prompt_feedback") and \
-           hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-           response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Agent Platform 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
-            if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
-               response_obj_call.prompt_feedback.block_reason_message:
-                block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
-            # 安全策略拦截属硬错误：立即舍弃复用 Client，下次请求重建连接池
-            report_client_failure(current_client, kind="evict",
-                                  reason=f"安全策略拦截（{response_obj_call.prompt_feedback.block_reason}）")
-            raise ValueError(block_msg)
+        prompt_end = _classify_prompt_feedback(response_obj_call)
+        if prompt_end and prompt_end.error_type:
+            return _generation_end_error_response(GenerationEndError(prompt_end))
+        if prompt_end and prompt_end.finish_reason and not (getattr(response_obj_call, "candidates", None) or []):
+            candidates = []
+        else:
+            candidates = getattr(response_obj_call, "candidates", None) or []
+        candidate_ends = [
+            _classify_sdk_candidate(candidate, synthetic_tool_name=synthetic_tool_name,
+                                    is_final=True)
+            for candidate in candidates
+        ]
+        if not candidates and getattr(response_obj_call, "text", None) is None:
+            if prompt_end and prompt_end.finish_reason:
+                candidate_ends = [prompt_end]
+            else:
+                return _generation_end_error_response(
+                    GenerationEndError(classify_generation_end(None, is_final=True)))
+        for end in candidate_ends:
+            if end.error_type:
+                return _generation_end_error_response(GenerationEndError(end))
+        if prompt_end and prompt_end.finish_reason:
+            candidate_ends = [prompt_end] * max(1, len(candidate_ends))
+        if not candidates and getattr(response_obj_call, "text", None) is not None:
+            candidate_ends = [classify_generation_end("STOP", is_final=True)]
 
-        if not is_gemini_response_valid(response_obj_call):
+        if not is_gemini_response_valid(response_obj_call) and not (
+                any(end.finish_reason == "content_filter" for end in candidate_ends)
+                or (prompt_end and prompt_end.finish_reason)):
             error_details = f"Agent Platform 非流式响应无有效内容，模型：{model_to_call}。"
             if hasattr(response_obj_call, "candidates"):
                 candidates = response_obj_call.candidates or []
@@ -1088,7 +1265,21 @@ async def execute_gemini_call(
 
         _record_usage(response_obj_call, request_obj.model)
 
-        openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
+        openai_response_content = convert_to_openai_format(
+            response_obj_call, request_obj.model,
+            synthetic_tool_name=synthetic_tool_name)
+        for index, end in enumerate(candidate_ends):
+            if end.finish_reason:
+                openai_response_content["choices"][index]["finish_reason"] = end.finish_reason
+        if prompt_end and prompt_end.finish_reason:
+            if not openai_response_content.get("choices"):
+                openai_response_content["choices"] = [{
+                    "index": 0, "message": {"role": "assistant", "content": None},
+                    "finish_reason": prompt_end.finish_reason,
+                }]
+            else:
+                for choice in openai_response_content["choices"]:
+                    choice["finish_reason"] = prompt_end.finish_reason
         if synthetic_tool_name:
             if not has_synthetic_tool_call(openai_response_content, synthetic_tool_name):
                 print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"

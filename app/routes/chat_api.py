@@ -44,6 +44,61 @@ CHANNEL_NAMES = {
 # 等价性回归见 tests/test_outcome.py（429/500/502/503/504 可切换，400/401/403 等如实报错）。
 SWITCHABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+KNOWN_FAILURE_CATEGORIES = {
+    outcome_mod.RATE_LIMITED, outcome_mod.TRANSIENT,
+    outcome_mod.AUTH_REFRESHABLE, outcome_mod.CREDENTIAL_PERMANENT,
+    outcome_mod.REQUEST_PERMANENT, outcome_mod.POLICY_BLOCKED,
+    outcome_mod.EMPTY_OR_PROTOCOL, outcome_mod.CLIENT_CLOSED, outcome_mod.OTHER,
+}
+
+
+def _known_category(value):
+    return value if isinstance(value, str) and value in KNOWN_FAILURE_CATEGORIES else None
+
+
+def _json_body(resp: JSONResponse):
+    try:
+        body = resp.body
+        if isinstance(body, bytes):
+            return json.loads(body.decode("utf-8", errors="replace"))
+        return json.loads(body)
+    except Exception:
+        return {}
+
+
+def _json_response_category(resp: JSONResponse):
+    data = _json_body(resp)
+    error = data.get("error")
+    category = _known_category(error.get("category")) if isinstance(error, dict) else None
+    if category is not None:
+        return category
+    for choice in data.get("choices") or []:
+        if isinstance(choice, dict) and choice.get("finish_reason") == "content_filter":
+            return outcome_mod.POLICY_BLOCKED
+    return None
+
+
+def _explicit_exception_category(error):
+    return _known_category(getattr(error, "category", None))
+
+
+def _explicit_exception_response(error, category):
+    code = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if not isinstance(code, int) or not 400 <= code <= 599:
+        code = outcome_mod.CATEGORY_HTTP_STATUS.get(category, 502)
+    error_type = getattr(error, "error_type", None) or {
+        outcome_mod.CREDENTIAL_PERMANENT: "upstream_account_disabled",
+        outcome_mod.EMPTY_OR_PROTOCOL: "upstream_protocol_error",
+    }.get(category, "upstream_error")
+    payload = create_openai_error_response(code, str(error), error_type)
+    error_payload = payload["error"]
+    error_payload["error_type"] = error_type
+    error_payload["category"] = category
+    finish_reason = getattr(error, "upstream_finish_reason", None)
+    if finish_reason is not None:
+        error_payload["upstream_finish_reason"] = finish_reason
+    return JSONResponse(status_code=code, content=payload)
+
 
 def _channel_order(strategy: str) -> list:
     """按策略返回通道尝试顺序：
@@ -101,6 +156,9 @@ def _switchable_json(resp: JSONResponse) -> bool:
     经统一失败语义分类判定（outcome.status_switchable），等价于既有
     SWITCHABLE_STATUS_CODES 白名单。
     """
+    explicit_category = _json_response_category(resp)
+    if explicit_category is not None:
+        return outcome_mod.category_switchable(explicit_category)
     return outcome_mod.status_switchable(resp.status_code)
 
 
@@ -156,6 +214,42 @@ def _extract_stream_message(chunk: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _sse_payload(chunk):
+    if not isinstance(chunk, str) or not chunk.startswith("data:"):
+        return None
+    payload = chunk[len("data:"):].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        return json.loads(payload)
+    except Exception:
+        return None
+
+
+def _sse_done(chunk):
+    return isinstance(chunk, str) and chunk.startswith("data:") \
+        and chunk[len("data:"):].strip() == "[DONE]"
+
+
+def _sse_error_event(chunk):
+    data = _sse_payload(chunk)
+    return isinstance(data, dict) and isinstance(data.get("error"), dict)
+
+
+def _sse_terminal_category(chunk):
+    data = _sse_payload(chunk)
+    error = data.get("error") if isinstance(data, dict) else None
+    return _known_category(error.get("category")) if isinstance(error, dict) else None
+
+
+def _sse_content_filter(chunk):
+    data = _sse_payload(chunk)
+    if not isinstance(data, dict):
+        return False
+    return any(isinstance(choice, dict) and choice.get("finish_reason") == "content_filter"
+               for choice in data.get("choices") or [])
 
 
 def _chunk_has_effective_output(chunk: str) -> bool:
@@ -235,43 +329,58 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 return resp
 
             # 非流式 JSONResponse
-            if isinstance(resp, JSONResponse) and failover_mode and _switchable_json(resp):
-                # P0-6：可切换错误无论是否还有兜底通道，都记录失败摘要
-                #（最后一个通道返回 429/5xx 时不再"原样返回"当作普通结果——
-                # 前序通道的失败原因会丢，客户端只会看到最后一个错误）。
-                _summary = _summarize_json_error(resp)
-                _cat = outcome_mod.classify_failure(resp.status_code, _summary)
-                # P0-2：429 类带 Retry-After 语义的按精确窗口冷却候选（解析不出走通用计数）
-                if _cat == outcome_mod.RATE_LIMITED:
-                    breaker.report_rate_limited(channel, credential_id=cred or None,
-                                                message=_summary)
-                else:
-                    breaker.report_failure(channel, credential_id=cred or None)
-                attempts.append({"channel": channel, "status": resp.status_code,
-                                 "message": _summary, "category": _cat,
-                                 "upstream": True})
-                if remaining_channels(channels, idx):
-                    print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
-                          f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
-                    last_status, last_msg = resp.status_code, attempts[-1]["message"]
-                    continue
-                # 无兜底通道：聚合返回（含本通道与所有前序通道的错误）
-                return _all_failed_response(attempts, resp.status_code, "")
+            if isinstance(resp, JSONResponse):
+                _explicit_category = _json_response_category(resp)
+                if _explicit_category is not None and resp.status_code >= 400 \
+                        and not outcome_mod.category_switchable(_explicit_category):
+                    # 明确的永久 generation 失败不能误按 502 切换，也不计作连接故障。
+                    attempts.append({"channel": channel, "status": resp.status_code,
+                                     "message": _summarize_json_error(resp),
+                                     "category": _explicit_category, "upstream": True})
+                    return resp
+                if failover_mode and _switchable_json(resp):
+                    _summary = _summarize_json_error(resp)
+                    _cat = _explicit_category or outcome_mod.classify_failure(
+                        resp.status_code, _summary)
+                    # P0-2：429 类带 Retry-After 语义的按精确窗口冷却候选（解析不出走通用计数）
+                    if _cat == outcome_mod.RATE_LIMITED:
+                        breaker.report_rate_limited(channel, credential_id=cred or None,
+                                                    message=_summary)
+                    else:
+                        breaker.report_failure(channel, credential_id=cred or None)
+                    attempts.append({"channel": channel, "status": resp.status_code,
+                                     "message": _summary, "category": _cat,
+                                     "upstream": True})
+                    if remaining_channels(channels, idx):
+                        print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
+                              f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
+                        last_status, last_msg = resp.status_code, attempts[-1]["message"]
+                        continue
+                    # 无兜底通道：聚合返回（含本通道与所有前序通道的错误）
+                    return _all_failed_response(attempts, resp.status_code, "")
 
-            # 不可切换错误（400/401/403 等）如实返回；也记入 attempts 供日志聚合
-            if isinstance(resp, JSONResponse) and resp.status_code >= 400:
-                _summary = _summarize_json_error(resp)
-                attempts.append({"channel": channel, "status": resp.status_code,
-                                 "message": _summary,
-                                 "category": outcome_mod.classify_failure(
-                                     resp.status_code, _summary),
-                                 "upstream": True})
+                # 不可切换错误（400/401/403 等）如实返回；也记入 attempts 供日志聚合
+                if resp.status_code >= 400:
+                    _summary = _summarize_json_error(resp)
+                    attempts.append({"channel": channel, "status": resp.status_code,
+                                     "message": _summary,
+                                     "category": (_explicit_category or outcome_mod.classify_failure(
+                                         resp.status_code, _summary)),
+                                     "upstream": True})
+                if _explicit_category is not None:
+                    return resp   # 显式终止/过滤结果不清除连接健康计数
+
             breaker.report_success(channel)
             if cred:
                 breaker.report_success((channel, cred))
             return resp
 
         except UpstreamUnstartedError as e:
+            _explicit_category = _explicit_exception_category(e)
+            if _explicit_category is not None and not outcome_mod.category_switchable(
+                    _explicit_category):
+                # 上游包装的显式永久结束不是连接未出流故障。
+                return _explicit_exception_response(e, _explicit_category)
             if not failover_mode:
                 raise  # 非 hybrid：upstream 不应抛此异常；透传给外层兜底
             _cat = outcome_mod.classify_exception(e)
@@ -289,6 +398,11 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             # 无兜底通道：聚合所有尝试结果（P0-6），如实转成 OpenAI 错误响应
             return _all_failed_response(attempts, last_status, last_msg)
         except Exception as e:
+            explicit_category = _explicit_exception_category(e)
+            if explicit_category is not None and not outcome_mod.category_switchable(
+                    explicit_category):
+                # 显式永久 generation 失败既不尝试其它通道，也不记作连接故障。
+                return _explicit_exception_response(e, explicit_category)
             # 非流式/其他异常：只对"可切换"类错误继续兜底（429/503/配额等）
             _cat = outcome_mod.classify_exception(e)
             if _cat == outcome_mod.RATE_LIMITED:
@@ -364,12 +478,27 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
       （已出流的错误由 upstream 内部发错误 chunk 收尾，这里不会看到异常。）
     """
     has_output = False
+    has_terminal_error = False
+    has_policy_terminal = False
+    done_seen = False
     try:
         async for chunk in primary_resp.body_iterator:
+            if _sse_done(chunk):
+                done_seen = True
+                continue
+            if _sse_terminal_category(chunk) is not None:
+                has_terminal_error = True
+            elif _sse_content_filter(chunk):
+                has_policy_terminal = True
             if not has_output and _chunk_has_effective_output(chunk):
                 has_output = True
             yield chunk
+        if has_terminal_error or has_policy_terminal:
+            yield "data: [DONE]\n\n"
+            return
         if has_output:
+            if done_seen:
+                yield "data: [DONE]\n\n"
             breaker.report_success(primary_channel)
             return
         # 空流（只有心跳/空 delta/[DONE]）：按未出流失败处理
@@ -396,6 +525,12 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         yield "data: [DONE]\n\n"
         return
     except UpstreamUnstartedError as e:
+        explicit_category = _explicit_exception_category(e)
+        if explicit_category is not None and not outcome_mod.category_switchable(explicit_category):
+            payload = _explicit_exception_response(e, explicit_category)
+            yield f"data: {payload.body.decode('utf-8', errors='replace')}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         breaker.report_failure(primary_channel)
         if not remaining:
             print(f"❌ [故障转移] {channel_display_name(primary_channel)} 通道未出流失败且无兜底通道（{str(e)[:120]}）。")
@@ -431,6 +566,9 @@ async def _chat_completions_with_strategy(fastapi_request: Request, request: Ope
     try:
         return await _dispatch(order, request, fastapi_request, failover_mode=(strategy == "hybrid"))
     except Exception as e:
+        explicit_category = _explicit_exception_category(e)
+        if explicit_category is not None:
+            return _explicit_exception_response(e, explicit_category)
         code, msg = extract_upstream_error(e)
         print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
         return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))

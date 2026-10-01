@@ -24,6 +24,7 @@ SWITCHABLE_STATUS_CODES {429,500,502,503,504}、is_retryable_exception 逐条等
 """
 
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -79,6 +80,102 @@ _EMPTY_OR_PROTOCOL_KEYWORDS = (
 )
 
 
+@dataclass(frozen=True)
+class GenerationEnd:
+    raw_finish_reason: str
+    terminal: bool
+    finish_reason: Optional[str]
+    failure_category: Optional[str]
+    error_type: Optional[str]
+    http_status: Optional[int]
+
+
+class GenerationEndError(Exception):
+    """Sanitized exception for a terminal Gemini generation failure."""
+
+    def __init__(self, end: GenerationEnd):
+        self.category = end.failure_category
+        self.upstream_finish_reason = end.raw_finish_reason
+        self.code = end.http_status
+        self.error_type = end.error_type
+        if self.category == CREDENTIAL_PERMANENT:
+            message = "上游账号被限制或停用，生成已终止。"
+        else:
+            message = "上游生成未能正常完成。"
+        super().__init__(f"{message} (finish_reason={self.upstream_finish_reason})")
+
+
+def normalize_finish_reason(raw: Any) -> str:
+    """Return a stable finish-reason name while preserving unknown values."""
+    if raw is None:
+        return ""
+    raw_name = getattr(raw, "name", None)
+    if raw_name and str(raw_name).upper() in {
+        "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "BLOCKLIST",
+        "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION", "ESCALATION", "PUP_LIMITED_DISABLED",
+        "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+        "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE", "IMAGE_OTHER", "NO_IMAGE",
+        "OTHER", "UNSPECIFIED", "FINISH_REASON_UNSPECIFIED",
+    }:
+        value = raw_name
+    else:
+        raw_value = getattr(raw, "value", None)
+        value = raw_value if isinstance(raw_value, str) else raw_name or raw_value or raw
+    text = str(value).strip()
+    if text.startswith("FinishReason."):
+        text = text.split(".", 1)[1]
+    known = {
+        "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "BLOCKLIST",
+        "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION", "ESCALATION", "PUP_LIMITED_DISABLED",
+        "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+        "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE", "IMAGE_OTHER", "NO_IMAGE",
+        "OTHER", "UNSPECIFIED", "FINISH_REASON_UNSPECIFIED",
+    }
+    return text.upper() if text.upper() in known else text
+
+
+def classify_generation_end(
+    raw: Any, *, has_tool_calls: bool = False, is_final: bool = False,
+) -> GenerationEnd:
+    """Classify one Gemini generation finish reason for all response paths."""
+    reason = normalize_finish_reason(raw)
+    if reason in ("", "UNSPECIFIED", "FINISH_REASON_UNSPECIFIED"):
+        if is_final:
+            return GenerationEnd(
+                reason, True, None, EMPTY_OR_PROTOCOL,
+                "upstream_protocol_error", CATEGORY_HTTP_STATUS[EMPTY_OR_PROTOCOL],
+            )
+        return GenerationEnd(reason, False, None, None, None, None)
+    if reason == "STOP":
+        return GenerationEnd(reason, True, "tool_calls" if has_tool_calls else "stop", None, None, None)
+    if reason == "MAX_TOKENS":
+        return GenerationEnd(reason, True, "length", None, None, None)
+    if reason in {
+        "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+        "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "ESCALATION",
+    }:
+        return GenerationEnd(reason, True, "content_filter", POLICY_BLOCKED, None, None)
+    if reason == "PUP_LIMITED_DISABLED":
+        return GenerationEnd(
+            reason, True, None, CREDENTIAL_PERMANENT,
+            "upstream_account_disabled", CATEGORY_HTTP_STATUS[CREDENTIAL_PERMANENT],
+        )
+    if reason in {
+        "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+        "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE", "IMAGE_OTHER", "NO_IMAGE", "OTHER",
+    }:
+        return GenerationEnd(
+            reason, True, None, EMPTY_OR_PROTOCOL,
+            "upstream_protocol_error", CATEGORY_HTTP_STATUS[EMPTY_OR_PROTOCOL],
+        )
+    return GenerationEnd(
+        reason, True, None, EMPTY_OR_PROTOCOL,
+        "upstream_protocol_error", CATEGORY_HTTP_STATUS[EMPTY_OR_PROTOCOL],
+    )
+
+
 def classify_failure(status: Optional[int] = None, message: str = "") -> str:
     """把一次失败归入唯一分类（语义消息优先于状态码，同 logger.classify_error 的排序思路）。
 
@@ -122,6 +219,11 @@ def classify_exception(e: Optional[BaseException]) -> str:
     """
     if e is None:
         return OTHER
+    explicit_category = getattr(e, "category", None)
+    if isinstance(explicit_category, str) and (
+        explicit_category in CATEGORY_HTTP_STATUS or explicit_category == OTHER
+    ):
+        return explicit_category
     # httpx 状态错误：按真实状态码分类
     if isinstance(e, httpx.HTTPStatusError):
         return classify_failure(status=e.response.status_code, message=str(e))

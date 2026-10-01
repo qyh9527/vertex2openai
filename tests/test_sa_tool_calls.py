@@ -151,13 +151,33 @@ class TestSaNonstreamToolCall:
 
 
 class TestSaStreamToolCall:
+    async def test_malformed_function_call_is_protocol_error_before_tools_leak(self):
+        req = OpenAIRequest(model="gemini-3.6-flash",
+                            messages=[{"role": "user", "content": "hi"}],
+                            tools=[_weather_tool()], stream=True)
+        client = FakeClient(stream_chunks=[
+            _tool_call_response([_fc_part()], finish=types.FinishReason.MALFORMED_FUNCTION_CALL),
+        ])
+        resp = await execute_gemini_call(
+            client, "gemini-3.6-flash", lambda _: [], {}, req, channel_name="vertex")
+
+        lines = [line async for line in resp.body_iterator]
+        errors = [json.loads(line[6:])["error"] for line in lines
+                  if line.startswith("data: {") and '"error"' in line]
+
+        assert len(errors) == 1
+        assert errors[0]["category"] == "empty_or_protocol"
+        assert errors[0]["upstream_finish_reason"] == "MALFORMED_FUNCTION_CALL"
+        assert not any('"tool_calls"' in line for line in lines)
+        assert lines.count("data: [DONE]\n\n") == 1
+
     async def test_stream_tool_call_chunks(self):
         """真流式：工具调用 chunk → SSE tool_calls delta + finish_reason=tool_calls。"""
         req = OpenAIRequest(model="gemini-3.6-flash",
                             messages=[{"role": "user", "content": "上海天气"}],
                             tools=[_weather_tool()], stream=True)
         client = FakeClient(stream_chunks=[
-            _tool_call_response([_fc_part()], finish=types.FinishReason.MALFORMED_FUNCTION_CALL),
+            _tool_call_response([_fc_part()], finish=types.FinishReason.STOP),
             # 官方常见形态：functionCall 一个 chunk，STOP 尾块另一个 chunk
             _tool_call_response([], finish=types.FinishReason.STOP),
         ])
@@ -166,14 +186,16 @@ class TestSaStreamToolCall:
             client, "gemini-3.6-flash", lambda msgs: prompt, {}, req,
             channel_name="vertex")
         chunks = _parse_sse([c async for c in resp.body_iterator])
+        assert chunks, "real stream should have tool deltas, a visible error, or normal completion"
         tool_chunks = [c for c in chunks
-                       if (c["choices"] and c["choices"][0]["delta"].get("tool_calls"))]
+                       if (c.get("choices") and c["choices"][0]["delta"].get("tool_calls"))]
         assert tool_chunks, "必须输出 tool_calls delta"
         tc = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
         assert tc["function"]["name"] == "weather_api"
         assert json.loads(tc["function"]["arguments"]) == {"city": "上海"}
         # 收尾 finish_reason 必须是 tool_calls（不是 stop）
-        finishes = [c["choices"][0]["finish_reason"] for c in chunks if c["choices"]]
+        finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                    if c.get("choices")]
         assert "tool_calls" in finishes
 
     async def test_parallel_tool_calls_distinct_index(self):
@@ -185,7 +207,7 @@ class TestSaStreamToolCall:
             _tool_call_response([
                 _fc_part(args={"city": "上海"}, call_id="call_sa_a"),
                 _fc_part(args={"city": "北京"}, call_id="call_sa_b"),
-            ], finish=types.FinishReason.MALFORMED_FUNCTION_CALL),
+            ], finish=types.FinishReason.STOP),
         ])
         prompt = create_gemini_prompt(req.messages)
         resp = await execute_gemini_call(
@@ -195,7 +217,7 @@ class TestSaStreamToolCall:
         indexes = []
         names = []
         for c in chunks:
-            for choice in c["choices"]:
+            for choice in (c.get("choices") or []):
                 for tc in (choice["delta"].get("tool_calls") or []):
                     indexes.append(tc["index"])
                     if tc["function"].get("name"):
@@ -285,7 +307,7 @@ class TestSaFakeStreamToolCall:
                 types.Part(function_call=types.FunctionCall(
                     name=syn_name, args={"content": "防截断正文"})),
                 _fc_part(args={"city": "上海"}, call_id="call_sa_r", sig=real_sig),
-            ], role="model"), finish_reason=types.FinishReason.MALFORMED_FUNCTION_CALL)])
+            ], role="model"), finish_reason=types.FinishReason.STOP)])
 
         class _FM:
             async def generate_content(self, model, contents, config):

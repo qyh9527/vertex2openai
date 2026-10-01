@@ -35,6 +35,26 @@ class TestStatusSwitchableEquivalence:
 class TestExceptionSwitchableEquivalence:
     """exception_switchable 与 is_retryable_exception 逐例等价（不扩大识别面）。"""
 
+    def test_explicit_permanent_category_overrides_switchable_status(self):
+        error = _exc("upstream account disabled")
+        error.category = outcome.CREDENTIAL_PERMANENT
+        error.code = 502
+        assert outcome.classify_exception(error) == outcome.CREDENTIAL_PERMANENT
+        assert outcome.exception_switchable(error) is False
+
+    def test_uncategorized_502_keeps_legacy_switchability(self):
+        error = _exc("upstream failed")
+        error.code = 502
+        assert outcome.classify_exception(error) == outcome.TRANSIENT
+        assert outcome.exception_switchable(error) is True
+
+    def test_explicit_other_category_overrides_switchable_status(self):
+        error = _exc("unclassified upstream issue")
+        error.category = outcome.OTHER
+        error.code = 502
+        assert outcome.classify_exception(error) == outcome.OTHER
+        assert outcome.exception_switchable(error) is False
+
     CASES = [
         "429 too many requests",
         "Quota exceeded for project",

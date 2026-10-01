@@ -20,6 +20,7 @@ from signature_store import (
 
 from google.genai import types
 from models import OpenAIMessage, ContentPartText, ContentPartImage, normalize_content_part
+from outcome import classify_generation_end, normalize_finish_reason, GenerationEndError
 
 import io
 try:
@@ -1197,27 +1198,33 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
 
     return "".join(reasoning_text_parts), "".join(normal_text_parts)
 
-def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_model_str: str) -> Dict[str, Any]:
+def process_gemini_response_to_openai_dict(
+    gemini_response_obj: Any, request_model_str: str, *, synthetic_tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
     choices = []
     response_timestamp = int(time.time())
     base_id = f"chatcmpl-{response_timestamp}-{random.randint(1000,9999)}"
 
-    if hasattr(gemini_response_obj, "candidates") and gemini_response_obj.candidates:
-        for i, candidate in enumerate(gemini_response_obj.candidates):
-            message_payload = {"role": "assistant"}
-            
+    candidates = getattr(gemini_response_obj, "candidates", None)
+    if candidates:
+        for i, candidate in enumerate(candidates):
             raw_finish_reason = getattr(candidate, "finish_reason", None)
-            openai_finish_reason = "stop" 
-            if raw_finish_reason:
-                if hasattr(raw_finish_reason, "name"): raw_gemini_finish_reason_str = raw_finish_reason.name.upper()
-                else: raw_gemini_finish_reason_str = str(raw_finish_reason).upper()
-
-                if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
-                elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-                elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
-                elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
-            
+            initial_end = classify_generation_end(raw_finish_reason, is_final=True)
+            if initial_end.failure_category and initial_end.finish_reason is None:
+                raise GenerationEndError(initial_end)
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
+            has_real_tool_calls = any(
+                (fc := getattr(part, "function_call", None)) is not None
+                and getattr(fc, "name", None) != synthetic_tool_name
+                for part in parts_in_order
+            )
+            end = classify_generation_end(
+                raw_finish_reason,
+                has_tool_calls=has_real_tool_calls,
+                is_final=True,
+            )
+            message_payload = {"role": "assistant"}
+            openai_finish_reason = end.finish_reason
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
             if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                 normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
@@ -1248,7 +1255,6 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     message_payload.setdefault("tool_calls", []).append(tool_payload)
                     order_descriptors.append({"type": "tool_call", "index": tool_index})
                     tool_index += 1
-                    openai_finish_reason = "tool_calls"
                     continue
 
                 is_thought = getattr(part, "thought", None) is True
@@ -1293,11 +1299,28 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             if hasattr(candidate, "logprobs") and candidate.logprobs is not None: choice_item["logprobs"] = candidate.logprobs
             choices.append(choice_item)
             
-    elif hasattr(gemini_response_obj, "text") and gemini_response_obj.text is not None:
-         content_str = gemini_response_obj.text or ""
-         choices.append({"index": 0, "message": {"role": "assistant", "content": content_str}, "finish_reason": "stop"})
-    else: 
-         choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
+    else:
+        prompt_feedback = getattr(gemini_response_obj, "prompt_feedback", None)
+        block_reason = getattr(prompt_feedback, "block_reason", None)
+        normalized_block_reason = normalize_finish_reason(block_reason)
+        if normalized_block_reason not in ("", "UNSPECIFIED", "FINISH_REASON_UNSPECIFIED", "BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED"):
+            end = classify_generation_end(block_reason, is_final=True)
+            if end.failure_category and end.finish_reason is None:
+                raise GenerationEndError(end)
+            if end.finish_reason:
+                choices.append({
+                    "index": 0,
+                    "message": {"role": "assistant", "content": None},
+                    "finish_reason": end.finish_reason,
+                })
+
+        if not choices and hasattr(gemini_response_obj, "text") and gemini_response_obj.text is not None:
+            # Legacy SDK response with text but no candidates remains an independent fallback.
+            content_str = gemini_response_obj.text or ""
+            choices.append({"index": 0, "message": {"role": "assistant", "content": content_str}, "finish_reason": "stop"})
+        elif not choices:
+            end = classify_generation_end(None, is_final=True)
+            raise GenerationEndError(end)
 
     usage_data = map_usage(getattr(gemini_response_obj, "usage_metadata", None))
 
@@ -1307,5 +1330,6 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
         "usage": usage_data
     }
 
-def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]:
-    return process_gemini_response_to_openai_dict(gemini_response, model)
+def convert_to_openai_format(gemini_response: Any, model: str, *, synthetic_tool_name: Optional[str] = None) -> Dict[str, Any]:
+    return process_gemini_response_to_openai_dict(
+        gemini_response, model, synthetic_tool_name=synthetic_tool_name)

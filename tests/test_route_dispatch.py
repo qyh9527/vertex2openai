@@ -10,6 +10,7 @@ import pytest
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config as app_config
+import outcome as outcome_mod
 from routes import chat_api
 from failover import ChannelBreaker, UpstreamUnstartedError
 from models import OpenAIRequest
@@ -75,6 +76,12 @@ def _install3(monkeypatch, express_behavior, cookie_behavior, vertex_behavior):
     sa = FakeUpstream(vertex_behavior)
     monkeypatch.setattr(chat_api, "CHANNELS", {"express": ex, "cookie": ck, "vertex": sa})
     return ex, ck, sa
+
+
+def _use_public_hybrid_route(monkeypatch):
+    monkeypatch.setattr(app_state, "get_channel_strategy", lambda: "hybrid")
+    monkeypatch.setattr(app_state, "get_hybrid_channels", lambda: ["express", "cookie"])
+    monkeypatch.setattr(app_state, "get_cookie_accounts", lambda: [{"cookie": "fake", "project_id": "p"}])
 
 
 class TestChannelOrder:
@@ -161,6 +168,90 @@ class TestDispatch:
         assert resp.status_code == code
         assert len(ck.calls) == 0
 
+    @pytest.mark.parametrize("category", [
+        outcome_mod.CREDENTIAL_PERMANENT, outcome_mod.EMPTY_OR_PROTOCOL,
+    ])
+    async def test_explicit_permanent_502_does_not_switch(self, env, monkeypatch, category):
+        ex, ck = _install(
+            monkeypatch,
+            {"response": _json(502, {"error": {
+                "message": "explicit terminal error", "type": "upstream_protocol_error",
+                "category": category, "upstream_finish_reason": "PUP_LIMITED_DISABLED"}})},
+            {"response": _json(200)},
+        )
+
+        resp = await chat_api._dispatch(
+            ["express", "cookie"], _req(), None, failover_mode=True)
+
+        assert resp.status_code == 502
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+
+    async def test_unknown_or_absent_category_keeps_legacy_502_switch(self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"response": _json(502, {"error": {
+                "message": "ordinary upstream error", "type": "upstream_error",
+                "category": "unknown"}})},
+            {"response": _json(200)},
+        )
+
+        resp = await chat_api._dispatch(
+            ["express", "cookie"], _req(), None, failover_mode=True)
+
+        assert resp.status_code == 200
+        assert len(ex.calls) == 1 and len(ck.calls) == 1
+
+    async def test_plain_502_keeps_legacy_cookie_failover(self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"response": _json(502, {"error": {
+                "message": "ordinary upstream error", "type": "upstream_error"}})},
+            {"response": _json(200)},
+        )
+
+        resp = await chat_api._dispatch(
+            ["express", "cookie"], _req(), None, failover_mode=True)
+
+        assert resp.status_code == 200
+        assert len(ex.calls) == 1 and len(ck.calls) == 1
+
+    async def test_terminal_generation_exception_preserves_openai_fields(self, env, monkeypatch):
+        end = outcome_mod.classify_generation_end("PUP_LIMITED_DISABLED", is_final=True)
+        error = outcome_mod.GenerationEndError(end)
+        ex, ck = _install(
+            monkeypatch, {"raise": error}, {"response": _json(200)})
+
+        resp = await chat_api._chat_completions_with_strategy(
+            None, _req(), "hybrid")
+
+        body = json.loads(resp.body.decode("utf-8"))
+        assert resp.status_code == 502
+        assert body["error"] == {
+            "message": str(error), "type": "upstream_account_disabled",
+            "error_type": "upstream_account_disabled", "code": 502, "param": None,
+            "category": "credential_permanent",
+            "upstream_finish_reason": "PUP_LIMITED_DISABLED",
+        }
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+        assert chat_api.breaker.status() == {}
+
+    async def test_explicit_502_does_not_pollute_breaker(self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"response": _json(502, {"error": {
+                "message": "policy", "type": "upstream_error",
+                "category": outcome_mod.POLICY_BLOCKED}})},
+            {"response": _json(200)},
+        )
+        chat_api.breaker.report_failure("express")
+
+        resp = await chat_api._dispatch(
+            ["express", "cookie"], _req(), None, failover_mode=True)
+
+        assert resp.status_code == 502
+        assert chat_api.breaker.status()["express"]["failures"] == 1
+        assert len(ck.calls) == 0
+
     async def test_all_fail_returns_error_response(self, env, monkeypatch):
         ex, ck = _install(monkeypatch, {"response": _json(429)}, {"response": _json(503)})
         resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
@@ -186,6 +277,22 @@ class TestDispatch:
         resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
         assert resp.status_code == 200
         assert len(ex.calls) == 1 and len(ck.calls) == 1
+
+    async def test_explicit_terminal_category_inside_unstarted_does_not_switch(self, env, monkeypatch):
+        class TerminalUnstartedError(UpstreamUnstartedError):
+            category = outcome_mod.EMPTY_OR_PROTOCOL
+            upstream_finish_reason = "MALFORMED_RESPONSE"
+            code = 502
+            error_type = "upstream_protocol_error"
+
+        error = TerminalUnstartedError("terminal protocol failure")
+        ex, ck = _install(monkeypatch, {"raise": error}, {"response": _json(200)})
+
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+
+        assert resp.status_code == 502
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+        assert chat_api.breaker.status() == {}
 
     async def test_upstream_unstarted_no_fallback_returns_error(self, env, monkeypatch):
         ex, ck = _install(monkeypatch, {"raise": UpstreamUnstartedError("express 失败")},
@@ -413,6 +520,43 @@ class TestEmptyStreamFailover:
         assert "兜底正文" in body
         assert len(ex.calls) == 1 and len(ck.calls) == 1
 
+    async def test_done_only_primary_fallback_body_precedes_single_done(self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [": keep-alive\n\n", "data: [DONE]\n\n"]},
+            {"stream": [
+                'data: {"choices":[{"delta":{"content":"兜底正文"}}]}\n\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                "data: [DONE]\n\n",
+            ]},
+        )
+
+        _use_public_hybrid_route(monkeypatch)
+
+        resp = await chat_api.chat_completions(None, _req(), api_key="fake")
+        body = "".join([chunk async for chunk in resp.body_iterator])
+
+        assert body.count("[DONE]") == 1
+        assert body.index("兜底正文") < body.index("[DONE]")
+        assert len(ex.calls) == 1 and len(ck.calls) == 1
+
+    async def test_done_only_primary_without_fallback_emits_error_before_single_done(
+            self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [": keep-alive\n\n", "data: [DONE]\n\n"]},
+            {"response": _json(200)},
+        )
+        monkeypatch.setattr(app_state, "get_channel_strategy", lambda: "hybrid")
+        monkeypatch.setattr(app_state, "get_hybrid_channels", lambda: ["express"])
+
+        resp = await chat_api.chat_completions(None, _req(), api_key="fake")
+        body = "".join([chunk async for chunk in resp.body_iterator])
+
+        assert body.count("[DONE]") == 1
+        assert body.index("error") < body.index("[DONE]")
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+
     async def test_empty_delta_only_switches(self, env, monkeypatch):
         """role 声明 + 空 content chunk 不算有效输出。"""
         ex, ck = _install(
@@ -452,6 +596,50 @@ class TestEmptyStreamFailover:
         body = "".join([c async for c in resp.body_iterator])
         assert "正文" in body
         assert len(ck.calls) == 0
+
+    async def test_sse_error_with_explicit_category_is_not_success(self, env, monkeypatch):
+        error_chunk = 'data: {"error":{"message":"协议失败","type":"upstream_protocol_error",' \
+            '"code":502,"category":"empty_or_protocol",' \
+            '"upstream_finish_reason":"MALFORMED_RESPONSE"}}\n\n'
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [
+                'data: {"choices":[{"delta":{"content":"前文"}}]}\n\n',
+                error_chunk,
+                "data: [DONE]\n\n",
+            ]},
+            {"stream": ['data: {"choices":[{"delta":{"content":"兜底"}}]}\n\n']},
+        )
+        chat_api.breaker.report_failure("express")
+
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        body = "".join([chunk async for chunk in resp.body_iterator])
+
+        assert body.count("前文") == 1
+        assert body.count('"category":"empty_or_protocol"') == 1
+        assert body.count("[DONE]") == 1
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+        assert chat_api.breaker.status()["express"]["failures"] == 1
+
+    async def test_content_filter_without_body_is_not_empty_failure(self, env, monkeypatch):
+        ex, ck = _install(
+            monkeypatch,
+            {"stream": [
+                'data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n',
+                "data: [DONE]\n\n",
+            ]},
+            {"response": _json(200)},
+        )
+        chat_api.breaker.report_failure("express")
+
+        resp = await chat_api._dispatch(["express", "cookie"], _req(), None, failover_mode=True)
+        body = "".join([chunk async for chunk in resp.body_iterator])
+
+        assert "content_filter" in body
+        assert "空流" not in body
+        assert body.count("[DONE]") == 1
+        assert len(ex.calls) == 1 and len(ck.calls) == 0
+        assert chat_api.breaker.status()["express"]["failures"] == 1
 
     async def test_sse_error_event_is_effective_output(self, env, monkeypatch):
         """带明确 OpenAI 错误事件的流是"有效输出"：不触发空流兜底（upstream 已如实报错）。"""
