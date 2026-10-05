@@ -872,6 +872,14 @@ async def _execute_gemini_call(
                 max_retries, backoff_sec = get_retry_settings(channel_name)
                 has_yielded = False    # 是否已向客户端输出过正文/工具调用（重试与故障转移的唯一判断依据）
                 prefill_sent = False   # 预填充静态前缀是否已发出（重试不重发；已发则不触发跨通道故障转移）
+                def _pending_prefill():
+                    nonlocal prefill_sent
+                    if prefill_text and not prefill_sent:
+                        prefill_sent = True
+                        _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
+                        return f"data: {json.dumps(_pf)}\n\n"
+                    return None
+
                 synthetic_seen = False            # 防截断：本次流式是否出现过合成工具调用（流末用于"未生效"提示）
                 # 防截断 side-buffer（对齐 Antigravity-gateway 1.0.9）：阈值 0 = 完全直通不缓冲，
                 # 正文立刻下发（首字延迟最低，代价是模型若先吐普通文本再调合成工具，客户端会看到两段）；
@@ -918,10 +926,7 @@ async def _execute_gemini_call(
                         # 否则带预填充的请求（酒馆预设）遇到 429 会被误判为已输出而拒绝重试。
                         tool_indexer = ToolCallIndexer()
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
-                        if prefill_text and not prefill_sent:
-                            prefill_sent = True
-                            _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
-                            yield f"data: {json.dumps(_pf)}\n\n"
+                        # 前缀延迟到有效输出或正常终止再下发，建流成功不代表迭代不会失败。
 
                         final_usage = map_usage()
                         pending_finishes = {}
@@ -981,6 +986,8 @@ async def _execute_gemini_call(
                                               "字普通文本，已丢弃（正文以合成 content 为准）。")
                                         side_buffer = []
                                     has_yielded = True
+                                    if _pf := _pending_prefill():
+                                        yield _pf
                                     for _sc in _syn_contents:
                                         _syn_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
                                         yield f"data: {json.dumps(_syn_payload, ensure_ascii=False)}\n\n"
@@ -1024,6 +1031,8 @@ async def _execute_gemini_call(
                                     # 缓冲已攒够阈值：整批放行并永久转直通（首字延迟优先，对齐上游 1.0.9）
                                     if side_buffer and sum(len(s) for s in side_buffer) >= side_buffer_bytes:
                                         side_emitted = True
+                                        if _pf := _pending_prefill():
+                                            yield _pf
                                         for _sc in side_buffer:
                                             _sb_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
                                             yield f"data: {json.dumps(_sb_payload, ensure_ascii=False)}\n\n"
@@ -1048,6 +1057,14 @@ async def _execute_gemini_call(
                                         if not choice.get("delta"):
                                             continue
                                         sse_chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                                output_payload = json.loads(sse_chunk[len("data: "):])
+                                output_choice = (output_payload.get("choices") or [{}])[0]
+                                output_delta = output_choice.get("delta") or {}
+                                if (output_delta.get("content") or output_delta.get("reasoning_content")
+                                        or output_delta.get("tool_calls") or output_delta.get("extra_content")
+                                        or output_delta.get("function_call") or output_choice.get("finish_reason")):
+                                    if _pf := _pending_prefill():
+                                        yield _pf
                                 yield sse_chunk
 
                         # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
@@ -1065,6 +1082,8 @@ async def _execute_gemini_call(
                                         _tail_chunk, request_obj.model, response_id_for_stream,
                                         _pc_idx, indexer=tool_indexer)
                                     has_yielded = True
+                                    if _pf := _pending_prefill():
+                                        yield _pf
                                     yield _tail_sse
                                     if (terminal_finish_reasons.get(_pc_idx) in ("stop", "tool_calls")
                                             and _pc_idx in pending_finishes):
@@ -1084,6 +1103,8 @@ async def _execute_gemini_call(
                         # 未命中合成调用：flush side-buffer 当兜底（正文不丢）
                         if synthetic_tool_name and not synthetic_seen and side_buffer and not side_emitted:
                             side_emitted = True
+                            if _pf := _pending_prefill():
+                                yield _pf
                             for _sc in side_buffer:
                                 _sb_payload = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": _sc}, "finish_reason": None}]}
                                 yield f"data: {json.dumps(_sb_payload, ensure_ascii=False)}\n\n"
@@ -1095,6 +1116,8 @@ async def _execute_gemini_call(
                             if tail and input_relay_stripper is not None:
                                 tail = input_relay_stripper.feed(tail)
                             if tail:
+                                if _pf := _pending_prefill():
+                                    yield _pf
                                 yield _input_relay_sse_text(response_id_for_stream, request_obj, tail)
 
                         # 流式标签剥离器会保留“可能跨 chunk 的开标签”尾巴；流结束时原样放行
@@ -1102,9 +1125,13 @@ async def _execute_gemini_call(
                         if input_relay_stripper is not None:
                             relay_tail = input_relay_stripper.flush()
                             if relay_tail:
+                                if _pf := _pending_prefill():
+                                    yield _pf
                                 yield _input_relay_sse_text(response_id_for_stream, request_obj, relay_tail)
 
                         for finish in pending_finishes.values():
+                            if _pf := _pending_prefill():
+                                yield _pf
                             yield f"data: {json.dumps(finish, ensure_ascii=False)}\n\n"
 
                         terminal_candidate_indexes = tool_indexer.terminal_candidates()
@@ -1134,6 +1161,8 @@ async def _execute_gemini_call(
                             yield "data: [DONE]\n\n"
                             return
 
+                        if _pf := _pending_prefill():
+                            yield _pf
                         final_p_tk = final_usage["prompt_tokens"]
                         final_c_tk = final_usage["completion_tokens"]
                         final_t_tk = final_usage["total_tokens"]
