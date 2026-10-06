@@ -1,5 +1,6 @@
 import json
 import random
+import time
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -13,8 +14,9 @@ from upstreams.cookie_proxy import CookieProxyUpstream
 from upstreams.service_account import ServiceAccountUpstream
 from api_helpers import (
     extract_upstream_error, create_openai_error_response, is_retryable_exception,
-    channel_display_name,
+    channel_display_name, make_usage_chunk, wants_usage,
 )
+from usage_mapping import map_usage
 import outcome as outcome_mod
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
@@ -474,6 +476,16 @@ def _exception_switchable(e: Exception) -> bool:
     return outcome_mod.exception_switchable(e)
 
 
+def _error_usage_tail(request: OpenAIRequest) -> str:
+    """包装器自己生成错误收尾时的全零 usage 尾块（客户端要求 usage 时）。
+
+    下游网关见不到 usage 会按响应字节数估算输出 token 计费。
+    """
+    if not wants_usage(request):
+        return ""
+    return make_usage_chunk(f"chatcmpl-error-{time.time_ns()}", request.model, map_usage())
+
+
 async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list,
                                 request: OpenAIRequest, fastapi_request: Request,
                                 failover_mode: bool, primary_channel: str):
@@ -524,6 +536,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
                 # 兜底通道非流式失败（JSONResponse）：转成 SSE 错误流收尾
                 body = switch_resp.body
                 yield f"data: {body.decode('utf-8', errors='replace')}\n\n"
+                if (tail := _error_usage_tail(request)):
+                    yield tail
                 yield "data: [DONE]\n\n"
             return
         # 无兜底：发送可见的 SSE 错误（P0-7 不静默空回）
@@ -532,6 +546,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         err_payload = create_openai_error_response(
             502, f"{channel_display_name(primary_channel)} 通道上游返回空流（无正文/工具调用/错误事件），本次请求未获得有效回复。", "upstream_error")
         yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+        if (tail := _error_usage_tail(request)):
+            yield tail
         yield "data: [DONE]\n\n"
         return
     except UpstreamUnstartedError as e:
@@ -539,6 +555,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         if explicit_category is not None and not outcome_mod.category_switchable(explicit_category):
             payload = _explicit_exception_response(e, explicit_category)
             yield f"data: {payload.body.decode('utf-8', errors='replace')}\n\n"
+            if (tail := _error_usage_tail(request)):
+                yield tail
             yield "data: [DONE]\n\n"
             return
         breaker.report_failure(primary_channel)
@@ -547,6 +565,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
             payload = _attach_exception_report(
                 JSONResponse(content=create_openai_error_response(502, str(e)[:500], 'upstream_error')), e)
             yield f"data: {payload.body.decode('utf-8')}\n\n"
+            if (tail := _error_usage_tail(request)):
+                yield tail
             yield "data: [DONE]\n\n"
             return
         print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式未出流失败（{str(e)[:120]}），"
@@ -559,6 +579,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
             # 兜底通道非流式失败（JSONResponse）：转成 SSE 错误流收尾
             body = switch_resp.body
             yield f"data: {body.decode('utf-8', errors='replace')}\n\n"
+            if (tail := _error_usage_tail(request)):
+                yield tail
             yield "data: [DONE]\n\n"
 
 

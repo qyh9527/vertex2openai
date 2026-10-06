@@ -588,10 +588,8 @@ async def gemini_fake_stream_generator(
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
             while not api_call_task.done():
                 if outer_keep_alive_interval > 0:
-                    keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
-                                       "created": int(time.time()), "model": request_obj.model,
-                                       "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-                    yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                    # SSE 注释行心跳（~14 字节）：下游按响应字节估算 token 时不会被心跳抬高
+                    yield ": keep-alive\n\n"
                     await asyncio.sleep(outer_keep_alive_interval)
                 else:
                     await asyncio.sleep(0.2)
@@ -622,10 +620,7 @@ async def gemini_fake_stream_generator(
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
                             return
                         if outer_keep_alive_interval > 0:
-                            keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
-                                               "created": int(time.time()), "model": request_obj.model,
-                                               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                            yield ": keep-alive\n\n"
                     continue
                 raise
 
@@ -695,8 +690,19 @@ async def gemini_fake_stream_generator(
         _sa_hint = sa_channel_hint(channel_name, str(e_outer_gemini))
         if _sa_hint:
             print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
+        # 失败收尾也带 usage 尾块：下游网关（GPROXY）见不到 usage 会按响应字节数估算计费。
+        # 已拿到上游响应用真实用量，否则全零。
+        def _failure_usage_tail() -> str:
+            if not wants_usage(request_obj):
+                return ""
+            usage = map_usage(getattr(raw_gemini_response, "usage_metadata", None)) \
+                if raw_gemini_response is not None else map_usage()
+            return make_usage_chunk(response_id, request_obj.model, usage)
+
         if isinstance(e_outer_gemini, GenerationEndError):
             yield _generation_end_error_sse(e_outer_gemini)
+            if (tail := _failure_usage_tail()):
+                yield tail
             yield "data: [DONE]\n\n"
             return
         sse_err_msg_display = str(e_outer_gemini)
@@ -709,6 +715,8 @@ async def gemini_fake_stream_generator(
             raise UpstreamUnstartedError(str(e_outer_gemini))
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
+            if (tail := _failure_usage_tail()):
+                yield tail
             yield "data: [DONE]\n\n"
         if is_auto_attempt:
             raise

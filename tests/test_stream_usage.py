@@ -165,7 +165,125 @@ async def test_failure_has_no_success_usage(fake):
                                            force_fake_streaming=fake)
     lines, payloads = await consume(resp)
     assert lines[-1] == "data: [DONE]\n\n"
+    if not fake:
+        assert not any(p.get("choices") == [] for p in payloads)
+        return
+    # 假流式失败收尾：GPROXY 见不到 usage 会按字节估算计费，故补全零尾块。
+    assert lines.count("data: [DONE]\n\n") == 1
+    assert "error" in payloads[-2]
+    assert payloads[-1]["choices"] == []
+    assert payloads[-1]["usage"] == map_usage()
+    assert len([p for p in payloads if p.get("choices") == []]) == 1
+
+
+@pytest.mark.parametrize("options", [False, None])
+async def test_fake_failure_without_include_usage_has_no_tail(options):
+    client = client_for()
+    client.aio.models.generate_content.side_effect = ValueError("upstream failed")
+    resp = await helpers.execute_gemini_call(client, MODEL, lambda _: [], {}, request(options),
+                                           force_fake_streaming=True)
+    lines, payloads = await consume(resp)
+    assert lines[-1] == "data: [DONE]\n\n"
+    assert "error" in payloads[-1]
     assert not any(p.get("choices") == [] for p in payloads)
+
+
+async def test_fake_generation_end_failure_reports_real_usage():
+    # 上游已返回响应，随后分类为 GenerationEndError：尾块用真实 usage_metadata。
+    full = types.GenerateContentResponse(
+        candidates=[types.Candidate(
+            content=types.Content(role="model", parts=[types.Part(text="partial")]),
+            finish_reason=types.FinishReason.MALFORMED_FUNCTION_CALL)],
+        usage_metadata=sdk_meta(META))
+    resp = await helpers.execute_gemini_call(client_for(full=full), MODEL, lambda _: [], {},
+                                           request(), force_fake_streaming=True)
+    lines, payloads = await consume(resp)
+    assert lines[-1] == "data: [DONE]\n\n"
+    assert lines.count("data: [DONE]\n\n") == 1
+    assert "error" in payloads[-2]
+    assert payloads[-1]["choices"] == []
+    assert payloads[-1]["usage"] == EXPECTED
+    assert len([p for p in payloads if p.get("choices") == []]) == 1
+
+
+@pytest.mark.parametrize("include_usage", [True, False])
+async def test_fake_stream_heartbeat_is_sse_comment(monkeypatch, include_usage):
+    """心跳用 SSE 注释行（~14 字节），避免下游按响应字节估算 token 时被心跳抬高。"""
+    monkeypatch.setattr(helpers.app_state, "get_setting",
+                        lambda key, default=None: 0.01 if key == "fake_streaming_interval" else default)
+
+    async def slow(**kwargs):
+        await asyncio.sleep(0.1)
+        return response(usage=sdk_meta(META))
+    client = client_for()
+    client.aio.models.generate_content.side_effect = slow
+    resp = await helpers.execute_gemini_call(client, MODEL, lambda _: [], {}, request(include_usage),
+                                           force_fake_streaming=True)
+    lines, payloads = await consume(resp)
+    assert lines.count(": keep-alive\n\n") >= 2
+    assert not any(line.startswith("data: {") and '"content": ""' in line for line in lines)
+    assert_usage_contract(lines, payloads, include_usage)
+
+
+async def test_fake_stream_retry_backoff_heartbeat_is_sse_comment(monkeypatch):
+    monkeypatch.setattr(helpers, "get_retry_settings", lambda *args: (1, 0.1))
+    monkeypatch.setattr(helpers.app_state, "get_setting",
+                        lambda key, default=None: 0.01 if key == "fake_streaming_interval" else default)
+    monkeypatch.setattr(helpers, "is_retryable_exception", lambda e: True)
+    client = client_for()
+    client.aio.models.generate_content.side_effect = [ValueError("429"), response()]
+    resp = await helpers.execute_gemini_call(client, MODEL, lambda _: [], {}, request(),
+                                           force_fake_streaming=True)
+    lines, payloads = await consume(resp)
+    assert client.aio.models.generate_content.await_count == 2
+    assert ": keep-alive\n\n" in lines
+    assert not any(line.startswith("data: {") and '"content": ""' in line for line in lines)
+    assert_usage_contract(lines, payloads, True, map_usage())
+
+
+async def test_hybrid_wrapper_comment_heartbeat_only_is_empty_stream():
+    from fastapi.responses import StreamingResponse
+    from routes import chat_api
+
+    async def heartbeat_only():
+        yield ": keep-alive\n\n"
+        yield "data: [DONE]\n\n"
+
+    wrapper = chat_api._stream_with_failover(
+        StreamingResponse(heartbeat_only()), [], request(), None, True, "express")
+    lines = [line async for line in wrapper]
+    payloads = [json.loads(line[6:]) for line in lines if line.startswith("data: {")]
+    assert "error" in payloads[-2]
+    assert payloads[-1]["choices"] == [] and payloads[-1]["usage"] == map_usage()
+    assert lines[-1] == "data: [DONE]\n\n"
+    assert lines.count("data: [DONE]\n\n") == 1
+
+
+@pytest.mark.parametrize("include_usage", [True, False])
+async def test_hybrid_wrapper_empty_stream_error_tail(include_usage):
+    from fastapi.responses import StreamingResponse
+    from routes import chat_api
+
+    async def heartbeat_only():
+        yield 'data: {"choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": null}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    req = request(include_usage)
+    wrapper = chat_api._stream_with_failover(
+        StreamingResponse(heartbeat_only()), [], req, None, True, "express")
+    lines = [line async for line in wrapper]
+    payloads = [json.loads(line[6:]) for line in lines
+                if line.startswith("data: {")]
+    assert lines[-1] == "data: [DONE]\n\n"
+    assert lines.count("data: [DONE]\n\n") == 1
+    assert "error" in payloads[-2 if include_usage else -1]
+    tails = [p for p in payloads if p.get("choices") == []]
+    if include_usage:
+        assert len(tails) == 1 and payloads[-1] is tails[0]
+        assert tails[0]["usage"] == map_usage()
+        assert tails[0]["model"] == MODEL
+    else:
+        assert not tails
 
 
 async def test_usage_only_still_allows_failover():
