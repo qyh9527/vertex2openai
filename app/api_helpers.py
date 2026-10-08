@@ -588,8 +588,10 @@ async def gemini_fake_stream_generator(
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
             while not api_call_task.done():
                 if outer_keep_alive_interval > 0:
-                    # SSE 注释行心跳（~14 字节）：下游按响应字节估算 token 时不会被心跳抬高
-                    yield ": keep-alive\n\n"
+                    keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
+                                       "created": int(time.time()), "model": request_obj.model,
+                                       "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+                    yield f"data: {json.dumps(keep_alive_data)}\n\n"
                     await asyncio.sleep(outer_keep_alive_interval)
                 else:
                     await asyncio.sleep(0.2)
@@ -620,7 +622,10 @@ async def gemini_fake_stream_generator(
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
                             return
                         if outer_keep_alive_interval > 0:
-                            yield ": keep-alive\n\n"
+                            keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
+                                               "created": int(time.time()), "model": request_obj.model,
+                                               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
                     continue
                 raise
 

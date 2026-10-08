@@ -206,9 +206,13 @@ async def test_fake_generation_end_failure_reports_real_usage():
     assert len([p for p in payloads if p.get("choices") == []]) == 1
 
 
+def is_heartbeat(p):
+    return p.get("choices") == [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]
+
+
 @pytest.mark.parametrize("include_usage", [True, False])
-async def test_fake_stream_heartbeat_is_sse_comment(monkeypatch, include_usage):
-    """心跳用 SSE 注释行（~14 字节），避免下游按响应字节估算 token 时被心跳抬高。"""
+async def test_fake_stream_heartbeat_is_empty_content_chunk(monkeypatch, include_usage):
+    """心跳沿用历史空 content 数据块：客户端能感知到数据到达，计时器持续走动。"""
     monkeypatch.setattr(helpers.app_state, "get_setting",
                         lambda key, default=None: 0.01 if key == "fake_streaming_interval" else default)
 
@@ -220,12 +224,12 @@ async def test_fake_stream_heartbeat_is_sse_comment(monkeypatch, include_usage):
     resp = await helpers.execute_gemini_call(client, MODEL, lambda _: [], {}, request(include_usage),
                                            force_fake_streaming=True)
     lines, payloads = await consume(resp)
-    assert lines.count(": keep-alive\n\n") >= 2
-    assert not any(line.startswith("data: {") and '"content": ""' in line for line in lines)
-    assert_usage_contract(lines, payloads, include_usage)
+    assert ": keep-alive\n\n" not in lines
+    assert len([p for p in payloads if is_heartbeat(p)]) >= 2
+    assert_usage_contract(lines, [p for p in payloads if not is_heartbeat(p)], include_usage)
 
 
-async def test_fake_stream_retry_backoff_heartbeat_is_sse_comment(monkeypatch):
+async def test_fake_stream_retry_backoff_heartbeat_is_empty_content_chunk(monkeypatch):
     monkeypatch.setattr(helpers, "get_retry_settings", lambda *args: (1, 0.1))
     monkeypatch.setattr(helpers.app_state, "get_setting",
                         lambda key, default=None: 0.01 if key == "fake_streaming_interval" else default)
@@ -236,9 +240,9 @@ async def test_fake_stream_retry_backoff_heartbeat_is_sse_comment(monkeypatch):
                                            force_fake_streaming=True)
     lines, payloads = await consume(resp)
     assert client.aio.models.generate_content.await_count == 2
-    assert ": keep-alive\n\n" in lines
-    assert not any(line.startswith("data: {") and '"content": ""' in line for line in lines)
-    assert_usage_contract(lines, payloads, True, map_usage())
+    assert ": keep-alive\n\n" not in lines
+    assert any(is_heartbeat(p) for p in payloads)
+    assert_usage_contract(lines, [p for p in payloads if not is_heartbeat(p)], True, map_usage())
 
 
 async def test_hybrid_wrapper_comment_heartbeat_only_is_empty_stream():
