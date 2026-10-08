@@ -543,6 +543,10 @@ st.ingest(ev({ request_id: 'f', event_type: 'request_end', status: 'failed', err
 const fe = st.summary(st.getGroup('f'), 13).error;
 assert.strictEqual(fe.label, '错误');
 assert.ok(fe.text.includes('Final') && fe.text.includes('HTTP 502') && !fe.text.includes('Old'));
+
+// 非流式成功的 request_end 带 http_status=200：不是错误
+st.ingest(ev({ request_id: 'ok200', event_type: 'request_end', status: 'success', http_status: 200 }), 14);
+assert.strictEqual(st.summary(st.getGroup('ok200'), 15).error, null);
 """
 
 CASES["model_short_name"] = r"""

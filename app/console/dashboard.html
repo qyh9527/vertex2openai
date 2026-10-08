@@ -1898,9 +1898,10 @@ function createLogStore(opts){
     const et=lvStr(f.error_type); if(et) g.errorType=et;
     const es=lvStr(f.error_summary); if(es) g.errorSummary=es;
     const hs=lvNum(f.http_status); if(hs!==null) g.httpStatus=hs;
-    /* 错误展示分两路：进行中看“最近一次尝试失败”，已结束只认 request_end 自带的错误，不把切换前的旧失败当成最终错误 */
+    /* 错误展示分两路：进行中看“最近一次尝试失败”，已结束只认 request_end 自带的错误，不把切换前的旧失败当成最终错误；HTTP < 400 不算错误 */
     if(t==='request_end'){
-      if(et||es||hs!==null) g.endError={type:et,summary:es,http:hs};
+      const errHttp=(hs!==null && hs>=400) ? hs : null;
+      if(et||es||errHttp!==null) g.endError={type:et,summary:es,http:errHttp};
     }else if(et||es){
       g.lastError={type:et,summary:es,http:hs,channel:g.channel,attempt:lvNum(f.attempt)};
     }
@@ -2185,7 +2186,7 @@ function lvEventTags(ev){
   if(typeof f.upstream_task_done==='boolean') out.push(['上游任务'+(f.upstream_task_done?'已完成':'未完成'),'ph']);
   if(f.cancel_requested===true) out.push(['已请求取消','bo']);
   const et=lvStr(f.error_type); if(et) out.push([et,'er']);
-  if(lvNum(f.http_status)!==null) out.push(['HTTP '+f.http_status,'er']);
+  if(lvNum(f.http_status)!==null) out.push(['HTTP '+f.http_status,f.http_status>=400?'er':'ok']);
   if(ev.type==='request_end'){
     const st=LV_END_STATUSES.indexOf(f.status)>=0 ? f.status : 'unknown';
     out.push(['结果：'+LV_STATUS_LABEL[st],st==='success'?'ok':(st==='failed'?'er':'ph')]);
