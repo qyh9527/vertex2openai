@@ -176,6 +176,9 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         temp_dep = _temp_deprecated(name)
         if temp_dep:
             allowed -= {"temperature", "top_p", "top_k"}
+            # 官方 content-generation-parameters：3.6 Flash 起自定义 presence/frequency_penalty 直接报错
+            # （不是忽略），与上面同一版本边界；sampling_policy=allowed 也不放回。
+            allowed -= {"presence_penalty", "frequency_penalty"}
         return {
             "family": "g3",
             "is_image": False,

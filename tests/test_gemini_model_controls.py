@@ -36,6 +36,18 @@ def test_sdk_thinking(fields, settings, expected, monkeypatch):
     assert "thinking_budget" not in config
 
 
+@pytest.mark.parametrize("model,stripped", [
+    ("gemini-3.7-flash", True), ("gemini-3.6-flash", True), ("fake-gemini-3.8-flash", True),
+    ("gemini-3.5-flash", False), ("gemini-2.5-flash", False),
+])
+@pytest.mark.parametrize("policy", ["auto", "allowed"])
+def test_penalty_stripped_from_36(model, stripped, policy, monkeypatch):
+    monkeypatch.setattr(app_state, "get_effective_settings", lambda _: {"sampling_policy": policy})
+    request = OpenAIRequest(model=model, messages=[], presence_penalty=0.5, frequency_penalty=0.3)
+    keys = {"presence_penalty", "frequency_penalty"} & create_generation_config(request).keys()
+    assert keys == (set() if stripped else {"presence_penalty", "frequency_penalty"})
+
+
 def test_25_controls_unchanged(monkeypatch):
     monkeypatch.setattr(app_state, "get_effective_settings", lambda _: {})
     request = OpenAIRequest(model="gemini-2.5-flash", messages=[], temperature=0.5, top_p=0.8, top_k=10, n=2, thinking_budget=0)
