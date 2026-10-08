@@ -29,6 +29,9 @@
 
 import json
 import secrets
+import re
+from dataclasses import dataclass
+from outcome import GenerationEndError, classify_generation_end
 from typing import Any, Optional
 
 from models import OpenAIMessage
@@ -453,6 +456,86 @@ def extract_content_from_args(args: Any) -> Optional[str]:
     return None
 
 
+@dataclass(frozen=True)
+class SyntheticRestoreResult:
+    text: Optional[str]
+    structurally_complete: bool
+    recovered_partial: bool
+    failure_reason: Optional[str]
+
+
+def log_integrity(**fields) -> None:
+    """Only fixed protocol metadata belongs in request-scoped diagnostics."""
+    allowed = {"status", "transport", "synthetic_seen", "restored", "structurally_complete",
+               "recovered_partial", "finish_reason", "native_finish_reason", "failure_category",
+               "selected_text_channel", "stream_done"}
+    fields = {key: value for key, value in fields.items() if key in allowed}
+    fields.setdefault("transport", "buffered")
+    fields.setdefault("status", "integrity_failed" if fields.get("failure_category") else
+                      "partial" if fields.get("recovered_partial") or fields.get("finish_reason") in ("length", "content_filter") else
+                      "restored" if fields.get("synthetic_seen") else "not_called")
+    native = fields.get("native_finish_reason")
+    if native is not None:
+        from outcome import normalize_finish_reason
+        native = normalize_finish_reason(native)
+        # Match outcome.normalize_finish_reason's known protocol reasons, not
+        # arbitrary uppercase text supplied by an upstream response.
+        known = {
+            "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "BLOCKLIST",
+            "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION", "ESCALATION", "PUP_LIMITED_DISABLED",
+            "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE", "IMAGE_OTHER", "NO_IMAGE",
+            "OTHER", "UNSPECIFIED", "FINISH_REASON_UNSPECIFIED",
+        }
+        if native in known:
+            fields["native_finish_reason"] = native
+        else:
+            fields.pop("native_finish_reason", None)
+    try:
+        import request_log
+        ctx = request_log.current()
+        if ctx is not None:
+            ctx.emit("anti_truncation_integrity", "防截断完整性诊断", **fields)
+    except Exception:
+        pass
+
+
+def integrity_error() -> GenerationEndError:
+    log_integrity(structurally_complete=False, failure_category="empty_or_protocol")
+    return GenerationEndError(classify_generation_end("MALFORMED_FUNCTION_CALL", is_final=True))
+
+
+def restore_synthetic_args(args: Any) -> SyntheticRestoreResult:
+    """Strict integrity proof is independent of the existing salvage parser."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_field")
+            result[key] = value
+        return result
+
+    try:
+        if isinstance(args, str):
+            if len(args.encode("utf-8")) > MAX_ARGS_BYTES:
+                return SyntheticRestoreResult(None, False, False, "resource_limit")
+            parsed = json.loads(args, object_pairs_hook=unique_object)
+        else:
+            parsed = args
+            if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > MAX_ARGS_BYTES:
+                return SyntheticRestoreResult(None, False, False, "resource_limit")
+        complete = (isinstance(parsed, dict) and set(parsed) == {"content"}
+                    and isinstance(parsed["content"], str))
+        if complete:
+            parsed["content"].encode("utf-8")
+            return SyntheticRestoreResult(parsed["content"], True, False, None)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        pass
+    text = extract_content_from_args(args)
+    return SyntheticRestoreResult(text, False, text is not None, "invalid_arguments")
+
+
 def is_synthetic_part(part: Any, tool_name: str) -> bool:
     """判定 Gemini Part 是否是合成工具调用。"""
     fc = getattr(part, "function_call", None)
@@ -479,7 +562,8 @@ def has_synthetic_tool_call(openai_dict: dict, tool_name: str) -> bool:
     return False
 
 
-def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str) -> dict:
+def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str, *,
+                                     transport: str = "buffered", native_finish_reasons=None) -> dict:
     """非流式/假流式：从 OpenAI 响应 dict 解构合成工具调用，还原为标准 assistant.content。
 
     - 合成内容作为最终正文（绝不与非合成 content 拼接，杜绝双来源拼接错误）；
@@ -508,8 +592,23 @@ def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str) -> dict:
             if not isinstance(fn, dict):
                 continue
             if fn.get("name") == tool_name:
+                if synthetic_found:
+                    raise integrity_error()
                 synthetic_found = True
-                content = extract_content_from_args(fn.get("arguments"))
+                restored = restore_synthetic_args(fn.get("arguments"))
+                content = restored.text
+                log_integrity(transport=transport, synthetic_seen=True,
+                              status="integrity_failed" if not restored.structurally_complete and choice.get("finish_reason") in ("stop", "tool_calls") else
+                              "partial" if restored.recovered_partial or choice.get("finish_reason") in ("length", "content_filter") else "restored",
+                              native_finish_reason=(native_finish_reasons or {}).get(choice.get("index", 0)),
+                              restored=content is not None,
+                              structurally_complete=restored.structurally_complete,
+                              recovered_partial=restored.recovered_partial,
+                              finish_reason=choice.get("finish_reason")
+                              if choice.get("finish_reason") in ("stop", "tool_calls", "length", "content_filter") else None)
+                if (not restored.structurally_complete
+                        and choice.get("finish_reason") in ("stop", "tool_calls")):
+                    raise integrity_error()
                 if content is not None:
                     synthetic_contents.append(content)
             else:
@@ -527,10 +626,20 @@ def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str) -> dict:
             print(f"⚠️ [防截断] 模型调用了合成工具 {tool_name} 但 content 为空，已回退普通输出。")
 
         if real_calls:
+            if choice.get("finish_reason") in ("stop", "tool_calls"):
+                for tc in real_calls:
+                    arguments = (tc.get("function") or {}).get("arguments")
+                    try:
+                        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                        if not isinstance(parsed, dict):
+                            raise ValueError("invalid_arguments")
+                    except (ValueError, TypeError, RecursionError):
+                        raise integrity_error() from None
             for i, tc in enumerate(real_calls):
                 tc["index"] = i
             message["tool_calls"] = real_calls
-            choice["finish_reason"] = "tool_calls"
+            if choice.get("finish_reason") in ("stop", "tool_calls"):
+                choice["finish_reason"] = "tool_calls"
             _rebuild_part_order(message, tool_name)
         else:
             message.pop("tool_calls", None)
@@ -611,7 +720,7 @@ def _json_path_tail(path: Any) -> str:
     return text.strip("'\"")
 
 
-def _json_path_set(target: dict, path: str, value: Any) -> bool:
+def _json_path_set(target: dict, path: str, value: Any, budget: Optional[list] = None) -> bool:
     """把 partial_args 的值写进累积 dict（支持 $.a.b[0].c 与 /a/b 两种写法）。
 
     返回是否写入成功；解析不了的路径返回 False（调用方降级处理，不能静默丢参）。
@@ -619,6 +728,10 @@ def _json_path_set(target: dict, path: str, value: Any) -> bool:
     if not isinstance(path, str) or not path:
         return False
     text = path.strip()
+    if len(text) > 1024 or not (
+            re.fullmatch(r"\$(?:\.[A-Za-z_][A-Za-z_0-9]*|\[\d+\])+", text)
+            or re.fullmatch(r"(?:/[^/~]+(?:~[01][^/~]*)*)+", text)):
+        return False
     if text.startswith("$"):
         text = text[1:]
     tokens: list = []
@@ -649,9 +762,15 @@ def _json_path_set(target: dict, path: str, value: Any) -> bool:
         i += 1
     if buf:
         tokens.append(buf)
-    if not tokens:
+    if not tokens or len(tokens) > 64 or any(isinstance(t, int) and t > 1024 for t in tokens):
         return False
 
+    if budget is not None:
+        # Reserve before expansion; conservative overcount keeps memory bounded.
+        cost = sum(t + 1 if isinstance(t, int) else 1 for t in tokens)
+        if cost > budget[0]:
+            return False
+        budget[0] -= cost
     cursor: Any = target
     for idx, token in enumerate(tokens):
         last = idx == len(tokens) - 1
@@ -662,18 +781,28 @@ def _json_path_set(target: dict, path: str, value: Any) -> bool:
             while len(cursor) <= token:
                 cursor.append(None)
             if last:
+                previous = cursor[token] if isinstance(cursor, list) else cursor.get(token)
+                if isinstance(previous, (dict, list)) and previous != value:
+                    return False
                 cursor[token] = value
             else:
-                if not isinstance(cursor[token], (dict, list)):
+                if cursor[token] is not None and not isinstance(cursor[token], (dict, list)):
+                    return False
+                if cursor[token] is None:
                     cursor[token] = [] if isinstance(nxt, int) else {}
                 cursor = cursor[token]
         else:
             if not isinstance(cursor, dict):
                 return False
             if last:
+                previous = cursor[token] if isinstance(cursor, list) else cursor.get(token)
+                if isinstance(previous, (dict, list)) and previous != value:
+                    return False
                 cursor[token] = value
             else:
-                if not isinstance(cursor.get(token), (dict, list)):
+                if token in cursor and not isinstance(cursor[token], (dict, list)):
+                    return False
+                if token not in cursor:
                     cursor[token] = [] if isinstance(nxt, int) else {}
                 cursor = cursor[token]
     return True
@@ -685,10 +814,19 @@ class _CandidatePartialState:
     def __init__(self) -> None:
         self.mode: Optional[str] = None      # None | "synthetic" | "real"
         self.synthetic_seen = False
+        self.synthetic_id = None
         self.synthetic_content_seen = False  # 是否已经吐出过合成正文（防重复输出）
+        self.content_closed = False
+        self.call_closed = False
+        self.synthetic_complete = False
+        self.synthetic_bytes = 0
+        self.unicode_pending = ""
+        self.real_bytes = 0
         self.real_part: Any = None           # 真实调用首片（带 name / id / 思考签名）
         self.real_args: Optional[dict] = None
-        self.real_ok = True                  # 路径解析是否全部成功（失败则用空参兜底）
+        self.real_ok = True
+        self.real_open_paths = set()
+        self.real_values = {}
         self.real_degraded_warned = False
 
 
@@ -715,6 +853,7 @@ class StreamPartialState:
         self.partial_args_seen = False        # 本次流是否真的出现了分片参数
         self._non_content_warned = False
         self._candidates: dict = {}
+        self._node_budget = [65536]
 
     # ---------- 内部 ----------
     def _cand(self, candidate_index: int) -> _CandidatePartialState:
@@ -726,18 +865,28 @@ class StreamPartialState:
         """累积合成工具分片，返回本片新增正文。"""
         chunks = []
         for pa in partials:
-            if _is_partial_end_marker(pa):
-                continue
             value = getattr(pa, "string_value", None)
-            if value is None:
-                continue
-            path = getattr(pa, "json_path", None)
-            tail = _json_path_tail(path)
-            if path and tail not in CONTENT_KEYS and not self._non_content_warned:
-                # fail-open：认不出的路径也照吐（宁可多吐，不能静默丢正文）
-                self._non_content_warned = True
-                print(f"⚠️ [防截断] 增量参数路径 {path!r} 不是已知正文键名，已按正文照常输出。")
+            if getattr(pa, "json_path", None) != "$.content" or not isinstance(value, str):
+                raise integrity_error()
+            if cs.content_closed or cs.call_closed:
+                raise integrity_error()
+            value = cs.unicode_pending + value
+            cs.unicode_pending = ""
+            if value and 0xD800 <= ord(value[-1]) <= 0xDBFF:
+                cs.unicode_pending = value[-1]
+                value = value[:-1]
+            try:
+                value = value.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+            except UnicodeError:
+                raise integrity_error() from None
+            cs.synthetic_bytes += len(value.encode("utf-8"))
+            if cs.synthetic_bytes > MAX_ARGS_BYTES:
+                raise integrity_error()
             chunks.append(value)
+            if getattr(pa, "will_continue", None) is not True:
+                if cs.unicode_pending:
+                    raise integrity_error()
+                cs.content_closed = True
         text = "".join(chunks)
         if text:
             cs.synthetic_content_seen = True
@@ -747,13 +896,28 @@ class StreamPartialState:
     def _feed_real(self, cs: _CandidatePartialState, partials: list) -> None:
         """累积真实调用分片到 cs.real_args。"""
         for pa in partials:
-            if _is_partial_end_marker(pa):
-                continue
             path = getattr(pa, "json_path", None)
             if not isinstance(path, str) or not path:
+                raise integrity_error()
+            if _is_partial_end_marker(pa) and path in cs.real_open_paths:
+                cs.real_open_paths.discard(path)
                 continue
-            if not _json_path_set(cs.real_args, path, _partial_arg_value(pa)):
+            value = _partial_arg_value(pa)
+            cs.real_bytes += len(json.dumps(value, ensure_ascii=True).encode("utf-8")) + len(path.encode("utf-8"))
+            if cs.real_bytes > MAX_ARGS_BYTES or len(cs.real_values) >= 1024:
+                raise integrity_error()
+            if path in cs.real_values:
+                if path not in cs.real_open_paths or not isinstance(value, str):
+                    raise integrity_error()
+                value = cs.real_values[path] + value
+            cs.real_values[path] = value
+            if getattr(pa, "will_continue", None) is True:
+                cs.real_open_paths.add(path)
+            else:
+                cs.real_open_paths.discard(path)
+            if not _json_path_set(cs.real_args, path, value, self._node_budget):
                 cs.real_ok = False
+                raise integrity_error()
 
     def _flush_real(self, cs: _CandidatePartialState) -> Any:
         """把累积参数写回首片并返回（未缓冲任何调用时返回 None）。"""
@@ -763,20 +927,17 @@ class StreamPartialState:
         cs.real_args = None
         if src is None:
             return None
-        if not cs.real_ok and not cs.real_degraded_warned:
-            cs.real_degraded_warned = True
-            print("⚠️ [防截断] 真实工具调用的增量参数路径无法解析，本次以空参数收尾"
-                  "（不影响正文输出，请在滚动日志里核对工具声明）。")
+        if not cs.real_ok or cs.real_open_paths:
+            raise integrity_error()
         try:
             part = src.model_copy(deep=True)
             fc = part.function_call
-            fc.args = args if cs.real_ok else {}
+            fc.args = args
             fc.partial_args = None
             fc.will_continue = None
             return part
-        except Exception as e:
-            print(f"⚠️ [防截断] 增量参数回填失败，回退原片：{e}")
-            return src
+        except Exception:
+            raise integrity_error() from None
 
     # ---------- 对外 ----------
     @property
@@ -789,15 +950,30 @@ class StreamPartialState:
         """本次流是否已经解出过合成正文（流末用于"调了工具却空正文"的告警判定）。"""
         return any(c.synthetic_content_seen for c in self._candidates.values())
 
+    def validate_terminal(self, candidate_index: int, finish_reason: Optional[str],
+                          native_finish_reason=None) -> None:
+        cs = self._cand(candidate_index)
+        complete = (cs.synthetic_complete or cs.content_closed) and cs.call_closed
+        log_integrity(transport="stream", synthetic_seen=cs.synthetic_seen,
+                      status="integrity_failed" if cs.real_part is not None or (cs.synthetic_seen and not complete and finish_reason in ("stop", "tool_calls")) else
+                      "not_called" if not cs.synthetic_seen else
+                      "partial" if not complete or finish_reason in ("length", "content_filter") else "restored",
+                      native_finish_reason=native_finish_reason,
+                      restored=cs.synthetic_content_seen, structurally_complete=complete,
+                      recovered_partial=cs.synthetic_content_seen and not complete,
+                      finish_reason=finish_reason)
+        if cs.real_part is not None:
+            raise integrity_error()
+        if (cs.synthetic_seen and finish_reason in ("stop", "tool_calls")
+                and not complete):
+            raise integrity_error()
+
     def flush_pending_real(self) -> list:
         """流结束时冲洗未收尾的真实调用，返回 [(candidate_index, part), ...]。"""
         out = []
         for idx, cs in self._candidates.items():
             if cs.mode == "real" and cs.real_part is not None:
-                part = self._flush_real(cs)
-                cs.mode = None
-                if part is not None:
-                    out.append((idx, part))
+                raise integrity_error()
         return out
 
 
@@ -838,6 +1014,12 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
 
         # ① 合成工具（首片带名字；后续无名分片见 ③）
         if tool_name and is_synthetic_part(part, tool_name):
+            if cs.real_part is not None or cs.call_closed:
+                raise integrity_error()
+            if cs.synthetic_seen and getattr(fc, "id", None) and fc.id != cs.synthetic_id:
+                raise integrity_error()
+            if not cs.synthetic_seen:
+                cs.synthetic_id = getattr(fc, "id", None)
             cs.synthetic_seen = True
             cs.mode = "synthetic"
             changed = True
@@ -848,14 +1030,23 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
             elif args is not None and not cs.synthetic_content_seen:
                 # 上游没走增量（老模型/降级）：沿用整段提取。
                 # 已经吐过分片正文时忽略整段参数，避免同一份正文输出两次。
-                content = extract_content_from_args(args)
+                restored = restore_synthetic_args(args)
+                cs.synthetic_complete = restored.structurally_complete
+                content = restored.text
                 if content:
                     cs.synthetic_content_seen = True
                     synthetic_texts.append(content)
+            elif args is not None:
+                cs.synthetic_complete = restore_synthetic_args(args).structurally_complete
+            if (getattr(fc, "will_continue", None) is False
+                    or (getattr(fc, "will_continue", None) is None and args is not None)):
+                cs.call_closed = True
             continue
 
         # ② 真实调用的首片（带名字）
         if name:
+            if cs.real_part is not None:
+                raise integrity_error()
             done = state._flush_real(cs)
             if done is not None:
                 kept.append(done)
@@ -874,19 +1065,41 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
             cs.real_part = part
             cs.real_args = {}
             cs.real_ok = True
+            cs.real_open_paths = set()
+            cs.real_values = {}
+            cs.real_bytes = 0
             changed = True
             if partials:
                 state.partial_args_seen = True
                 state._feed_real(cs, partials)
+                if will_continue is False:
+                    kept.append(state._flush_real(cs))
+                    cs.mode = None
             continue
 
-        # ③ 无名分片：归属当前模式
+        # ③ 无名分片：归属当前模式；带 ID 时必须匹配首片。
+        if (cs.real_part is not None and getattr(fc, "id", None)
+                and getattr(fc, "id", None) != getattr(cs.real_part.function_call, "id", None)):
+            raise integrity_error()
         if cs.mode == "synthetic":
+            if cs.call_closed or (getattr(fc, "id", None) and fc.id != cs.synthetic_id):
+                raise integrity_error()
             changed = True
+            if args is not None:
+                restored = restore_synthetic_args(args)
+                if not restored.structurally_complete:
+                    raise integrity_error()
+                cs.synthetic_complete = True
+                if not cs.synthetic_content_seen and restored.text:
+                    cs.synthetic_content_seen = True
+                    synthetic_texts.append(restored.text)
             if partials:
                 text = state._feed_synthetic(cs, partials)
                 if text:
                     synthetic_texts.append(text)
+            if (getattr(fc, "will_continue", None) is False
+                    or (getattr(fc, "will_continue", None) is None and not partials)):
+                cs.call_closed = True
             continue
         if cs.mode == "real":
             if partials:
@@ -894,6 +1107,9 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                 if state.allow_real_buffering:
                     changed = True
                     state._feed_real(cs, partials)
+                    if getattr(fc, "will_continue", None) is False:
+                        kept.append(state._flush_real(cs))
+                        cs.mode = None
                 else:
                     kept.append(part)
                 continue
@@ -907,6 +1123,8 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                 kept.append(part)
                 cs.mode = None
             continue
+        if partials:
+            raise integrity_error()
         kept.append(part)
 
     if not changed:

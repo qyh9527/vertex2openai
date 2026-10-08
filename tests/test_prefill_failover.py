@@ -157,7 +157,7 @@ async def test_committed_output_does_not_retry_or_switch(monkeypatch, kind):
     assert fallback.aio.models.calls == 0
     assert _contents(lines).count("prefix ") == 1
     assert lines.count("data: [DONE]\n\n") == 1
-    assert not any('"error"' in line for line in lines)
+    assert any('"error"' in line for line in lines)
     if kind == "text":
         assert _contents(lines) == ["prefix ", "answer"]
     else:
@@ -186,10 +186,9 @@ async def test_pending_real_tool_flush_follows_prefill():
     client = _FakeClient([[_chunk(parts=[part])]])
     response = await _execute(client, synthetic_tool_name="v2o_emit_terminal")
     lines = [line async for line in response.body_iterator]
-    assert _contents(lines) == ["prefix "]
-    prefix_index = next(i for i, line in enumerate(lines) if '"prefix "' in line)
-    tool_index = next(i for i, line in enumerate(lines) if '"tool_calls"' in line)
-    assert prefix_index < tool_index
+    assert _contents(lines) == []
+    assert not any('"tool_calls"' in line for line in lines)
+    assert any('"error"' in line for line in lines)
     assert lines.count("data: [DONE]\n\n") == 1
 
 

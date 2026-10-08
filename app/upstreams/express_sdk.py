@@ -35,7 +35,7 @@ from runtime_state import app_state
 from failover import UpstreamUnstartedError
 from anti_truncation import (is_enabled_for_request, inject_request, get_enabled_field,
                             enable_stream_partial_args, partial_args_enabled,
-                            partial_args_supported)
+                            partial_args_supported, log_integrity)
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -515,9 +515,11 @@ class ExpressSDKUpstream(BaseUpstream):
         # 每次调用都打一行显眼日志（✅ 已启用 / ⛔ 未启用或被忽略），标注下游启用字段名
         # 与具体情况，滚动日志里一眼分辨哪些请求有防截断保护。
         synthetic_tool_name = None
+        at_transport = "fake_stream" if request_obj.stream and is_fake else "stream" if request_obj.stream else "buffered"
         at_field = get_enabled_field()
         if is_enabled_for_request(request_obj, {"value": at_field}):
             if is_image_model:
+                log_integrity(status="skipped", transport=at_transport, synthetic_seen=False)
                 print(f"⛔ [防截断] 本次调用下游已启用（字段「{at_field}」=true），"
                       "但生图/非文本模型不支持工具参数输出，已忽略启用字段（走普通通道）。")
             else:
@@ -525,6 +527,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 print(f"✅ [防截断] 本次调用下游已启用（字段「{at_field}」=true）→ "
                       f"已注入合成传输工具 {synthetic_tool_name}，回答改走工具参数输出绕开截断。")
         else:
+            log_integrity(status="disabled", transport=at_transport, synthetic_seen=False)
             print(f"⛔ [防截断] 本次调用下游未启用（请求体无「{at_field}」字段或值非 true）→ "
                   "走普通文本生成，重提示词场景存在 max_output_tokens 截断风险。")
 

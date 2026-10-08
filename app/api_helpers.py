@@ -53,6 +53,7 @@ from anti_truncation import (
     transform_stream_chunk,
     note_partial_args_unsupported,
     SETTING_SIDE_BUFFER,
+    log_integrity,
 )
 from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 
@@ -623,6 +624,8 @@ async def gemini_fake_stream_generator(
             api_call_task.cancel()
             cancel_requested = True
         outcome_state = "cancelled"
+        if synthetic_tool_name:
+            log_integrity(status="cancelled", transport="fake_stream", failure_category="client_closed", stream_done=False)
         ctx.set_outcome("cancelled", phase=phase, upstream_task_done=task_done,
                         cancel_requested=cancel_requested)
 
@@ -772,11 +775,15 @@ async def gemini_fake_stream_generator(
                 openai_response_dict["choices"][index]["finish_reason"] = end.finish_reason
 
         if synthetic_tool_name:
+            native_reasons = {index: getattr(candidate, "finish_reason", None) for index, candidate in enumerate(candidates)}
             if not has_synthetic_tool_call(openai_response_dict, synthetic_tool_name):
+                log_integrity(status="not_called", transport="fake_stream", synthetic_seen=False,
+                              native_finish_reason=next(iter(native_reasons.values()), None))
                 print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
                       "本次未生效（如实透传普通输出）。")
             openai_response_dict = strip_synthetic_from_openai_dict(
-                openai_response_dict, synthetic_tool_name)
+                openai_response_dict, synthetic_tool_name, transport="fake_stream",
+                native_finish_reasons=native_reasons)
         if input_relay_strip_tag:
             openai_response_dict = _strip_input_relay_from_openai_dict(
                 openai_response_dict, input_relay_strip_tag)
@@ -859,6 +866,8 @@ async def gemini_fake_stream_generator(
         if outcome_state is None:
             # 被 aclose / GeneratorExit 或其他 BaseException 打断，没有业务结论。
             outcome_state = "cancelled"
+            if synthetic_tool_name:
+                log_integrity(status="cancelled", transport="fake_stream", failure_category="client_closed", stream_done=False)
             ctx.set_outcome(
                 "cancelled", phase=phase,
                 upstream_task_done=(not upstream_cancel_forced) if api_call_task is not None else None,
@@ -1050,7 +1059,8 @@ async def _execute_gemini_call(
                     side_buffer_bytes = 0
                 side_buffering = bool(synthetic_tool_name) and side_buffer_bytes > 0
                 side_buffer: list = []
-                side_emitted = False               # 缓冲已 flush（防重复输出）
+                side_emitted = False
+                selected_text_channel = None
                 # 真流式增量参数状态机（3.33）：合成正文逐片实时下发，
                 # 真实工具调用的分片参数累积完成后按原样一次性交给转换管线。
                 partial_state = StreamPartialState(synthetic_tool_name) if synthetic_tool_name else None
@@ -1069,6 +1079,7 @@ async def _execute_gemini_call(
                     if await _client_gone():
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                         return
+                    stream_gen_obj = None
                     try:
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
                             model=model_to_call,
@@ -1085,11 +1096,18 @@ async def _execute_gemini_call(
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
                         # 前缀延迟到有效输出或正常终止再下发，建流成功不代表迭代不会失败。
 
+                        if synthetic_tool_name:
+                            partial_state = StreamPartialState(synthetic_tool_name)
+                            side_buffer = []
+                            side_emitted = False
+                            selected_text_channel = None
+                            synthetic_seen = False
                         final_usage = map_usage()
                         pending_finishes = {}
                         seen_candidate_indexes = set()
                         candidate_tool_calls = set()
                         terminal_finish_reasons = {}
+                        native_finish_reasons = {}
                         raw_terminal_candidate_indexes = set()
                         prompt_feedback_terminal = False
 
@@ -1097,6 +1115,9 @@ async def _execute_gemini_call(
                             if conversion_report is not None:
                                 conversion_report.inspect_response(chunk_item_call)
                             raw_candidates = getattr(chunk_item_call, "candidates", None) or []
+                            if partial_state is not None and len(raw_candidates) > 1:
+                                raise GenerationEndError(classify_generation_end(
+                                    "MALFORMED_RESPONSE", is_final=True))
                             raw_feedback_end = _classify_prompt_feedback(chunk_item_call)
                             if raw_feedback_end and raw_feedback_end.error_type:
                                 raise GenerationEndError(raw_feedback_end)
@@ -1104,12 +1125,18 @@ async def _execute_gemini_call(
                                 prompt_feedback_terminal = True
                             if raw_candidates:
                                 for fallback_index, raw_candidate in enumerate(raw_candidates):
-                                    candidate_index = fallback_index
+                                    sdk_index = getattr(raw_candidate, "index", None)
+                                    candidate_index = fallback_index if sdk_index is None else sdk_index
+                                    if candidate_index in raw_terminal_candidate_indexes:
+                                        raise GenerationEndError(classify_generation_end(
+                                            "MALFORMED_RESPONSE", is_final=True))
                                     seen_candidate_indexes.add(candidate_index)
                                     if _candidate_has_real_tool_calls(
                                             raw_candidate, synthetic_tool_name):
                                         candidate_tool_calls.add(candidate_index)
                                     raw_finish_reason = getattr(raw_candidate, "finish_reason", None)
+                                    if raw_finish_reason is not None:
+                                        native_finish_reasons[candidate_index] = raw_finish_reason
                                     raw_end = classify_generation_end(
                                         raw_finish_reason,
                                         has_tool_calls=(candidate_index in candidate_tool_calls),
@@ -1138,7 +1165,10 @@ async def _execute_gemini_call(
                                 chunk_item_call, _syn_contents = transform_stream_chunk(
                                     chunk_item_call, 0, partial_state)
                                 synthetic_seen = partial_state.synthetic_seen
+                                if selected_text_channel == "plain":
+                                    _syn_contents = []
                                 if _syn_contents:
+                                    selected_text_channel = "synthetic"
                                     if side_buffer and not side_emitted:
                                         # 命中合成调用：丢弃此前缓冲的普通文本（单来源原则）
                                         print(f"⚠️ [防截断] 模型在调用合成工具前输出了 {sum(len(s) for s in side_buffer)} "
@@ -1173,10 +1203,10 @@ async def _execute_gemini_call(
                                 sse_payload = json.loads(sse_chunk[len("data: "):])
                                 choice_payload = (sse_payload.get("choices") or [{}])[0]
                                 delta_payload = choice_payload.get("delta") or {}
-                                if (delta_payload.get("content") or delta_payload.get("reasoning_content")
-                                        or delta_payload.get("tool_calls") or delta_payload.get("extra_content")
-                                        or delta_payload.get("function_call")):
-                                    has_yielded = True
+                                if synthetic_tool_name and delta_payload.get("content"):
+                                    if selected_text_channel == "synthetic":
+                                        delta_payload.pop("content", None)
+                                        sse_chunk = f"data: {json.dumps(sse_payload, ensure_ascii=False)}\n\n"
                                 if deduper is not None:
                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                     if sse_chunk is None:
@@ -1186,10 +1216,11 @@ async def _execute_gemini_call(
                                         sse_chunk, input_relay_stripper)
                                     if sse_chunk is None:
                                         continue  # 正文属于待判定/待剥离的标签块
-                                if side_buffering and not synthetic_seen and not side_emitted:
+                                if side_buffering and selected_text_channel != "synthetic" and not side_emitted:
                                     # 缓冲已攒够阈值：整批放行并永久转直通（首字延迟优先，对齐上游 1.0.9）
-                                    if side_buffer and sum(len(s) for s in side_buffer) >= side_buffer_bytes:
+                                    if side_buffer and sum(len(s.encode("utf-8")) for s in side_buffer) >= side_buffer_bytes:
                                         side_emitted = True
+                                        selected_text_channel = "plain"
                                         if _pf := _pending_prefill():
                                             yield _pf
                                         for _sc in side_buffer:
@@ -1200,6 +1231,15 @@ async def _execute_gemini_call(
                                         # 合成调用尚未出现：普通文本先入 side-buffer 不透传
                                         #（命中合成即丢弃、流末未命中则 flush 兜底）
                                         _sideheld = _try_buffer_side_text(sse_chunk, side_buffer)
+                                        if side_buffer and sum(len(s.encode("utf-8")) for s in side_buffer) >= side_buffer_bytes:
+                                            side_emitted = True
+                                            selected_text_channel = "plain"
+                                            has_yielded = True
+                                            if _pf := _pending_prefill():
+                                                yield _pf
+                                            for text in side_buffer:
+                                                yield _input_relay_sse_text(response_id_for_stream, request_obj, text)
+                                            side_buffer = []
                                         if _sideheld is None:
                                             continue      # 纯正文 chunk：已整条吞下
                                         if _sideheld is not False:
@@ -1219,6 +1259,12 @@ async def _execute_gemini_call(
                                 output_payload = json.loads(sse_chunk[len("data: "):])
                                 output_choice = (output_payload.get("choices") or [{}])[0]
                                 output_delta = output_choice.get("delta") or {}
+                                if synthetic_tool_name and output_delta.get("content"):
+                                    selected_text_channel = "plain"
+                                if (output_delta.get("content") or output_delta.get("reasoning_content")
+                                        or output_delta.get("tool_calls") or output_delta.get("extra_content")
+                                        or output_delta.get("function_call")):
+                                    has_yielded = True
                                 if (output_delta.get("content") or output_delta.get("reasoning_content")
                                         or output_delta.get("tool_calls") or output_delta.get("extra_content")
                                         or output_delta.get("function_call") or output_choice.get("finish_reason")):
@@ -1288,6 +1334,12 @@ async def _execute_gemini_call(
                                     yield _pf
                                 yield _input_relay_sse_text(response_id_for_stream, request_obj, relay_tail)
 
+                        if partial_state is not None:
+                            log_integrity(transport="stream", selected_text_channel=selected_text_channel,
+                                          synthetic_seen=synthetic_seen, stream_done=False)
+                            for candidate_index, finish_reason in terminal_finish_reasons.items():
+                                partial_state.validate_terminal(candidate_index, finish_reason,
+                                                                native_finish_reasons.get(candidate_index))
                         for finish in pending_finishes.values():
                             if _pf := _pending_prefill():
                                 yield _pf
@@ -1337,14 +1389,24 @@ async def _execute_gemini_call(
                         if wants_usage(request_obj):
                             yield make_usage_chunk(response_id_for_stream, request_obj.model, final_usage)
 
+                        if partial_state is not None:
+                            log_integrity(transport="stream", stream_done=True, synthetic_seen=synthetic_seen,
+                                          status="not_called" if not synthetic_seen else
+                                          "partial" if any(reason in ("length", "content_filter") for reason in terminal_finish_reasons.values()) else "restored",
+                                          selected_text_channel=selected_text_channel)
                         yield "data: [DONE]\n\n"
                         return
 
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, GeneratorExit):
+                        if synthetic_tool_name:
+                            log_integrity(status="cancelled", transport="stream", failure_category="client_closed", stream_done=False)
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
                         if isinstance(e_stream_call, GenerationEndError):
+                            if synthetic_tool_name:
+                                log_integrity(status="integrity_failed", transport="stream", failure_category="empty_or_protocol",
+                                              native_finish_reason=next(iter(native_finish_reasons.values()), None), stream_done=False)
                             yield _generation_end_error_sse(e_stream_call)
                             yield "data: [DONE]\n\n"
                             return
@@ -1405,8 +1467,10 @@ async def _execute_gemini_call(
                         # 预填充已发出时不触发 failover：切换后新通道会重发预填充，客户端会看到重复开头。
                         if failover_mode and not has_yielded and not prefill_sent and is_retryable:
                             raise UpstreamUnstartedError(str(e_stream_call))
-                        # 已经输出过内容（正文或预填充前缀）：不再重发错误体，只补结束标记，避免污染已有输出
+                        # 已出流异常必须明确报失败，不能只发 DONE 伪装正常收尾。
                         if has_yielded or prefill_sent:
+                            yield _generation_end_error_sse(GenerationEndError(
+                                classify_generation_end("MALFORMED_RESPONSE", is_final=True)))
                             yield "data: [DONE]\n\n"
                             return
                         # 未出流：预检（is_auto_attempt）语义 = 抛异常由调用方决定。
@@ -1417,6 +1481,8 @@ async def _execute_gemini_call(
                         yield f"data: {json.dumps(err_resp)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
+                    finally:
+                        await request_log.aclose_quietly(stream_gen_obj)
 
             return StreamingResponse(
                 with_usage_null(_gemini_real_stream_generator_inner(), wants_usage(request_obj)),
@@ -1552,11 +1618,18 @@ async def _execute_gemini_call(
                 for choice in openai_response_content["choices"]:
                     choice["finish_reason"] = prompt_end.finish_reason
         if synthetic_tool_name:
+            native_reasons = {index: getattr(candidate, "finish_reason", None) for index, candidate in enumerate(candidates)}
             if not has_synthetic_tool_call(openai_response_content, synthetic_tool_name):
+                log_integrity(status="not_called", transport="buffered", synthetic_seen=False,
+                              native_finish_reason=next(iter(native_reasons.values()), None))
                 print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
                       "本次未生效（如实透传普通输出）。")
-            openai_response_content = strip_synthetic_from_openai_dict(
-                openai_response_content, synthetic_tool_name)
+            try:
+                openai_response_content = strip_synthetic_from_openai_dict(
+                    openai_response_content, synthetic_tool_name,
+                    native_finish_reasons=native_reasons)
+            except GenerationEndError as error:
+                return _generation_end_error_response(error)
         if input_relay_strip_tag:
             openai_response_content = _strip_input_relay_from_openai_dict(
                 openai_response_content, input_relay_strip_tag)

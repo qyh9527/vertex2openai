@@ -441,6 +441,10 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
     if hasattr(chunk, "candidates") and chunk.candidates and len(chunk.candidates) > candidate_index:
         candidate = chunk.candidates[candidate_index]
+        # The argument selects a position; SDK index is the cross-chunk identity.
+        sdk_index = getattr(candidate, "index", None)
+        if sdk_index is not None:
+            candidate_index = sdk_index
         parts = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
         has_tool_calls = any(getattr(part, "function_call", None) is not None for part in parts)
         raw_reason = getattr(candidate, "finish_reason", None)

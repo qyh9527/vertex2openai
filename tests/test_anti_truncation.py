@@ -282,7 +282,9 @@ class TestStreamPartialArgs:
         ]
         client, req, prompt = self._make_stream(chunks)
         body = await self._run(client, req, prompt, syn)
-        assert self._content_pieces(body) == ["正文来自其他键"]
+        assert self._content_pieces(body) == []
+        assert '"error"' in body
+        assert "正文来自其他键" not in body
 
     async def test_real_tool_call_fragments_reassembled(self):
         """真实工具调用的分片参数累积成完整 arguments，签名/名称原样保留。"""
@@ -325,15 +327,14 @@ class TestStreamPartialArgs:
                  if payload and payload != "[DONE]"
                  for choice in json.loads(payload).get("choices", [])
                  for tc in ((choice.get("delta") or {}).get("tool_calls") or [])]
-        assert len(calls) == 1
-        assert calls[0]["function"]["name"] == "get_weather"
-        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "上海"}
+        # 未闭合参数不能交给客户端执行；已收到的参数不构成完整调用。
+        assert calls == []
         errors = [json.loads(line[len("data: "):])["error"]
                   for line in body.splitlines() if line.startswith("data: {")
                   and '"error"' in line]
         assert len(errors) == 1
         assert errors[0]["category"] == "empty_or_protocol"
-        assert errors[0]["upstream_finish_reason"] == ""
+        assert errors[0]["upstream_finish_reason"] == "MALFORMED_FUNCTION_CALL"
         assert body.count("data: [DONE]") == 1
         assert '"finish_reason": "stop"' not in body
 
@@ -624,7 +625,7 @@ class TestStreamSideBuffer:
         client, req, prompt = self._make_stream(chunks)
         body = await self._run(client, req, prompt, syn)
         content = self._collect_content(body)
-        assert content == "开头几个字合成正文"
+        assert content == "开头几个字"
         assert "v2o_emit" not in body  # 合成工具名绝不泄漏给下游
 
     async def test_preamble_text_dropped_when_buffer_enabled(self):
