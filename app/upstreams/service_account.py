@@ -31,6 +31,7 @@ from upstreams.express_sdk import ExpressSDKUpstream
 from api_helpers import create_openai_error_response
 from http_options import get_http_options, resolve_paygo_bundle
 from runtime_state import app_state
+import request_log
 import config as app_config
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -173,6 +174,7 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         location = location or "global"
         is_global = location == "global"
         headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
+        request_log.note_transport(headers, timeout)
         for w in warnings:
             print(f"⚠️ [流量等级] {w}")
         client_to_use = _get_cached_sa_client(sa_json, project_id, location, headers, timeout)

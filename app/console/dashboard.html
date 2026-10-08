@@ -98,6 +98,157 @@
   .trend-tooltip strong { display:block; margin-bottom:2px; }
   .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { opacity:1; transform:translate(-50%,0); }
   @media (max-width:640px) { .health-legend { gap:4px; } .health-legend-item { padding:6px 3px; } .trend-chart { gap:3px; } .trend-bar { width:78%; } .trend-tooltip { left:0; transform:translate(0,4px); } .trend-mark:hover .trend-tooltip, .trend-mark:focus .trend-tooltip { transform:translate(0,0); } }
+
+  /* ===== 运行日志：按请求分组的可折叠视图（只服务日志区，其余页面不引用） ===== */
+  .lv-win { position:relative; overflow-y:auto; overflow-x:hidden; background:#fff; color:var(--fg); font-size:12.5px; overscroll-behavior:contain; }
+  .lv-hide { display:none !important; }
+  .lv-conn { display:inline-flex; align-items:center; gap:5px; margin-left:4px; font-size:11px; color:var(--muted); white-space:nowrap; }
+  .lv-conn:before { content:""; width:7px; height:7px; border-radius:50%; background:#a1a1aa; flex:0 0 auto; }
+  .lv-conn[data-state=live]:before { background:var(--status-good); }
+  .lv-conn[data-state=retry]:before { background:var(--status-warning); }
+  .lv-conn[data-state=closed]:before { background:var(--status-critical); }
+  .lv-titlebar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+  .lv-title { margin-left:8px; }
+  .lv-tb-first { margin-left:auto; }
+  .lv-filterbar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+  .lv-chips { display:flex; flex-wrap:wrap; gap:4px; }
+  .lv-chip { white-space:nowrap; flex:0 0 auto; }
+  .lv-empty { padding:32px 16px; text-align:center; color:var(--muted); font-size:12px; }
+  .lv-newbtn { position:absolute; left:50%; bottom:14px; transform:translateX(-50%); z-index:5; padding:6px 14px; border:0; border-radius:999px; background:var(--fg); color:#fff; font-size:12px; font-weight:600; cursor:pointer; box-shadow:0 4px 14px rgba(16,24,40,.22); }
+  .lv-newbtn:hover { background:#27272a; }
+
+  .lv-group, .lv-sys { --lv-bar:#d4d4d8; --lv-info:#2a78d6; border-bottom:1px solid var(--border); border-left:3px solid var(--lv-bar); background:#fff; }
+  .lv-group[data-state=in_progress] { --lv-bar:var(--lv-info); }
+  .lv-group[data-state=success] { --lv-bar:var(--status-good); }
+  .lv-group[data-state=failed] { --lv-bar:var(--status-critical); }
+  .lv-group[data-state=cancelled], .lv-group[data-state=unknown] { --lv-bar:#a1a1aa; }
+  .lv-group[data-state=stale] { --lv-bar:#c4c4cc; }
+  .lv-sys { --lv-bar:#e4e4e7; background:#fcfcfd; }
+  .lv-head { display:flex; align-items:stretch; }
+  .lv-head:hover { background:#f8f8fa; }
+  .lv-sum { flex:1 1 auto; min-width:0; min-height:34px; padding:7px 4px 7px 8px; display:grid; align-items:center; column-gap:8px;
+            grid-template-columns:14px 84px 64px 66px 52px minmax(0,1fr) 72px 100px 84px 62px;
+            border:0; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+  .lv-sum > .lv-c, .lv-meta > .lv-c { grid-row:1; min-width:0; }
+  .lv-meta { display:contents; }
+  .lv-chev { grid-column:1; color:#a1a1aa; font-size:10px; transition:transform .15s ease; }
+  .lv-group.open .lv-chev, .lv-sys.open .lv-chev { transform:rotate(90deg); }
+  .lv-badge { grid-column:2; justify-self:start; display:inline-flex; align-items:center; gap:4px; padding:1px 7px; border-radius:6px; font-size:11.5px; font-weight:600; line-height:18px; white-space:nowrap; }
+  .lv-badge.st-in_progress { color:#1d5fb0; background:rgba(42,120,214,.10); }
+  .lv-badge.st-success { color:#0a7d0a; background:rgba(12,163,12,.10); }
+  .lv-badge.st-failed { color:#b42323; background:rgba(208,59,59,.10); }
+  .lv-badge.st-cancelled { color:#52525b; background:#f1f1f4; }
+  .lv-badge.st-unknown, .lv-badge.st-stale { color:#52525b; background:#f7f7f9; border:1px dashed #c4c4cc; padding:0 6px; }
+  .lv-badge.st-in_progress .lv-gl { animation:lv-pulse 1.4s ease-in-out infinite; }
+  @keyframes lv-pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+  .lv-time, .lv-id, .lv-elapsed { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-variant-numeric:tabular-nums; }
+  .lv-time { grid-column:3; font-size:11.5px; color:var(--muted); }
+  .lv-id { grid-column:4; font-size:11.5px; color:#52525b; }
+  .lv-mode { grid-column:5; }
+  .lv-model { grid-column:6; display:flex; align-items:center; gap:6px; }
+  .lv-mn-short { display:none; }
+  .lv-mname { min-width:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .lv-ch { grid-column:7; }
+  .lv-ph { grid-column:8; }
+  .lv-rs { grid-column:9; }
+  .lv-rs-s { display:none; }
+  .lv-tags.lv-tags-m { display:none; }
+  .lv-tags { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; }
+  .lv-elapsed { grid-column:10; justify-self:end; text-align:right; font-size:12px; font-weight:600; }
+  .lv-mode, .lv-ch, .lv-ph, .lv-rs { font-size:11.5px; color:#52525b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .lv-tag { padding:0 5px; border:1px solid transparent; border-radius:4px; font-size:10.5px; line-height:16px; white-space:nowrap; }
+  .lv-tag.slow { color:#a15c07; background:rgba(245,158,11,.14); border-color:rgba(245,158,11,.4); }
+  .lv-tag.inc { color:#52525b; background:#fff; border:1px dashed #c4c4cc; }
+  .lv-tag.hit { color:var(--fg); background:#fff7d6; border-color:#f1d77a; }
+  .lv-group.open .lv-tag.hit { display:none; }
+  .lv-copy { flex:0 0 auto; align-self:center; margin:0 8px 0 2px; padding:2px 8px; border:1px solid var(--border); border-radius:6px; background:#fff; color:#52525b; font-size:11px; cursor:pointer; white-space:nowrap; }
+  .lv-copy:hover { background:#f7f7f9; }
+  .lv-sum:focus-visible, .lv-copy:focus-visible, .lv-newbtn:focus-visible, .lv-chip:focus-visible, .lv-tbtn:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+
+  .lv-body { display:none; border-top:1px solid var(--border); background:#fafafb; }
+  .lv-group.open .lv-body, .lv-sys.open .lv-body { display:block; }
+  .lv-info { display:flex; flex-wrap:wrap; gap:3px 16px; padding:8px 12px 6px 20px; font-size:11.5px; color:#52525b; min-width:0; }
+  .lv-kv { min-width:0; overflow-wrap:anywhere; }
+  .lv-kv b { margin-right:5px; font-weight:500; color:var(--muted); }
+  .lv-kv.warn { color:#a15c07; }
+  .lv-kv.err { color:#b42323; }
+  .lv-kv code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; user-select:all; }
+  .lv-events { padding:2px 0 6px; }
+  .lv-ev { display:grid; grid-template-columns:62px 14px minmax(0,1fr); column-gap:8px; padding:3px 12px 3px 17px; border-left:2px solid transparent; }
+  .lv-ev.lv-warn { border-left-color:var(--status-warning); background:#fffbeb; }
+  .lv-ev.lv-err { border-left-color:var(--status-critical); background:#fef2f2; }
+  .lv-ev.lv-ok { border-left-color:var(--status-good); }
+  .lv-ev.lv-cost { border-left-color:#a855f7; background:#faf5ff; }
+  .lv-ev.lv-dim { opacity:.4; }
+  .lv-et { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; line-height:1.55; }
+  .lv-mk { font-size:11px; font-weight:700; text-align:center; line-height:1.6; color:#a1a1aa; }
+  .lv-ev.lv-warn .lv-mk { color:#a15c07; }
+  .lv-ev.lv-err .lv-mk { color:#b42323; }
+  .lv-ev.lv-ok .lv-mk { color:#0a7d0a; }
+  .lv-ev.lv-cost .lv-mk { color:#7c3aed; }
+  .lv-eb { min-width:0; }
+  .lv-msg { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; line-height:1.55; color:#3f3f46; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .lv-mdl { color:#059669; font-weight:600; }
+  .lv-etags { display:flex; flex-wrap:wrap; gap:4px; margin-top:2px; }
+  .lv-etag { padding:0 6px; border-radius:4px; background:#f1f1f4; color:#52525b; font-size:10.5px; line-height:17px; white-space:nowrap; }
+  .lv-etag.k-at { color:var(--fg); font-weight:600; }
+  .lv-etag.k-sw, .lv-etag.k-bo { color:#a15c07; background:rgba(245,158,11,.14); }
+  .lv-etag.k-er { color:#b42323; background:rgba(208,59,59,.10); }
+  .lv-etag.k-ok { color:#0a7d0a; background:rgba(12,163,12,.10); }
+  .lv-etag.k-nt { color:#a15c07; background:#fff7d6; }
+  .lv-sys .lv-sum { display:flex; align-items:center; gap:8px; }
+  .lv-sys .lv-sys-title { font-weight:600; white-space:nowrap; }
+  .lv-sys .lv-sys-count { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .lv-sys .lv-sys-prev { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; }
+  .lv-sys.open .lv-sys-prev { display:none; }
+
+  @media (max-width:640px) {
+    .lv-sum { grid-template-columns:10px auto minmax(0,1fr) auto; column-gap:5px; row-gap:3px; padding:7px 2px 7px 6px; }
+    .lv-chev { grid-row:1; }
+    .lv-badge { grid-row:1; }
+    .lv-model { grid-column:3; grid-row:1; flex-wrap:nowrap; }
+    .lv-mname { flex:0 1 auto; }
+    .lv-mname.has-short .lv-mn-full { display:none; }
+    .lv-mname.has-short .lv-mn-short { display:inline; }
+    .lv-model .lv-tags { display:none; }
+    .lv-meta > .lv-tags-m { display:inline-flex; order:0; flex:none; }
+    .lv-rs-l { display:none; }
+    .lv-rs-s { display:inline; }
+    .lv-tag.inc { font-size:0; padding:0 4px; }
+    .lv-tag.inc:before { content:"不全"; font-size:10.5px; }
+    .lv-elapsed { grid-column:4; grid-row:1; }
+    .lv-meta { display:flex; flex-wrap:nowrap; align-items:center; gap:0 5px; grid-column:2 / -1; grid-row:2; min-width:0; overflow:hidden; font-size:11px; }
+    .lv-meta > .lv-c { grid-row:auto; flex:none; font-size:11px; }
+    .lv-meta > .lv-ph { order:1; }
+    .lv-meta > .lv-rs { order:2; flex:none; }
+    .lv-meta > .lv-ch { order:3; }
+    .lv-meta > .lv-mode { order:4; }
+    .lv-meta > .lv-time { order:5; flex:0 1 auto; min-width:0; }
+    .lv-meta > .lv-id { order:6; flex:0 10 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .lv-copy { margin:0 6px 0 2px; }
+    .lv-ev { grid-template-columns:54px 14px minmax(0,1fr); column-gap:6px; padding-left:12px; }
+    .lv-info { padding-left:14px; }
+    .lv-titlebar { flex-wrap:nowrap; gap:6px; padding-left:12px; padding-right:12px; }
+    .lv-dots { display:none !important; }
+    .lv-title { margin-left:0; white-space:nowrap; }
+    .lv-conn { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+    .lv-btxt { display:none; }
+    .lv-tbtn { flex:0 0 auto; }
+    .lv-filterbar { flex-wrap:nowrap; gap:6px; }
+    .lv-filterbar .inp { width:112px !important; flex:0 0 auto; }
+    .lv-chips { flex:1 1 auto; min-width:0; flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+    .lv-chips::-webkit-scrollbar { display:none; }
+  }
+  @media (pointer:coarse) {
+    .lv-sum { min-height:44px; }
+    .lv-copy { min-width:44px; min-height:44px; }
+    .lv-chip, .lv-tbtn, .lv-newbtn, .lv-filterbar .inp { min-height:44px; }
+    .lv-tbtn, .lv-newbtn { min-width:44px; }
+  }
+  @media (prefers-reduced-motion:reduce) {
+    .lv-badge.st-in_progress .lv-gl { animation:none; }
+    .lv-chev { transition:none; }
+  }
 </style>
 </head>
 <body class="min-h-screen">
@@ -659,17 +810,25 @@
   <!-- Logs -->
   <section id="view-logs" class="hidden">
     <div class="card overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
-        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
-        <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
-        <button id="clear-log-btn" onclick="clearLogView()" class="ml-auto text-xs px-2 py-1 rounded border border-neutral-200" title="清空当前界面显示（不影响磁盘日志与实时流）">🧹 清空</button>
-        <button id="autoscroll-btn" onclick="toggleAutoScroll()" class="text-xs px-2 py-1 rounded border border-neutral-200">📌 自动滚动</button>
+      <div class="lv-titlebar px-4 py-2.5 border-b border-neutral-200">
+        <div class="lv-dots flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
+        <span class="lv-title text-xs text-neutral-400 log">terminal · 实时监控</span>
+        <span id="log-conn" class="lv-conn" data-state="connecting" role="status">连接中…</span>
+        <button id="clear-log-btn" type="button" onclick="clearLogView()" class="lv-tbtn lv-tb-first text-xs px-2 py-1 rounded border border-neutral-200" aria-label="清空" title="清空当前界面显示（不影响磁盘日志与实时流）"><span aria-hidden="true">🧹</span><span class="lv-btxt"> 清空</span></button>
+        <button id="autoscroll-btn" type="button" aria-pressed="true" onclick="toggleAutoScroll()" class="lv-tbtn text-xs px-2 py-1 rounded border border-neutral-200" aria-label="自动滚动" title="自动滚动"><span aria-hidden="true">📌</span><span class="lv-btxt"> 自动滚动</span></button>
       </div>
-      <div class="px-3 py-2 border-b border-neutral-200 flex items-center gap-2 flex-wrap">
-        <input id="log-filter" class="inp" style="width:150px" placeholder="🔍 关键字过滤…">
-        <div id="log-chips" class="flex gap-1 flex-wrap"></div>
+      <div class="lv-filterbar px-3 py-2 border-b border-neutral-200">
+        <input id="log-filter" class="inp" style="width:150px" placeholder="🔍 关键字过滤…" aria-label="按关键字过滤日志">
+        <div id="log-chips" class="lv-chips"></div>
       </div>
-      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
+      <div class="relative">
+        <div id="logwin" class="lv-win" style="height:60vh" role="log" aria-live="off" aria-label="按请求分组的运行日志">
+          <div id="lv-sys" class="lv-sys lv-hide"></div>
+          <div id="lv-groups"></div>
+          <div id="lv-empty" class="lv-empty">暂无日志 · 等待实时事件…</div>
+        </div>
+        <button id="lv-newbtn" type="button" class="lv-newbtn lv-hide"></button>
+      </div>
     </div>
   </section>
 </div>
@@ -1611,68 +1770,783 @@ async function saveSettings(){
 }
 
 /* ---------- Logs ---------- */
-const logwin=$('logwin'); let autoscroll=true;
-const MAX_LOG_LINES=2000;                     // 缓冲上限：超出丢最旧，防 DOM 无限膨胀
-const LOG_LEVELS=[['all','全部'],['ok','✅ 成功'],['warn','⚠️ 警告'],['err','❌ 错误'],['cost','💰 计费']];
-let curLevel='all'; let filterQ='';
-logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; syncAutoBtn(); });
-function syncAutoBtn(){ const b=$('autoscroll-btn'); if(b){ b.style.background=autoscroll?'#111':''; b.style.color=autoscroll?'#fff':''; } }
-function toggleAutoScroll(){
-  autoscroll=!autoscroll; syncAutoBtn();
-  if(autoscroll && logwin) logwin.scrollTop=logwin.scrollHeight;
-}
-syncAutoBtn();
+/* LOGVIEW-CORE:BEGIN */
+/* 纯逻辑核心：只做事件归并 / 去重 / 分组 / 上限 / 筛选，不读写页面节点；测试会把这一段抽出来在 Node 里运行。 */
+const LV_LIMITS={MAX_GROUPS:200,MAX_EVENTS_PER_GROUP:300,MAX_TOTAL_EVENTS:6000,MAX_UNGROUPED:800,MAX_SEEN_IDS:6000};
+const LV_MODE_LABEL={fake_stream:'假流式',stream:'真流式',non_stream:'非流式'};
+const LV_CHANNEL_LABEL={express:'Express',vertex:'服务账号',cookie:'Cookie'};
+const LV_PHASE_LABEL={received:'已接收',preparing:'准备中',waiting_upstream:'等待上游',backoff:'退避中',upstream_received:'已收到上游',converting_response:'转换中',sending_downstream:'发送中'};
+const LV_STATUS_LABEL={in_progress:'进行中',success:'成功',failed:'失败',cancelled:'已取消',unknown:'未知',stale:'无结束记录'};
+const LV_END_STATUSES=['success','failed','cancelled','unknown'];
 function logLevel(t){
   if(t.includes('✅')||t.includes('🎉')) return 'ok';
-  if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')) return 'warn';
+  if(t.includes('⚠️')||t.includes('WARN')||t.includes('重试')) return 'warn';
   if(t.includes('❌')||t.includes('ERROR')) return 'err';
   if(t.includes('💰')) return 'cost';
   return 'other';
 }
-function logLine(t){
-  let c='#525252',bg='transparent',bl='2px solid transparent';
-  const lv=logLevel(t);
-  if(lv==='ok'){c='#0369a1';bl='2px solid #38bdf8';}
-  else if(lv==='warn'){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
-  else if(lv==='err'){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
-  else if(lv==='cost'){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
-  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
-  return `<div data-level="${lv}" style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+function lvStr(v){ return (typeof v==='string' && v!=='') ? v : null; }
+function lvNum(v){ return (typeof v==='number' && isFinite(v)) ? v : null; }
+function lvPad2(n){ return n<10 ? '0'+n : ''+n; }
+function lvClock(ms){ const d=new Date(ms); return lvPad2(d.getHours())+':'+lvPad2(d.getMinutes())+':'+lvPad2(d.getSeconds()); }
+function lvFmtMs(ms){
+  if(lvNum(ms)===null) return '—';
+  if(ms<1000) return Math.round(ms)+'ms';
+  const s=ms/1000;
+  if(s<60) return s.toFixed(1)+'s';
+  const m=Math.floor(s/60), sec=Math.floor(s%60);
+  if(m<60) return m+'m'+lvPad2(sec)+'s';
+  return Math.floor(m/60)+'h'+lvPad2(m%60)+'m';
 }
-function isLogVisible(row){
-  if(curLevel!=='all' && row.dataset.level!==curLevel) return false;
-  if(filterQ && !row.textContent.toLowerCase().includes(filterQ)) return false;
+function lvUsageText(u){
+  if(u==='unknown') return 'usage 未知';
+  if(!u || typeof u!=='object') return null;
+  const pick=(...ks)=>{ for(const k of ks){ if(lvNum(u[k])!==null) return u[k]; } return null; };
+  const p=pick('prompt_tokens','prompt_token_count','input_tokens');
+  const c=pick('completion_tokens','completion_token_count','candidates_token_count','output_tokens');
+  if(p===null && c===null) return null;
+  return 'prompt '+(p===null?'—':p)+' / completion '+(c===null?'—':c);
+}
+function lvEventLevel(f,msg){
+  if(f.level==='ERROR') return 'err';
+  if(f.level==='WARN') return 'warn';
+  const guess=logLevel(msg);
+  /* 后端显式标 INFO 的事件，文案里的 🔄 / 重试 等关键词不再被推断成警告或错误；level 缺失才完全沿用文本推断 */
+  if(f.level==='INFO') return (guess==='warn' || guess==='err') ? 'other' : guess;
+  return guess;
+}
+/* 已结束组的阶段列：给出结局而不是停在最后一个阶段（成功组不再显示“发送中”） */
+function lvEndPhaseLabel(status,phase){
+  const at=phase ? (LV_PHASE_LABEL[phase]||phase) : '';
+  if(status==='success') return '已完成';
+  if(status==='failed') return at ? '失败于 '+at : '失败';
+  if(status==='cancelled') return at ? '取消于 '+at : '已取消';
+  return '已结束';
+}
+/* 把一条 SSE data（字符串或已解析对象）规整成帧对象；心跳 / 空串返回 null，非 JSON 文本当作 legacy_text。 */
+function lvParseFrame(raw){
+  if(raw===null || raw===undefined) return null;
+  let f=raw;
+  if(typeof raw==='string'){
+    if(raw.trim()==='') return null;
+    if(raw.charAt(0)===':' && raw.indexOf('keep-alive')>=0) return null;
+    f=null;
+    if(raw.charAt(0)==='{'){ try{ f=JSON.parse(raw); }catch(e){ f=null; } }
+    if(!f || typeof f!=='object') return {event_type:'legacy_text',event_id:null,request_id:null,message:raw};
+  }
+  if(typeof f!=='object' || Array.isArray(f)) return null;
+  if(!lvStr(f.event_type)) f=Object.assign({},f,{event_type:'log'});
+  return f;
+}
+function lvFilterActive(f){
+  return !!(f && ((f.q && String(f.q).trim()!=='') || (f.level && f.level!=='all')));
+}
+function lvNormQ(f){ return (f && f.q) ? String(f.q).trim().toLowerCase() : ''; }
+function lvEvHit(ev,q,level){
+  if(level && level!=='all' && ev.lv!==level) return false;
+  if(q){
+    if(ev.lower===null) ev.lower=ev.message.toLowerCase();
+    if(ev.lower.indexOf(q)<0) return false;
+  }
   return true;
 }
-function applyLogFilters(){ for(const row of logwin.children) row.style.display=isLogVisible(row)?'':'none'; }
-function appendLogLine(html){
-  const wrap=document.createElement('div');
-  wrap.innerHTML=html;
-  const row=wrap.firstElementChild;
-  logwin.appendChild(row);
-  row.style.display=isLogVisible(row)?'':'none';
-  while(logwin.children.length>MAX_LOG_LINES) logwin.firstElementChild.remove();
-  if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+
+function createLogStore(opts){
+  const L=Object.assign({},LV_LIMITS,(opts && opts.limits) || {});
+  const groupMap=new Map();           /* request_id -> group，Map 插入顺序即显示顺序 */
+  let ungroupedRows=[];
+  const seen=new Set();               /* 去重：已见 event_id（有界，淘汰最旧） */
+  let total=0;                        /* 分组事件数 + 未分组行数 */
+  let replayDone=false;               /* 是否已经见到过第一次 replay_complete */
+  let watermark=0, maxSeenTs=0;       /* 清空水位 / 已见最大服务端 timestamp */
+  let latestBoot=null, latestBootTs=-1;
+  let evictedGroups=0, ungroupedDropped=0, rowSeq=0;
+
+  function remember(key){
+    if(seen.has(key)) return false;
+    seen.add(key);
+    if(seen.size>L.MAX_SEEN_IDS) seen.delete(seen.values().next().value);
+    return true;
+  }
+  function isStale(g){
+    return !g.hasEnd && g.bootId!==null && latestBoot!==null && g.bootId!==latestBoot;
+  }
+  function newGroup(rid,ev,replayed){
+    return {id:rid,shortId:rid.slice(0,8),events:[],nextN:0,omitted:0,truncated:false,
+      hasStart:false,hasEnd:false,status:'in_progress',
+      clientModel:null,mode:null,channel:null,phase:null,
+      startTime:'',startTs:null,bootId:null,
+      retries:0,switches:0,endRetries:null,endSwitches:null,slow:false,
+      elapsedMs:null,elapsedAt:0,endElapsedMs:null,
+      errorType:null,errorSummary:null,httpStatus:null,lastError:null,endError:null,finishReason:null,usage:null,
+      upstreamTaskDone:null,cancelRequested:null,
+      userSet:false,expanded:!replayed,createdLive:!replayed};
+  }
+  function applyEvent(g,ev,nowMs){
+    const f=ev.frame, t=ev.type;
+    if(t==='request_start'){ g.hasStart=true; if(ev.time) g.startTime=ev.time; if(ev.ts!==null) g.startTs=ev.ts; }
+    else if(!g.startTime){ if(ev.time) g.startTime=ev.time; if(g.startTs===null && ev.ts!==null) g.startTs=ev.ts; }
+    const cm=lvStr(f.client_model); if(cm) g.clientModel=cm;
+    const md=lvStr(f.mode); if(md) g.mode=md;
+    const ch=lvStr(f.channel); if(ch) g.channel=ch;
+    const ph=lvStr(f.phase); if(ph) g.phase=ph;
+    if(t==='channel_switch'){ g.switches++; const tc=lvStr(f.target_channel); if(tc) g.channel=tc; }
+    if(t==='attempt_failed' && f.retryable===true) g.retries++;
+    if(f.slow===true || t==='upstream_slow') g.slow=true;
+    const el=lvNum(f.elapsed_ms); if(el!==null){ g.elapsedMs=el; g.elapsedAt=nowMs; }
+    const bid=lvStr(f.boot_id); if(bid) g.bootId=bid;
+    const et=lvStr(f.error_type); if(et) g.errorType=et;
+    const es=lvStr(f.error_summary); if(es) g.errorSummary=es;
+    const hs=lvNum(f.http_status); if(hs!==null) g.httpStatus=hs;
+    /* 错误展示分两路：进行中看“最近一次尝试失败”，已结束只认 request_end 自带的错误，不把切换前的旧失败当成最终错误 */
+    if(t==='request_end'){
+      if(et||es||hs!==null) g.endError={type:et,summary:es,http:hs};
+    }else if(et||es){
+      g.lastError={type:et,summary:es,http:hs,channel:g.channel,attempt:lvNum(f.attempt)};
+    }
+    const fr=lvStr(f.finish_reason); if(fr) g.finishReason=fr;
+    if(f.usage!==undefined && f.usage!==null) g.usage=f.usage;
+    if(typeof f.upstream_task_done==='boolean') g.upstreamTaskDone=f.upstream_task_done;
+    if(typeof f.cancel_requested==='boolean') g.cancelRequested=f.cancel_requested;
+    if(t==='request_end'){
+      g.hasEnd=true;
+      g.status=LV_END_STATUSES.indexOf(f.status)>=0 ? f.status : 'unknown';
+      g.endElapsedMs=el;
+      g.endRetries=lvNum(f.retries);
+      g.endSwitches=lvNum(f.switches);
+    }
+  }
+  function addUngrouped(ev,cs){
+    ev.n=++rowSeq;
+    ungroupedRows.push(ev); total++;
+    cs.ungroupedAdded.push(ev);
+    if(ungroupedRows.length>L.MAX_UNGROUPED){
+      ungroupedRows.shift(); total--; ungroupedDropped++; cs.ungroupedRemoved++;
+    }
+  }
+  function evictOne(keepId,cs){
+    /* 先淘汰最旧的已结束组；没有才淘汰最旧的进行中组；绝不为被淘汰的组伪造终态。 */
+    let victim=null;
+    for(const g of groupMap.values()){
+      if(g.id===keepId) continue;
+      if(g.hasEnd){ victim=g; break; }
+      if(victim===null) victim=g;
+    }
+    if(victim===null) return false;
+    total-=victim.events.length;
+    groupMap.delete(victim.id);
+    evictedGroups++;
+    cs.removed.push(victim.id);
+    cs.created=cs.created.filter(x=>x!==victim.id);
+    cs.updated=cs.updated.filter(x=>x!==victim.id);
+    return true;
+  }
+  function enforceLimits(keepId,cs){
+    while((groupMap.size>L.MAX_GROUPS || total>L.MAX_TOTAL_EVENTS) && evictOne(keepId,cs)){ /* 循环到不超限 */ }
+  }
+  function addToGroup(rid,ev,replayed,nowMs,cs){
+    let g=groupMap.get(rid);
+    if(!g){ g=newGroup(rid,ev,replayed); groupMap.set(rid,g); cs.created.push(rid); }
+    else if(cs.updated.indexOf(rid)<0) cs.updated.push(rid);
+    ev.n=g.nextN++;
+    g.events.push(ev); total++;
+    if(g.events.length>L.MAX_EVENTS_PER_GROUP){ g.events.shift(); total--; g.omitted++; g.truncated=true; }
+    applyEvent(g,ev,nowMs);
+    if(!g.userSet){
+      if(g.hasEnd) g.expanded=false;                       /* 结束 -> 自动折叠 */
+      else if(!replayed && !isStale(g)) g.expanded=true;   /* 实时的进行中组 -> 展开 */
+    }
+  }
+
+  function ingest(input,nowMs){
+    const cs={accepted:false,reason:null,created:[],updated:[],removed:[],ungroupedAdded:[],ungroupedRemoved:0,control:null};
+    const f=lvParseFrame(input);
+    if(f===null){ cs.reason='invalid'; return cs; }
+    if(typeof nowMs!=='number') nowMs=Date.now();
+    const type=f.event_type;
+    if(type==='stream_control'){
+      cs.reason='control';
+      if(f.control==='replay_complete'){ replayDone=true; cs.control={type:'replay_complete'}; }
+      else if(f.control==='dropped'){
+        const n=lvNum(f.dropped) || 0;
+        addUngrouped({eid:null,ts:null,time:lvClock(nowMs),type:'client_notice',lv:'warn',frame:f,replayed:false,lower:null,n:0,
+          message:'实时日志有 '+n+' 条因订阅队列溢出未送达'},cs);
+        cs.control={type:'dropped',dropped:n};
+        enforceLimits(null,cs);
+      }else cs.control={type:String(f.control)};
+      return cs;
+    }
+    const ts=lvNum(f.timestamp);
+    const replayed=f.replayed===true;
+    if(ts!==null && ts>maxSeenTs) maxSeenTs=ts;
+    /* 记录当前实时连接看到的最新 boot_id（以服务端 timestamp 最大者为准，补发的旧 boot 不会盖掉它） */
+    let bootChanged=false;
+    const bid=lvStr(f.boot_id);
+    if(bid){
+      const bt=ts===null ? latestBootTs : ts;
+      if(latestBoot===null || bt>=latestBootTs){
+        if(bid!==latestBoot){ latestBoot=bid; bootChanged=true; }
+        if(bt>latestBootTs) latestBootTs=bt;
+      }
+    }
+    if(bootChanged){
+      for(const g of groupMap.values()){
+        if(isStale(g) && cs.updated.indexOf(g.id)<0) cs.updated.push(g.id);
+      }
+    }
+    const msg=typeof f.message==='string' ? f.message : (f.message===null || f.message===undefined ? '' : String(f.message));
+    if(type==='legacy_text'){
+      if(replayDone){ cs.reason='legacy_late'; return cs; }
+      if(replayed && watermark>0 && (ts===null || ts<=watermark)){ cs.reason='cleared'; return cs; }
+      if(!remember('L|'+(ts===null?'':ts)+'|'+msg)){ cs.reason='dup'; return cs; }
+      addUngrouped({eid:null,ts:ts,time:lvStr(f.time)||'',type:'legacy_text',message:msg,lv:logLevel(msg),frame:f,replayed:replayed,lower:null,n:0},cs);
+      cs.accepted=true;
+      enforceLimits(null,cs);
+      return cs;
+    }
+    if(replayed && watermark>0 && ts!==null && ts<=watermark){ cs.reason='cleared'; return cs; }
+    const eid=lvStr(f.event_id);
+    if(eid && !remember(eid)){ cs.reason='dup'; return cs; }
+    const ev={eid:eid,ts:ts,time:lvStr(f.time)||'',type:type,message:msg,lv:lvEventLevel(f,msg),frame:f,replayed:replayed,lower:null,n:0};
+    const rid=lvStr(f.request_id);
+    if(rid===null){ addUngrouped(ev,cs); enforceLimits(null,cs); }
+    else{ addToGroup(rid,ev,replayed,nowMs,cs); enforceLimits(rid,cs); }
+    cs.accepted=true;
+    return cs;
+  }
+
+  /* 清空只影响前端状态：记下已见到的最大服务端 timestamp 作水位，之后补发的旧记录一律丢弃。 */
+  function clear(){
+    if(maxSeenTs>watermark) watermark=maxSeenTs;
+    groupMap.clear(); ungroupedRows=[]; total=0; evictedGroups=0; ungroupedDropped=0;
+  }
+  function elapsedOf(g,nowMs){
+    if(g.hasEnd) return g.endElapsedMs;
+    if(g.elapsedMs===null) return null;
+    if(isStale(g)) return g.elapsedMs;
+    return g.elapsedMs+Math.max(0,nowMs-g.elapsedAt);
+  }
+  function summary(g,nowMs){
+    const stale=isStale(g);
+    const reasons=[];
+    if(!g.hasStart) reasons.push('no_start');
+    if(stale) reasons.push('boot_changed');
+    if(g.truncated) reasons.push('truncated');
+    const statusKey=g.hasEnd ? g.status : (stale ? 'stale' : 'in_progress');
+    return {
+      id:g.id,shortId:g.shortId,startTime:g.startTime,clientModel:g.clientModel,
+      mode:g.mode,modeLabel:g.mode ? (LV_MODE_LABEL[g.mode]||g.mode) : '',
+      channel:g.channel,channelLabel:g.channel ? (LV_CHANNEL_LABEL[g.channel]||g.channel) : '',
+      phase:g.phase,phaseLabel:g.hasEnd ? lvEndPhaseLabel(g.status,g.phase) : (g.phase ? (LV_PHASE_LABEL[g.phase]||g.phase) : ''),
+      statusKey:statusKey,statusLabel:LV_STATUS_LABEL[statusKey]||statusKey,
+      live:!g.hasEnd && !stale,stale:stale,slow:g.slow,
+      incomplete:reasons.length>0,reasons:reasons,omitted:g.omitted,
+      retries:g.endRetries!==null ? g.endRetries : g.retries,
+      switches:g.endSwitches!==null ? g.endSwitches : g.switches,
+      elapsedMs:elapsedOf(g,nowMs),
+      modelShort:(g.mode==='fake_stream' && g.clientModel && g.clientModel.indexOf('fake-')===0 && g.clientModel.length>5) ? g.clientModel.slice(5) : null,
+      error:errorOf(g)
+    };
+  }
+  function errorOf(g){
+    const fmt=e=>{
+      const parts=[];
+      if(e.type) parts.push(e.type);
+      if(e.http!==null && e.http!==undefined) parts.push('HTTP '+e.http);
+      if(e.summary) parts.push(e.summary);
+      return parts.join(' · ');
+    };
+    if(g.hasEnd) return g.endError ? {label:'错误',text:fmt(g.endError)} : null;
+    const e=g.lastError;
+    if(!e) return null;
+    const ch=e.channel ? (LV_CHANNEL_LABEL[e.channel]||e.channel) : '';
+    const where=(ch ? ch : '')+(e.attempt!==null ? (ch?' ':'')+'第 '+e.attempt+' 次尝试' : '');
+    return {label:'最近错误'+(where ? '（'+where+'）' : ''),text:fmt(e)};
+  }
+  function summaryText(g){
+    const s=summary(g,0);
+    return [g.id,s.clientModel,s.modeLabel,s.mode,s.channelLabel,s.channel,s.phaseLabel,s.phase,s.statusLabel,s.startTime,g.errorType,g.errorSummary]
+      .filter(x=>typeof x==='string' && x!=='').join(' ').toLowerCase();
+  }
+  /* 筛选：关键词匹配摘要字段 + 组内任一事件 message；级别对组内任一事件生效；hits = 同时满足两者的事件数 */
+  function matches(g,f){
+    const q=lvNormQ(f), level=(f && f.level) || 'all';
+    if(q==='' && level==='all') return {match:true,hits:0,active:false};
+    let hits=0, anyQ=(q===''), anyLv=(level==='all');
+    for(const ev of g.events){
+      const lvOk=(level==='all' || ev.lv===level);
+      let qOk=true;
+      if(q!==''){
+        if(ev.lower===null) ev.lower=ev.message.toLowerCase();
+        qOk=ev.lower.indexOf(q)>=0;
+        if(qOk) anyQ=true;
+      }
+      if(lvOk) anyLv=true;
+      if(lvOk && qOk) hits++;
+    }
+    if(!anyQ) anyQ=summaryText(g).indexOf(q)>=0;
+    return {match:anyQ && anyLv,hits:hits,active:true};
+  }
+  function eventMatches(ev,f){ return lvEvHit(ev,lvNormQ(f),(f && f.level) || 'all'); }
+  function setUserExpanded(id,flag){
+    const g=groupMap.get(id); if(!g) return false;
+    g.userSet=true; g.expanded=!!flag; return true;
+  }
+  function stats(){
+    let inProgress=0, omitted=0;
+    for(const g of groupMap.values()){ if(!g.hasEnd) inProgress++; omitted+=g.omitted; }
+    return {groups:groupMap.size,events:total,ungrouped:ungroupedRows.length,inProgress:inProgress,
+      omittedEvents:omitted,evictedGroups:evictedGroups,ungroupedDropped:ungroupedDropped,seen:seen.size};
+  }
+  return {
+    limits:L,ingest:ingest,clear:clear,
+    getGroup:id=>groupMap.get(id)||null,
+    groups:()=>Array.from(groupMap.values()),
+    ungrouped:()=>ungroupedRows.slice(),
+    setUserExpanded:setUserExpanded,
+    isExpanded:id=>{ const g=groupMap.get(id); return !!(g && g.expanded); },
+    matches:matches,eventMatches:eventMatches,filterActive:lvFilterActive,
+    summary:summary,elapsedOf:elapsedOf,stats:stats,
+    seenSize:()=>seen.size,replayComplete:()=>replayDone,latestBootId:()=>latestBoot,watermark:()=>watermark
+  };
 }
-function clearLogView(){ logwin.innerHTML=''; }
+/* LOGVIEW-CORE:END */
+
+/* ===== DOM 渲染层：入站帧先进队列，requestAnimationFrame 批量处理，只增量更新受影响的组节点 ===== */
+const logwin=$('logwin'); let autoscroll=true;
+const LOG_LEVELS=[['all','全部'],['ok','✅ 成功'],['warn','⚠️ 警告'],['err','❌ 错误'],['cost','💰 计费']];
+const LV_FRAME_BATCH=300;                     /* 每帧最多处理的入站帧数，剩余留给下一帧 */
+const LV_GLYPH={in_progress:'●',success:'✓',failed:'✕',cancelled:'⊘',unknown:'?',stale:'…'};
+const LV_MARK={err:['✕','错误'],warn:['▲','警告'],ok:['✓','成功'],cost:['$','计费'],other:['·','信息']};
+let curLevel='all'; let filterQ='';
+const logStore=createLogStore();
+const lvGroupsEl=$('lv-groups'), lvSysEl=$('lv-sys'), lvEmptyEl=$('lv-empty'), lvNewBtn=$('lv-newbtn');
+const lvNodes=new Map();                      /* request_id -> 节点引用（只保存页面上存在的组） */
+const lvTicking=new Set();                    /* 进行中且有耗时的组 id，供 1s 计时刷新 */
+const lvSys={built:false,open:false,lastN:-1};
+let lvNodeSeq=0, lvQueue=[], lvFlushScheduled=false, lvRaf=0, lvTimer=0, lvNewCount=0, lvJustCleared=false;
+let lvConnState='connecting', lvLastMsgAt=0, lvFilterTimer=0;
+
+logwin.addEventListener('scroll',()=>{
+  autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; syncAutoBtn();
+  if(autoscroll) lvHideNew();
+});
+function syncAutoBtn(){
+  const b=$('autoscroll-btn');
+  if(b){ b.style.background=autoscroll?'#111':''; b.style.color=autoscroll?'#fff':''; b.setAttribute('aria-pressed',autoscroll?'true':'false'); }
+}
+function toggleAutoScroll(){
+  autoscroll=!autoscroll; syncAutoBtn();
+  if(autoscroll && logwin){ logwin.scrollTop=logwin.scrollHeight; lvHideNew(); }
+}
+syncAutoBtn();
+function lvFilter(){ return {q:filterQ,level:curLevel}; }
+function lvMk(tag,cls,text){
+  const e=document.createElement(tag);
+  if(cls) e.className=cls;
+  if(text!==undefined) e.textContent=text;
+  return e;
+}
+function lvSetText(el,t){ if(el._t!==t){ el._t=t; el.textContent=t; } }
+function lvSetCell(el,t){ lvSetText(el,t); el.classList.toggle('lv-hide',t===''); }
+function lvShowNew(){ lvNewBtn.textContent='↓ '+lvNewCount+' 条新日志'; lvNewBtn.classList.remove('lv-hide'); }
+function lvHideNew(){ lvNewCount=0; lvNewBtn.classList.add('lv-hide'); }
+lvNewBtn.addEventListener('click',()=>{ autoscroll=true; syncAutoBtn(); logwin.scrollTop=logwin.scrollHeight; lvHideNew(); });
+if(typeof ResizeObserver!=='undefined'){
+  /* 日志页从隐藏标签切回、或窗口尺寸变化时，保持“自动滚动”语义 */
+  new ResizeObserver(()=>{ if(autoscroll) logwin.scrollTop=logwin.scrollHeight; }).observe(logwin);
+}
+
+/* --- 事件行 --- */
+function lvAppendHighlighted(parent,text){
+  const re=/gemini-[a-zA-Z0-9.\-]+/g; let last=0, m;
+  while((m=re.exec(text))!==null){
+    if(m.index>last) parent.appendChild(document.createTextNode(text.slice(last,m.index)));
+    parent.appendChild(lvMk('span','lv-mdl',m[0]));
+    last=m.index+m[0].length;
+  }
+  if(last<text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+function lvChLabel(c){ return LV_CHANNEL_LABEL[c]||c; }
+function lvEventTags(ev){
+  const f=ev.frame||{}, out=[];
+  if(ev.type==='client_notice') out.push(['前端提示','nt']);
+  if(lvNum(f.attempt)!==null) out.push(['第 '+f.attempt+(lvNum(f.max_attempts)!==null?'/'+f.max_attempts:'')+' 次','at']);
+  const ph=lvStr(f.phase); if(ph) out.push([LV_PHASE_LABEL[ph]||ph,'ph']);
+  if(lvNum(f.attempt_elapsed_ms)!==null) out.push(['本次 '+lvFmtMs(f.attempt_elapsed_ms),'tm']);
+  if(lvNum(f.elapsed_ms)!==null) out.push(['累计 '+lvFmtMs(f.elapsed_ms),'tm']);
+  if(lvNum(f.backoff_seconds)!==null) out.push(['退避 '+f.backoff_seconds+'s','bo']);
+  const sc=lvStr(f.source_channel), tc=lvStr(f.target_channel);
+  if(sc||tc) out.push([(sc?lvChLabel(sc):'?')+' → '+(tc?lvChLabel(tc):'?'),'sw']);
+  else if(lvStr(f.channel) && (ev.type==='attempt_start'||ev.type==='fake_stream_start'||ev.type==='request_end')) out.push([lvChLabel(f.channel),'ch']);
+  if(f.slow===true) out.push(['慢','bo']);
+  const fr=lvStr(f.finish_reason); if(fr) out.push(['finish: '+fr,'ok']);
+  const u=lvUsageText(f.usage); if(u) out.push([u,'ok']);
+  if(typeof f.upstream_task_done==='boolean') out.push(['上游任务'+(f.upstream_task_done?'已完成':'未完成'),'ph']);
+  if(f.cancel_requested===true) out.push(['已请求取消','bo']);
+  const et=lvStr(f.error_type); if(et) out.push([et,'er']);
+  if(lvNum(f.http_status)!==null) out.push(['HTTP '+f.http_status,'er']);
+  if(ev.type==='request_end'){
+    const st=LV_END_STATUSES.indexOf(f.status)>=0 ? f.status : 'unknown';
+    out.push(['结果：'+LV_STATUS_LABEL[st],st==='success'?'ok':(st==='failed'?'er':'ph')]);
+  }
+  return out;
+}
+function lvEventRow(ev){
+  const row=lvMk('div','lv-ev lv-'+ev.lv);
+  row._n=ev.n; row._ev=ev;
+  const mk=LV_MARK[ev.lv]||LV_MARK.other;
+  const mark=lvMk('span','lv-mk',mk[0]); mark.setAttribute('role','img'); mark.setAttribute('aria-label',mk[1]);
+  const body=lvMk('div','lv-eb');
+  const msg=lvMk('div','lv-msg'); lvAppendHighlighted(msg,ev.message); body.appendChild(msg);
+  const tags=lvEventTags(ev);
+  if(tags.length){
+    const box=lvMk('div','lv-etags');
+    for(const [text,kind] of tags) box.appendChild(lvMk('span','lv-etag k-'+kind,text));
+    body.appendChild(box);
+  }
+  row.append(lvMk('span','lv-et',ev.time||''),mark,body);
+  return row;
+}
+/* 只追加尚未渲染的新事件，并从头部移除已被上限淘汰的行 */
+function lvSyncRows(box,st,evs,f){
+  const first=evs.length ? evs[0].n : 0;
+  while(box.firstChild && box.firstChild._n<first) box.removeChild(box.firstChild);
+  let i=evs.length;
+  while(i>0 && evs[i-1].n>st.lastN) i--;
+  if(i<evs.length){
+    const act=logStore.filterActive(f), frag=document.createDocumentFragment();
+    for(let j=i;j<evs.length;j++){
+      const row=lvEventRow(evs[j]);
+      if(act && !logStore.eventMatches(evs[j],f)) row.classList.add('lv-dim');
+      frag.appendChild(row);
+    }
+    box.appendChild(frag);
+    st.lastN=evs[evs.length-1].n;
+  }
+}
+function lvRedim(box,f){
+  const act=logStore.filterActive(f);
+  for(const row of box.children) row.classList.toggle('lv-dim',act && !logStore.eventMatches(row._ev,f));
+}
+
+/* --- 请求组节点 --- */
+const LV_REASON_TEXT={
+  no_start:'没有收到 request_start（可能已被清空或截断）',
+  boot_changed:'服务已重启且没有收到 request_end，最终结果未知'
+};
+function lvCreateNode(g){
+  const idn=++lvNodeSeq;
+  const el=lvMk('div','lv-group');
+  const head=lvMk('div','lv-head');
+  const sum=lvMk('button','lv-sum'); sum.type='button';
+  sum.setAttribute('aria-expanded','false'); sum.setAttribute('aria-controls','lvb-'+idn);
+  const chev=lvMk('span','lv-c lv-chev','▸'); chev.setAttribute('aria-hidden','true');
+  const badge=lvMk('span','lv-c lv-badge');
+  const glyph=lvMk('span','lv-gl'); glyph.setAttribute('aria-hidden','true');
+  const btxt=lvMk('span');
+  badge.append(glyph,btxt);
+  const model=lvMk('span','lv-c lv-model');
+  const mname=lvMk('span','lv-mname');
+  const mnFull=lvMk('span','lv-mn-full'), mnShort=lvMk('span','lv-mn-short');
+  mname.append(mnFull,mnShort);
+  const elapsed=lvMk('span','lv-c lv-elapsed');
+  const meta=lvMk('span','lv-meta');
+  const time=lvMk('span','lv-c lv-time'), idc=lvMk('span','lv-c lv-id'), mode=lvMk('span','lv-c lv-mode');
+  const ch=lvMk('span','lv-c lv-ch'), ph=lvMk('span','lv-c lv-ph'), rs=lvMk('span','lv-c lv-rs');
+  const rsL=lvMk('span','lv-rs-l'), rsS=lvMk('span','lv-rs-s');
+  rs.append(rsL,rsS);
+  /* 标签放两份：桌面挂在模型名后，手机挂在第二行末尾，让第一行把完整模型名让出来 */
+  const mkTags=()=>{
+    const box=lvMk('span','lv-tags');
+    const slow=lvMk('span','lv-tag slow lv-hide','慢'), inc=lvMk('span','lv-tag inc lv-hide','记录不完整'), hit=lvMk('span','lv-tag hit lv-hide');
+    box.append(slow,inc,hit);
+    return {box,slow,inc,hit};
+  };
+  const tgD=mkTags(), tgM=mkTags();
+  tgM.box.classList.add('lv-tags-m');
+  model.append(mname,tgD.box);
+  meta.append(time,idc,mode,ch,ph,rs,tgM.box);
+  sum.append(chev,badge,model,elapsed,meta);
+  const copy=lvMk('button','lv-copy','复制'); copy.type='button';
+  copy.setAttribute('aria-label','复制完整请求 ID'); copy.title='复制完整请求 ID';
+  head.append(sum,copy);
+  const body=lvMk('div','lv-body'); body.id='lvb-'+idn;
+  const info=lvMk('div','lv-info'), evBox=lvMk('div','lv-events');
+  body.append(info,evBox);
+  el.append(head,body);
+  const id=g.id;
+  sum.addEventListener('click',()=>lvToggleGroup(id));
+  copy.addEventListener('click',()=>lvCopyId(id,copy));
+  return {el,sum,badge,glyph,btxt,mname,mnFull,mnShort,elapsed,time,idc,mode,ch,ph,rs,rsL,rsS,tg:[tgD,tgM],info,evBox,lastN:-1,open:false,visible:true,infoSig:'',stateKey:''};
+}
+function lvToggleGroup(id){
+  const g=logStore.getGroup(id), node=lvNodes.get(id);
+  if(!g || !node) return;
+  logStore.setUserExpanded(id,!logStore.isExpanded(id));
+  lvUpdateNode(node,g);
+}
+function lvApplyOpen(node,open){
+  node.open=open;
+  node.el.classList.toggle('open',open);
+  node.sum.setAttribute('aria-expanded',open?'true':'false');
+  /* 折叠时释放组内事件行，展开时一次性补渲染 */
+  node.evBox.textContent=''; node.info.textContent='';
+  node.lastN=-1; node.infoSig='';
+}
+function lvKv(box,label,value,cls,asCode){
+  const d=lvMk('div','lv-kv'+(cls?' '+cls:''));
+  d.appendChild(lvMk('b','',label));
+  d.appendChild(asCode ? lvMk('code','',value) : document.createTextNode(value));
+  box.appendChild(d);
+}
+function lvRefreshInfo(node,g,s){
+  const u=lvUsageText(g.usage);
+  const sig=[s.statusKey,s.retries,s.switches,s.reasons.join(','),g.omitted,s.error?s.error.label+s.error.text:'',g.finishReason,u,s.slow,g.upstreamTaskDone,g.cancelRequested].join('\u0001');
+  if(sig===node.infoSig) return;
+  node.infoSig=sig;
+  const box=node.info; box.textContent='';
+  lvKv(box,'请求 ID',g.id,'',true);
+  if(s.retries>0 || s.switches>0) lvKv(box,'重试 / 切换',s.retries+' 次 / '+s.switches+' 次');
+  if(typeof g.upstreamTaskDone==='boolean') lvKv(box,'上游任务',g.upstreamTaskDone?'已完成':'未完成');
+  if(g.cancelRequested===true) lvKv(box,'取消','已请求取消','warn');
+  if(g.finishReason) lvKv(box,'finish_reason',g.finishReason);
+  if(u) lvKv(box,'用量',u);
+  if(s.error && s.error.text) lvKv(box,s.error.label,s.error.text,'err');
+  if(s.slow) lvKv(box,'提示','上游等待偏慢','warn');
+  if(s.reasons.length){
+    const txt=s.reasons.map(r=>r==='truncated' ? '已省略 '+g.omitted+' 条较早记录' : LV_REASON_TEXT[r]).join('；');
+    lvKv(box,'记录不完整',txt,'warn');
+  }
+}
+function lvApplyFilterNode(node,g,f){
+  const m=logStore.matches(g,f);
+  node.el.classList.toggle('lv-hide',!m.match);
+  node.visible=m.match;
+  const showHit=m.active && m.match && m.hits>0;
+  for(const t of node.tg){
+    t.hit.classList.toggle('lv-hide',!showHit);
+    if(showHit) lvSetText(t.hit,'命中 '+m.hits);
+  }
+}
+function lvUpdateNode(node,g){
+  const s=logStore.summary(g,Date.now()), f=lvFilter();
+  if(node.stateKey!==s.statusKey){
+    node.stateKey=s.statusKey;
+    node.el.dataset.state=s.statusKey;
+    node.badge.className='lv-c lv-badge st-'+s.statusKey;
+    lvSetText(node.glyph,LV_GLYPH[s.statusKey]||'?');
+    lvSetText(node.btxt,s.statusLabel);
+    node.badge.title=s.stale ? '服务已重启，没有收到 request_end；最终结果未知' : '';
+  }
+  lvSetCell(node.time,s.startTime||'');
+  lvSetText(node.idc,s.shortId); node.idc.title=g.id;
+  lvSetCell(node.mode,s.modeLabel);
+  lvSetText(node.mnFull,s.clientModel||'—'); lvSetText(node.mnShort,s.modelShort||'');
+  node.mname.classList.toggle('has-short',!!s.modelShort);
+  node.mname.title=s.clientModel||'';
+  if(s.clientModel) node.mname.setAttribute('aria-label',s.clientModel);
+  lvSetCell(node.ch,s.channelLabel);
+  lvSetCell(node.ph,s.phaseLabel); node.ph.title=s.phaseLabel;
+  const rsLong=[], rsShort=[];
+  if(s.retries>0){ rsLong.push('重试'+s.retries); rsShort.push('↻'+s.retries); }
+  if(s.switches>0){ rsLong.push('切换'+s.switches); rsShort.push('⇄'+s.switches); }
+  lvSetText(node.rsL,rsLong.join(' ')); lvSetText(node.rsS,rsShort.join(' '));
+  node.rs.classList.toggle('lv-hide',rsLong.length===0);
+  node.rs.title='重试 '+s.retries+' 次 · 通道切换 '+s.switches+' 次';
+  lvSetText(node.elapsed,lvFmtMs(s.elapsedMs));
+  const incTitle=s.reasons.map(r=>r==='truncated' ? '已省略 '+g.omitted+' 条较早记录' : LV_REASON_TEXT[r]).join('；');
+  for(const t of node.tg){
+    t.slow.classList.toggle('lv-hide',!s.slow);
+    t.inc.classList.toggle('lv-hide',!s.incomplete);
+    t.inc.title=incTitle;
+  }
+  if(s.live && s.elapsedMs!==null) lvTicking.add(g.id); else lvTicking.delete(g.id);
+  const open=logStore.isExpanded(g.id);
+  if(open!==node.open) lvApplyOpen(node,open);
+  if(node.open){ lvRefreshInfo(node,g,s); lvSyncRows(node.evBox,node,g.events,f); }
+  lvApplyFilterNode(node,g,f);
+}
+function lvRemoveNode(id){
+  const node=lvNodes.get(id);
+  if(node){ node.el.remove(); lvNodes.delete(id); }
+  lvTicking.delete(id);
+}
+function lvSyncGroup(id){
+  const g=logStore.getGroup(id);
+  if(!g) return;
+  let node=lvNodes.get(id);
+  if(!node){ node=lvCreateNode(g); lvNodes.set(id,node); lvGroupsEl.appendChild(node.el); }
+  lvUpdateNode(node,g);
+}
+function lvCopyId(id,btn){
+  const done=()=>{ btn.textContent='已复制'; setTimeout(()=>{ if(btn.isConnected) btn.textContent='复制'; },1200); };
+  const fail=()=>toast('复制失败，请手动选中请求 ID');
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(id).then(done).catch(()=>{ if(fallbackCopyText(id)) done(); else fail(); });
+  }else if(fallbackCopyText(id)) done();
+  else fail();
+}
+
+/* --- 系统与未关联日志区 --- */
+function lvBuildSys(){
+  const sum=lvMk('button','lv-sum'); sum.type='button';
+  sum.setAttribute('aria-expanded','false'); sum.setAttribute('aria-controls','lv-sys-body');
+  const chev=lvMk('span','lv-chev','▸'); chev.setAttribute('aria-hidden','true');
+  lvSys.count=lvMk('span','lv-sys-count');
+  lvSys.hit=lvMk('span','lv-tag hit lv-hide');
+  lvSys.prev=lvMk('span','lv-sys-prev');
+  sum.append(chev,lvMk('span','lv-sys-title','系统与未关联日志'),lvSys.count,lvSys.hit,lvSys.prev);
+  const head=lvMk('div','lv-head'); head.appendChild(sum);
+  const body=lvMk('div','lv-body'); body.id='lv-sys-body';
+  lvSys.evBox=lvMk('div','lv-events'); body.appendChild(lvSys.evBox);
+  lvSysEl.append(head,body);
+  lvSys.sum=sum; lvSys.built=true;
+  sum.addEventListener('click',()=>{
+    lvSys.open=!lvSys.open;
+    lvSysEl.classList.toggle('open',lvSys.open);
+    sum.setAttribute('aria-expanded',lvSys.open?'true':'false');
+    lvSys.evBox.textContent=''; lvSys.lastN=-1;
+    lvRenderSys();
+  });
+}
+function lvRenderSys(){
+  const rows=logStore.ungrouped(), f=lvFilter();
+  if(!rows.length){ lvSysEl.classList.add('lv-hide'); return; }
+  if(!lvSys.built) lvBuildSys();
+  const act=logStore.filterActive(f);
+  let hits=0;
+  if(act) for(const r of rows) if(logStore.eventMatches(r,f)) hits++;
+  lvSysEl.classList.toggle('lv-hide',act && hits===0);
+  lvSetText(lvSys.count,'· '+rows.length+' 条');
+  lvSys.hit.classList.toggle('lv-hide',!(act && hits>0));
+  if(act && hits>0) lvSetText(lvSys.hit,'命中 '+hits);
+  const last=rows[rows.length-1];
+  lvSetText(lvSys.prev,(last.time ? last.time+'  ' : '')+last.message.split('\n')[0]);
+  if(lvSys.open) lvSyncRows(lvSys.evBox,lvSys,rows,f);
+}
+function lvUpdateEmpty(){
+  const st=logStore.stats(), f=lvFilter();
+  let msg='';
+  if(st.groups===0 && st.ungrouped===0) msg=lvJustCleared ? '已清空 · 等待新的实时日志…' : '暂无日志 · 等待实时事件…';
+  else if(logStore.filterActive(f)){
+    let any=!lvSysEl.classList.contains('lv-hide');
+    if(!any) for(const n of lvNodes.values()) if(n.visible){ any=true; break; }
+    if(!any) msg='没有匹配的日志';
+  }
+  lvEmptyEl.classList.toggle('lv-hide',msg==='');
+  if(msg) lvSetText(lvEmptyEl,msg);
+}
+
+/* --- 入站队列：requestAnimationFrame 批量处理 --- */
+function lvEnqueue(raw){ lvQueue.push(raw); lvSchedule(); }
+function lvSchedule(){
+  if(lvFlushScheduled) return;
+  lvFlushScheduled=true;
+  lvRaf=requestAnimationFrame(()=>lvFlush(false));
+  lvTimer=setTimeout(()=>lvFlush(false),250);   /* 后台标签页 rAF 会暂停，用定时器兜底 */
+}
+function lvFlush(all){
+  lvFlushScheduled=false;
+  cancelAnimationFrame(lvRaf); clearTimeout(lvTimer);
+  const limit=all ? lvQueue.length : (document.hidden ? 2000 : LV_FRAME_BATCH);
+  const batch=lvQueue.splice(0,limit);
+  const touched=new Set(); let sysDirty=false, accepted=0;
+  const now=Date.now();
+  for(const raw of batch){
+    const cs=logStore.ingest(raw,now);
+    for(const id of cs.removed){ lvRemoveNode(id); touched.delete(id); }
+    for(const id of cs.created) touched.add(id);
+    for(const id of cs.updated) touched.add(id);
+    if(cs.ungroupedAdded.length || cs.ungroupedRemoved) sysDirty=true;
+    if(cs.accepted) accepted++;
+  }
+  for(const id of touched) lvSyncGroup(id);
+  if(sysDirty) lvRenderSys();
+  if(batch.length){
+    if(accepted>0) lvJustCleared=false;
+    lvUpdateEmpty();
+    if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+    else if(accepted>0){ lvNewCount+=accepted; lvShowNew(); }
+  }
+  if(lvQueue.length) lvSchedule();
+}
+
+/* --- 筛选 / 清空 --- */
+function applyLogFilters(){
+  const f=lvFilter();
+  for(const g of logStore.groups()){
+    const node=lvNodes.get(g.id); if(!node) continue;
+    lvApplyFilterNode(node,g,f);
+    if(node.open) lvRedim(node.evBox,f);
+  }
+  if(lvSys.built && lvSys.open) lvRedim(lvSys.evBox,f);
+  lvRenderSys();
+  lvUpdateEmpty();
+}
+function clearLogView(){
+  lvFlush(true);                    /* 先吃完队列，让水位覆盖所有已收到的记录 */
+  logStore.clear();
+  lvGroupsEl.textContent=''; lvNodes.clear(); lvTicking.clear();
+  lvSysEl.textContent=''; lvSysEl.classList.add('lv-hide'); lvSysEl.classList.remove('open');
+  lvSys.built=false; lvSys.open=false; lvSys.lastN=-1;
+  lvHideNew(); lvJustCleared=true; lvUpdateEmpty();
+}
 function renderLogChips(){
   const box=$('log-chips'); if(!box) return;
-  box.innerHTML='';
+  box.textContent='';
   for(const [lv,label] of LOG_LEVELS){
     const b=document.createElement('button');
+    b.type='button';
     b.textContent=label;
-    b.className='text-xs px-2 py-0.5 rounded border border-neutral-200 '+(curLevel===lv?'bg-neutral-900 text-white':'');
+    b.setAttribute('aria-pressed',curLevel===lv?'true':'false');
+    b.className='lv-chip text-xs px-2 py-0.5 rounded border border-neutral-200 '+(curLevel===lv?'bg-neutral-900 text-white':'');
     b.onclick=()=>{ curLevel=lv; renderLogChips(); applyLogFilters(); };
     box.appendChild(b);
   }
 }
 renderLogChips();
-$('log-filter').addEventListener('input',e=>{ filterQ=e.target.value.trim().toLowerCase(); applyLogFilters(); });
+$('log-filter').addEventListener('input',e=>{
+  filterQ=e.target.value.trim().toLowerCase();
+  clearTimeout(lvFilterTimer); lvFilterTimer=setTimeout(applyLogFilters,120);
+});
 $('log-filter').addEventListener('keydown',e=>{ if(e.key==='Escape'){ e.target.value=''; filterQ=''; applyLogFilters(); } });
+
+/* --- 单一 1s 计时器：只刷新“可见且进行中”的组的耗时文本；页面隐藏时跳过 --- */
+setInterval(()=>{
+  if(document.visibilityState==='hidden' || !lvTicking.size) return;
+  const view=$('view-logs');
+  if(!view || view.classList.contains('hidden')) return;
+  const now=Date.now(), wr=logwin.getBoundingClientRect();
+  for(const id of lvTicking){
+    const node=lvNodes.get(id), g=logStore.getGroup(id);
+    if(!node || !g || !node.visible) continue;
+    const r=node.el.getBoundingClientRect();
+    if(r.bottom<wr.top || r.top>wr.bottom) continue;
+    lvSetText(node.elapsed,lvFmtMs(logStore.elapsedOf(g,now)));
+  }
+},1000);
+
+/* --- 连接状态（与请求状态分开）+ SSE --- */
+function lvSetConn(state){
+  lvConnState=state;
+  const el=$('log-conn'); if(!el) return;
+  const last=lvLastMsgAt ? lvClock(lvLastMsgAt) : '—';
+  el.dataset.state=state;
+  el.textContent=state==='live' ? '实时' : (state==='retry' ? '重连中…' : (state==='closed' ? '已断开 · 最后更新 '+last : '连接中…'));
+  el.title='SSE 连接状态 · 最后更新 '+last;
+}
+lvSetConn('connecting');
 try{
   const es=new EventSource('/stream-logs');
-  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; appendLogLine(logLine(e.data)); };
-}catch(e){}
+  es.onopen=()=>lvSetConn('live');
+  es.onmessage=e=>{
+    lvLastMsgAt=Date.now();
+    if(lvConnState!=='live') lvSetConn('live');
+    lvEnqueue(e.data);
+  };
+  es.onerror=()=>lvSetConn(es.readyState===2 ? 'closed' : 'retry');
+}catch(e){ lvSetConn('closed'); }
 
 /* ---------- Project ID auto-extract（按行内 input 冒泡委托，兼容动态添加的账号行） ---------- */
 document.addEventListener('input',e=>{

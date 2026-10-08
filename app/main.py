@@ -14,7 +14,7 @@ from auth import get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 
-from logger import rt_logger, stats, read_recent_log_lines
+from logger import rt_logger, stats, read_recent_log_records
 import config
 from runtime_state import app_state
 import model_capabilities as mc
@@ -552,24 +552,70 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
     return JSONResponse(content={"status": "success", "message": message})
 
 
+def _sse_log_frame(record: dict, replayed: bool) -> str:
+    """一帧 /stream-logs：信封 + replayed；复制后再加字段，不改 rt_logger 里的原 dict。"""
+    frame = dict(record)
+    frame["replayed"] = replayed
+    return f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+
+
+def _merge_replay_records(disk: list, hist: list) -> list:
+    """合并磁盘尾部与内存历史做初始补发：先磁盘全部（保持文件顺序），
+    再追加内存里磁盘没有、且比磁盘同一次启动的最大 seq 更新（或该启动不在磁盘里）的记录。"""
+    disk_ids = {r.get("event_id") for r in disk if r.get("event_id")}
+    disk_max_seq: dict = {}
+    for r in disk:
+        boot, seq = r.get("boot_id"), r.get("seq")
+        if boot is not None and isinstance(seq, int):
+            disk_max_seq[boot] = max(seq, disk_max_seq.get(boot, seq))
+    merged = list(disk)
+    for r in hist:
+        event_id = r.get("event_id")
+        if event_id in disk_ids:
+            continue
+        boot, seq = r.get("boot_id"), r.get("seq")
+        if boot in disk_max_seq and not (isinstance(seq, int) and seq > disk_max_seq[boot]):
+            continue
+        merged.append(r)
+    return merged
+
+
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
     async def log_generator():
-        # 先补发持久化日志的历史尾部，重建容器后前端也能看到此前的日志；再走实时流。
-        for msg in read_recent_log_lines(200):
-            yield f"data: {msg}\n\n"
+        # 顺序：先订阅队列 → 取内存历史快照 → 读磁盘尾部 → 合并去重补发（replayed=true）
+        # → replay_complete → 实时（跳过已补发的 event_id）。重建容器后也能看到此前落盘的日志。
         q = rt_logger.subscribe()
         try:
-            for msg in rt_logger.snapshot_history():
-                yield f"data: {msg}\n\n"
+            hist = rt_logger.snapshot_history()
+            disk = await asyncio.to_thread(read_recent_log_records, 600)
+            sent_ids = set()
+            for record in _merge_replay_records(disk, hist):
+                event_id = record.get("event_id")
+                if event_id:
+                    sent_ids.add(event_id)
+                yield _sse_log_frame(record, True)
+            yield ("data: " + json.dumps({"schema_version": 1, "event_type": "stream_control",
+                                          "control": "replay_complete", "replayed": False},
+                                         ensure_ascii=False) + "\n\n")
             while True:
                 if await request.is_disconnected():
                     break
+                dropped = rt_logger.take_dropped(q)
+                if dropped > 0:
+                    yield ("data: " + json.dumps({"schema_version": 1, "event_type": "stream_control",
+                                                  "control": "dropped", "dropped": dropped,
+                                                  "replayed": False}, ensure_ascii=False) + "\n\n")
                 try:
-                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                    yield f"data: {msg}\n\n"
+                    record = await asyncio.wait_for(q.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
+                    continue
+                event_id = record.get("event_id")
+                if event_id in sent_ids:
+                    sent_ids.discard(event_id)
+                    continue
+                yield _sse_log_frame(record, False)
         finally:
             rt_logger.unsubscribe(q)
     return StreamingResponse(log_generator(), media_type="text/event-stream")

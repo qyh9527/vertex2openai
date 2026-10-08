@@ -141,7 +141,21 @@ def get_http_options(
         options["headers"] = dict(headers)
     elif priority_paygo:
         options["headers"] = dict(PRIORITY_PAYGO_HEADERS)
-    if timeout and not client_args:
-        options["timeout"] = int(timeout)
+    if timeout:
+        # HttpOptions.timeout 单位是毫秒（genai 2.19 types.py 注释 + _api_client 内 /1000）。
+        # 代理路径也要写：SDK 每次请求都把它显式传给 httpx，不设就是 timeout=None（不限时），
+        # 会盖掉预构建 client 上的默认超时。
+        options["timeout"] = int(timeout) * 1000
 
     return types.HttpOptions(**options) if options else None
+
+
+def describe_transport_timeout(timeout: Optional[int]) -> str:
+    """用于诊断日志：如实描述 get_http_options 会怎样处理该 timeout（不改变其行为）。
+
+    - 空值：不覆盖；genai 2.19 此时逐请求传 timeout=None，即不限时；
+    - 有值：按秒换算成毫秒写入 HttpOptions.timeout，代理与直连路径一致。
+    """
+    if not timeout:
+        return "未覆盖（SDK 逐请求不设超时）"
+    return f"{timeout} 秒（HttpOptions.timeout={int(timeout) * 1000} 毫秒）"

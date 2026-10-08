@@ -1,13 +1,15 @@
 import builtins
+import contextvars
 import json
 import logging
 import os
+import secrets
 import time
 import asyncio
 import re
 import threading
 from logging.handlers import TimedRotatingFileHandler
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -329,6 +331,110 @@ STATS_SAVE_INTERVAL = 30   # 秒：统计落盘节流间隔
 stats = ProxyStats()
 
 
+# ===== 结构化日志记录（事件契约 v1，见 .scratch/request-log-grouping/plan.md）=====
+# 同一事件在「磁盘 / 内存历史 / 实时推送」三处使用同一个 event_id（<boot_id>-<seq>），
+# 控制台 /stream-logs 据此去重，不会因为补发历史而重复展示。
+SCHEMA_VERSION = 1
+BOOT_ID = secrets.token_hex(3)            # 进程启动随机 6 位 hex，区分不同次启动的 seq
+_seq = 0                                   # 进程内单调递增序号（持 _emit_lock 分配）
+_emit_lock = threading.RLock()             # 序号分配 + 落盘 + 推送同锁，保证三处顺序一致
+
+# 防止 print 钩子内部再触发 print 导致递归
+_in_hook = threading.local()
+
+# 当前请求的日志上下文（request_log.RequestLogContext，需有 .request_id 属性）。
+# 定义在这里而不是 request_log，避免 logger <-> request_log 循环导入。
+REQUEST_CTX: contextvars.ContextVar = contextvars.ContextVar("v2o_request_ctx", default=None)
+
+# 落盘行里结构化元数据的分隔标记；asctime 前缀由 logging formatter 添加。
+_META_MARK = " #v2o:"
+_ASCTIME_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
+# str.splitlines() 会拆分的“非常规换行”，落盘前统一换成空格，避免读回时把一条消息拆散。
+_ODD_LINE_BREAKS = re.compile("[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _normalize_message(message: Any) -> str:
+    text = ANSI_ESCAPE.sub("", str(message if message is not None else ""))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _ODD_LINE_BREAKS.sub(" ", text)
+
+
+def _build_envelope(seq: int, message: str, event_type: str, level: Optional[str],
+                    request_id: Optional[str], fields: Optional[dict]) -> Dict[str, Any]:
+    now = time.time()
+    envelope: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": f"{BOOT_ID}-{seq}",
+        "boot_id": BOOT_ID,
+        "seq": seq,
+        "timestamp": int(now * 1000),
+        "time": time.strftime("%H:%M:%S", time.localtime(now)),
+        "event_type": event_type,
+        "message": message,
+    }
+    if request_id is not None:
+        envelope["request_id"] = request_id
+    if level is not None:
+        envelope["level"] = level
+    for key, value in (fields or {}).items():
+        # 值为 None 一律省略；核心字段不允许被业务字段覆盖
+        if value is not None and key not in envelope:
+            envelope[key] = value
+    return envelope
+
+
+def _disk_line(envelope: Dict[str, Any]) -> str:
+    """落盘行：`<message> #v2o:<json>`（asctime 前缀由 formatter 加）。
+
+    meta = 信封去掉 message/time；多行 message 时原样多行写入，标记在最后一行，
+    meta 带 line_count，读回时据此把前面的原始行拼回 message。
+    """
+    message = envelope.get("message", "")
+    meta = {k: v for k, v in envelope.items() if k not in ("message", "time")}
+    line_count = message.count("\n") + 1
+    if line_count > 1:
+        meta["line_count"] = line_count
+    return message + _META_MARK + json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+
+def emit_record(message: str, *, event_type: str = "log", level: Optional[str] = None,
+                request_id: Optional[str] = None, fields: Optional[dict] = None,
+                echo: bool = True) -> dict:
+    """生成一条结构化日志：终端回显 + 落盘 + 实时推送，三处共用同一个 event_id。
+
+    全程吞异常，日志问题绝不影响业务。直接用 original_print / file_logger / rt_logger，
+    不经过 custom_print，所以不会再生成第二条记录。
+    """
+    global _seq
+    envelope: Dict[str, Any] = {}
+    previous_active = getattr(_in_hook, "active", False)
+    _in_hook.active = True
+    try:
+        text = _normalize_message(message)
+        with _emit_lock:
+            _seq += 1
+            envelope = _build_envelope(_seq, text, event_type, level, request_id, fields)
+            if echo:
+                try:
+                    original_print(text)
+                except Exception:
+                    pass
+            if file_logger is not None:
+                try:
+                    file_logger.info(_disk_line(envelope))
+                except Exception:
+                    pass
+            try:
+                rt_logger.push(envelope)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        _in_hook.active = previous_active
+    return envelope
+
+
 class SSELogger:
     """把运行日志推给控制台的 SSE 订阅者。
 
@@ -337,12 +443,15 @@ class SSELogger:
         （图片压缩线程、to_thread 里的消息转换等）。改为 loop.call_soon_threadsafe。
       - 订阅者列表会被事件循环并发增删，遍历时可能 RuntimeError。改为持锁取快照。
       - 队列原本无界，慢客户端会把内存撑爆。改为有界 + 满则丢最旧。
+
+    历史与队列里存的都是结构化信封 dict（见 emit_record）；队列满丢最旧时给该队列累加
+    丢弃计数，订阅端用 take_dropped() 取出并向前端下发 dropped 控制帧。
     """
 
-    def __init__(self, max_history: int = 100, queue_size: int = 500):
+    def __init__(self, max_history: int = 300, queue_size: int = 500):
         self.max_history = max_history
         self.queue_size = queue_size
-        self.history: List[str] = []
+        self.history: List[dict] = []
         self._subscribers: List[tuple] = []       # [(queue, loop)]
         self._lock = threading.Lock()
 
@@ -350,6 +459,7 @@ class SSELogger:
 
     def subscribe(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_size)
+        q._v2o_dropped = 0
         loop = loop or asyncio.get_running_loop()
         with self._lock:
             self._subscribers.append((q, loop))
@@ -359,14 +469,21 @@ class SSELogger:
         with self._lock:
             self._subscribers = [(sq, sl) for (sq, sl) in self._subscribers if sq is not q]
 
-    def snapshot_history(self) -> List[str]:
+    def snapshot_history(self) -> List[dict]:
         with self._lock:
             return list(self.history)
+
+    @staticmethod
+    def take_dropped(q: asyncio.Queue) -> int:
+        """取出并清零该队列因溢出而丢弃的条数（在订阅端事件循环线程里调用）。"""
+        count = getattr(q, "_v2o_dropped", 0)
+        q._v2o_dropped = 0
+        return count
 
     # ---- 推送 ----
 
     @staticmethod
-    def _offer(q: asyncio.Queue, msg: str) -> None:
+    def _offer(q: asyncio.Queue, msg: dict) -> None:
         """在事件循环线程里执行：队列满时丢最旧的一条，保证新日志能进来。"""
         try:
             q.put_nowait(msg)
@@ -374,15 +491,20 @@ class SSELogger:
             try:
                 q.get_nowait()
                 q.put_nowait(msg)
+                q._v2o_dropped = getattr(q, "_v2o_dropped", 0) + 1
             except Exception:
                 pass
 
-    def push(self, plain_text: str) -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        formatted_msg = f"[{timestamp}] {plain_text}"
+    def push(self, record) -> None:
+        """推送一条记录；传 str 时包成 event_type="log" 的信封（兼容旧调用）。"""
+        global _seq
+        if not isinstance(record, dict):
+            with _emit_lock:
+                _seq += 1
+                record = _build_envelope(_seq, _normalize_message(record), "log", None, None, None)
 
         with self._lock:
-            self.history.append(formatted_msg)
+            self.history.append(record)
             if len(self.history) > self.max_history:
                 self.history.pop(0)
             subscribers = list(self._subscribers)
@@ -391,7 +513,7 @@ class SSELogger:
             try:
                 if loop.is_closed():
                     continue
-                loop.call_soon_threadsafe(self._offer, q, formatted_msg)
+                loop.call_soon_threadsafe(self._offer, q, record)
             except RuntimeError:
                 # 事件循环已停止，忽略即可
                 pass
@@ -424,8 +546,97 @@ def read_recent_log_lines(n: int = 200) -> List[str]:
     except Exception:
         return []
 
-# 防止 print 钩子内部再触发 print 导致递归
-_in_hook = threading.local()
+
+def _parse_marked_line(line: str) -> Optional[tuple]:
+    """解析带 #v2o 标记的行；返回 (标记之前的正文, meta dict)，不是合法结构化行返回 None。"""
+    idx = line.rfind(_META_MARK + "{")
+    if idx < 0:
+        return None
+    try:
+        meta = json.loads(line[idx + len(_META_MARK):])
+    except Exception:
+        return None
+    if not isinstance(meta, dict) or meta.get("schema_version") != SCHEMA_VERSION:
+        return None
+    return line[:idx], meta
+
+
+def _legacy_record(line: str) -> Dict[str, Any]:
+    record: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": None,
+        "request_id": None,
+        "event_type": "legacy_text",
+        "message": line,
+    }
+    m = _ASCTIME_PREFIX.match(line)
+    if m:
+        try:
+            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            record["timestamp"] = int(ts * 1000)
+            record["time"] = time.strftime("%H:%M:%S", time.localtime(ts))
+        except Exception:
+            pass
+    return record
+
+
+def read_recent_log_records(n: int = 600) -> List[dict]:
+    """读取磁盘日志尾部并还原成结构化记录（按文件顺序）。
+
+    - 带 `#v2o:{json}` 标记且 schema_version==1 的行 = 结构化记录；多行 message 按
+      line_count 把前面的原始行拼回（尾部截断不够时用现有行并标 partial=true），
+      被拼回的行不再作为旧文本输出；
+    - 其余行（旧格式文本）包成 legacy_text 记录，event_id/request_id 为 None。
+    """
+    lines = read_recent_log_lines(n)
+    structured_at: Dict[int, tuple] = {}      # 起始行下标 -> (标记行下标, 记录)
+    consumed_until = 0                         # 已被前一条结构化记录占用的行下标上界（不含）
+    for i, line in enumerate(lines):
+        parsed = _parse_marked_line(line)
+        if parsed is None:
+            continue
+        head, meta = parsed
+        try:
+            line_count = max(1, int(meta.pop("line_count", 1)))
+        except Exception:
+            line_count = 1
+        start = i - (line_count - 1)
+        partial = False
+        if start < consumed_until:
+            start = consumed_until
+            partial = True
+        body_lines = lines[start:i] + [head]
+        prefix = _ASCTIME_PREFIX.match(body_lines[0])
+        if prefix:
+            body_lines[0] = body_lines[0][prefix.end():]
+        record = dict(meta)
+        record["message"] = "\n".join(body_lines)
+        ts = record.get("timestamp")
+        if isinstance(ts, (int, float)):
+            record["time"] = time.strftime("%H:%M:%S", time.localtime(ts / 1000))
+        elif prefix:
+            try:
+                tsec = time.mktime(time.strptime(prefix.group(1), "%Y-%m-%d %H:%M:%S"))
+                record["timestamp"] = int(tsec * 1000)
+                record["time"] = time.strftime("%H:%M:%S", time.localtime(tsec))
+            except Exception:
+                pass
+        if partial:
+            record["partial"] = True
+        structured_at[start] = (i, record)
+        consumed_until = i + 1
+
+    records: List[dict] = []
+    j = 0
+    while j < len(lines):
+        if j in structured_at:
+            end, record = structured_at[j]
+            records.append(record)
+            j = end + 1
+        else:
+            records.append(_legacy_record(lines[j]))
+            j += 1
+    return records
 
 
 def custom_print(*args, **kwargs):
@@ -462,16 +673,13 @@ def custom_print(*args, **kwargs):
         if not raw_msg:
             return
 
-        # 文件日志（STATE_DIR/vertex2openai.log，按天轮转保留 7 天）。
-        # 用清理 ANSI 后的文本，保证 VPS 上 tail -f 看到的是纯文本。
-        if file_logger is not None:
-            try:
-                file_logger.info(ANSI_ESCAPE.sub('', raw_msg))
-            except Exception:
-                pass
-
+        # 落盘（STATE_DIR/vertex2openai.log，按天轮转保留 7 天）与实时推送统一交给 emit_record：
+        # 用清理 ANSI 后的文本，保证 VPS 上 tail -f 看到的是纯文本；
+        # request_id 取自当前请求上下文（无上下文 = 未分组）；终端输出上面已打过，echo=False。
         try:
-            rt_logger.push(ANSI_ESCAPE.sub('', raw_msg))
+            request_id = getattr(REQUEST_CTX.get(), "request_id", None)
+            emit_record(ANSI_ESCAPE.sub('', raw_msg), event_type="log",
+                        request_id=request_id, echo=False)
         except Exception:
             pass
     finally:

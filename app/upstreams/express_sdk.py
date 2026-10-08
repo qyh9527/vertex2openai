@@ -29,6 +29,7 @@ from top_input_injection import (
 )
 from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
+import request_log
 from conversion_report import ConversionReport
 from runtime_state import app_state
 from failover import UpstreamUnstartedError
@@ -377,6 +378,7 @@ class ExpressSDKUpstream(BaseUpstream):
         model_to_call = resolve_express_model_path(base_model_name, settings)
         is_global = "/locations/global/" in model_to_call
         headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
+        request_log.note_transport(headers, timeout)
         for w in warnings:
             print(f"⚠️ [流量等级] {w}")
         priority_paygo = bool(headers)

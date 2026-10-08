@@ -20,6 +20,7 @@ from usage_mapping import map_usage
 import outcome as outcome_mod
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
+import request_log
 
 router = APIRouter()
 
@@ -322,6 +323,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             continue
 
         upstream = CHANNELS[channel]
+        request_log.note_channel(channel)
         # 候选粒度：本次请求在该通道选中的凭证（脱敏 id；express 留空=通道粒度）
         cred = _current_credential_id(channel)
         try:
@@ -364,8 +366,11 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                                      "message": _summary, "category": _cat,
                                      "upstream": True})
                     if remaining_channels(channels, idx):
-                        print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
-                              f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
+                        request_log.channel_switch(
+                            channel, channels[idx + 1],
+                            f"⚠️ [故障转移] {channel_display_name(channel)} 通道 HTTP {resp.status_code}"
+                            f"（{attempts[-1]['message'][:120]}），切换至 {channel_display_name(channels[idx + 1])} 通道兜底。",
+                            error_summary=attempts[-1]['message'])
                         last_status, last_msg = resp.status_code, attempts[-1]["message"]
                         continue
                     # 无兜底通道：聚合返回（含本通道与所有前序通道的错误）
@@ -403,8 +408,11 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
                              "category": _cat})
             if remaining_channels(channels, idx):
-                print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道未出流失败（{str(e)[:120]}），"
-                      f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
+                request_log.channel_switch(
+                    channel, channels[idx + 1],
+                    f"⚠️ [故障转移] {channel_display_name(channel)} 通道未出流失败（{str(e)[:120]}），"
+                    f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。",
+                    error_summary=str(e))
                 last_status, last_msg = 503, str(e)
                 continue
             # 无兜底通道：聚合所有尝试结果（P0-6），如实转成 OpenAI 错误响应
@@ -424,8 +432,11 @@ async def _dispatch(channels: list, request: OpenAIRequest,
             if remaining_channels(channels, idx) and _exception_switchable(e):
                 attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
                                  "category": _cat})
-                print(f"⚠️ [故障转移] {channel_display_name(channel)} 通道异常（{str(e)[:120]}），"
-                      f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。")
+                request_log.channel_switch(
+                    channel, channels[idx + 1],
+                    f"⚠️ [故障转移] {channel_display_name(channel)} 通道异常（{str(e)[:120]}），"
+                    f"切换至 {channel_display_name(channels[idx + 1])} 通道兜底。",
+                    error_summary=str(e))
                 last_status, last_msg = 503, str(e)
                 continue
             if not remaining_channels(channels, idx):
@@ -503,6 +514,7 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
     has_terminal_error = False
     has_policy_terminal = False
     done_seen = False
+    opened_iterators = [primary_resp.body_iterator]   # 退出时逐个关闭，清理沿调用链向内传递
     try:
         async for chunk in primary_resp.body_iterator:
             if _sse_done(chunk):
@@ -526,10 +538,14 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         # 空流（只有心跳/空 delta/[DONE]）：按未出流失败处理
         breaker.report_failure(primary_channel)
         if remaining:
-            print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式结束但无有效输出"
-                  f"（上游返回空流），切换至 {channel_display_name(remaining[0])} 通道重新发起请求。")
+            request_log.channel_switch(
+                primary_channel, remaining[0],
+                f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式结束但无有效输出"
+                f"（上游返回空流），切换至 {channel_display_name(remaining[0])} 通道重新发起请求。",
+                error_summary="上游返回空流（无有效输出）")
             switch_resp = await _dispatch(remaining, request, fastapi_request, failover_mode)
             if isinstance(switch_resp, StreamingResponse):
+                opened_iterators.append(switch_resp.body_iterator)
                 async for chunk in switch_resp.body_iterator:
                     yield chunk
             else:
@@ -569,10 +585,14 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
                 yield tail
             yield "data: [DONE]\n\n"
             return
-        print(f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式未出流失败（{str(e)[:120]}），"
-              f"切换至 {channel_display_name(remaining[0])} 通道重新发起请求。")
+        request_log.channel_switch(
+            primary_channel, remaining[0],
+            f"⚠️ [故障转移] {channel_display_name(primary_channel)} 通道流式未出流失败（{str(e)[:120]}），"
+            f"切换至 {channel_display_name(remaining[0])} 通道重新发起请求。",
+            error_summary=str(e))
         switch_resp = await _dispatch(remaining, request, fastapi_request, failover_mode)
         if isinstance(switch_resp, StreamingResponse):
+            opened_iterators.append(switch_resp.body_iterator)
             async for chunk in switch_resp.body_iterator:
                 yield chunk
         else:
@@ -582,30 +602,55 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
             if (tail := _error_usage_tail(request)):
                 yield tail
             yield "data: [DONE]\n\n"
+    finally:
+        for opened in reversed(opened_iterators):
+            await request_log.aclose_quietly(opened)
+
+
+def _request_mode(request: OpenAIRequest) -> str:
+    """请求日志里的模式：非流式 / 假流式（fake- 前缀）/ 流式（生图模型强制假流式由生成器事件更新）。"""
+    if not request.stream:
+        return "non_stream"
+    name = (request.model or "").strip()
+    if name.upper().startswith("[PAY]"):
+        name = name[len("[PAY]"):].strip()
+    return "fake_stream" if name.lower().startswith("fake-") else "stream"
 
 
 async def _chat_completions_with_strategy(fastapi_request: Request, request: OpenAIRequest,
                                           strategy: str):
     """按指定策略执行一次聊天请求；显式渠道路径传入单渠道策略。"""
-    order = _available_channels(_channel_order(strategy))
-    if not order:
-        return JSONResponse(
-            status_code=503,
-            content=create_openai_error_response(
-                503, f"当前策略（{strategy}）下没有可用通道：请配置 VERTEX_EXPRESS_API_KEY、"
-                     "Google Cookie 与服务账号 JSON 中的至少一种，"
-                     "或在大盘控制台「通道与凭证」页配置。",
-                "upstream_error"),
-        )
+    # 一个客户端请求 = 一个 request_id（贯穿重试与故障转移）；早于通道预检，预检日志也能归组
+    ctx = request_log.begin_request(request.model, _request_mode(request), strategy)
     try:
-        return await _dispatch(order, request, fastapi_request, failover_mode=(strategy == "hybrid"))
-    except Exception as e:
-        explicit_category = _explicit_exception_category(e)
-        if explicit_category is not None:
-            return _explicit_exception_response(e, explicit_category)
-        code, msg = extract_upstream_error(e)
-        print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
-        return _attach_exception_report(JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error")), e)
+        order = _available_channels(_channel_order(strategy))
+        if not order:
+            return request_log.track_response(ctx, JSONResponse(
+                status_code=503,
+                content=create_openai_error_response(
+                    503, f"当前策略（{strategy}）下没有可用通道：请配置 VERTEX_EXPRESS_API_KEY、"
+                         "Google Cookie 与服务账号 JSON 中的至少一种，"
+                         "或在大盘控制台「通道与凭证」页配置。",
+                    "upstream_error"),
+            ))
+        try:
+            return request_log.track_response(ctx, await _dispatch(
+                order, request, fastapi_request, failover_mode=(strategy == "hybrid")))
+        except Exception as e:
+            explicit_category = _explicit_exception_category(e)
+            if explicit_category is not None:
+                return request_log.track_response(ctx, _explicit_exception_response(e, explicit_category))
+            code, msg = extract_upstream_error(e)
+            print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
+            return request_log.track_response(ctx, _attach_exception_report(JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error")), e))
+    except BaseException as error:
+        # CancelledError 等：连接断开或任务取消；其余未预期异常记为失败。仍要收一个终态事件（finish 幂等）
+        if isinstance(error, Exception):
+            request_log.finish(ctx, "failed", error_type=type(error).__name__,
+                               error_summary=request_log.redact(error))
+        else:
+            request_log.finish(ctx, "cancelled")
+        raise
 
 
 @router.post("/v1/chat/completions")

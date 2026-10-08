@@ -135,9 +135,22 @@ class TestGetHttpOptionsProxy:
 
     def test_flex_timeout_propagated_to_client(self, monkeypatch):
         import httpx
+        from google.genai._api_client import get_timeout_in_seconds
         from http_options import get_http_options, FLEX_TIMEOUT_SECONDS
         monkeypatch.setattr(app_config, "PROXY_URL", "http://127.0.0.1:7897")
         monkeypatch.setattr(app_config, "SSL_CERT_FILE", None)
         opts = get_http_options(timeout=FLEX_TIMEOUT_SECONDS)
         assert isinstance(opts.httpx_async_client, httpx.AsyncClient)
-        assert opts.timeout is None   # 超时已进预构建 client，不再重复设 options.timeout
+        # SDK 每次请求都把 HttpOptions.timeout 显式传给 httpx；不设就是 timeout=None（不限时），
+        # 会盖掉预构建 client 的默认超时，所以代理路径也必须写 options.timeout（毫秒）。
+        assert get_timeout_in_seconds(opts.timeout) == FLEX_TIMEOUT_SECONDS
+
+    def test_flex_timeout_without_proxy_is_seconds_not_milliseconds(self, monkeypatch):
+        from google.genai._api_client import get_timeout_in_seconds
+        from http_options import get_http_options, FLEX_TIMEOUT_SECONDS
+        monkeypatch.setattr(app_config, "PROXY_URL", None)
+        monkeypatch.setattr(app_config, "SSL_CERT_FILE", None)
+        opts = get_http_options(timeout=FLEX_TIMEOUT_SECONDS)
+        # HttpOptions.timeout 单位是毫秒：1800 秒必须传 1_800_000，传 1800 只有 1.8 秒
+        assert opts.timeout == FLEX_TIMEOUT_SECONDS * 1000
+        assert get_timeout_in_seconds(opts.timeout) == FLEX_TIMEOUT_SECONDS

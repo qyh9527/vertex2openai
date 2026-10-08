@@ -58,6 +58,7 @@ from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 
 # 引入报错重试统计器
 from logger import stats
+import request_log
 
 # 假流式前缀：请求 fake-<模型名> 时该请求走假流式（标准 SDK 通道通用），其余模型保持真实流式。
 # 定义在公共模块：models_api（列表暴露）、express_sdk（强制假流式）、cookie_proxy（剥前缀）共用。
@@ -81,6 +82,11 @@ def channel_display_name(channel: Optional[str]) -> str:
     if meta:
         return meta["display"]
     return str(channel)
+
+
+def _seconds_text(ms: Optional[int]) -> str:
+    """诊断日志用的耗时文案；缺失就写“未知”，不造数字。"""
+    return "未知" if ms is None else f"{ms / 1000:.1f}s"
 
 
 def channel_call_text(channel: Optional[str]) -> str:
@@ -549,11 +555,19 @@ async def gemini_fake_stream_generator(
     input_relay_strip_tag: Optional[str] = None,
     conversion_report=None,
 ):
-    print(f"🌊 [假流式] 已开始通过 {channel_call_text(channel_name)} 调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
+    # 请求日志上下文：正常由路由入口创建；测试直接调用生成器时没有（或只剩已结束的），
+    # 这里自建一个并由本生成器负责 finish。
+    ctx = request_log.current()
+    if ctx is None or ctx.terminal_emitted:
+        ctx = request_log.begin_request(request_obj.model, "fake_stream")
+        ctx.owner = True
+    ctx.mode = "fake_stream"
+    ctx.channel = channel_name
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
     max_retries, backoff_sec = get_retry_settings(channel_name)
+    max_attempts = max_retries + 1
 
     async def _client_gone() -> bool:
         if fastapi_request is None:
@@ -571,12 +585,72 @@ async def gemini_fake_stream_generator(
     last_error = None
     response_id = f"chatcmpl-fakestream-{time.time_ns()}"
 
+    # ---- 诊断状态（只用于日志，不参与任何业务分支）----
+    phase = "preparing"          # preparing -> waiting_upstream -> backoff -> converting_response -> sending_downstream
+    ctx.phase = phase
+    outcome_state = None         # 本生成器是否已给出终态结论：success / failed / cancelled
+    observer = None
+    waited_ms_total = 0          # 各次尝试等待上游的毫秒数之和
+    waited_ms_known = True       # 有某次尝试无法取得完成时刻时，不再上报 upstream_wait_ms
+    upstream_cancel_forced = False
+
+    def _set_phase(new_phase: str) -> None:
+        nonlocal phase
+        phase = new_phase
+        ctx.phase = new_phase
+
+    def _close_observer() -> Optional[int]:
+        """关闭本次尝试的观察器并累计上游等待时间；返回本次尝试耗时（毫秒）。"""
+        nonlocal observer, waited_ms_total, waited_ms_known
+        if observer is None:
+            return None
+        current_observer, observer = observer, None
+        current_observer.close()
+        waited = current_observer.wait_ms()
+        if waited is None:
+            waited_ms_known = False
+        else:
+            waited_ms_total += waited
+        return current_observer.attempt_elapsed_ms()
+
+    def _mark_cancelled() -> None:
+        """记录取消结论；上游任务还在跑就请求取消（与原有 cancel 行为一致）。"""
+        nonlocal outcome_state
+        task_done = api_call_task.done() if api_call_task is not None else None
+        cancel_requested = False
+        if api_call_task is not None and not api_call_task.done():
+            api_call_task.cancel()
+            cancel_requested = True
+        outcome_state = "cancelled"
+        ctx.set_outcome("cancelled", phase=phase, upstream_task_done=task_done,
+                        cancel_requested=cancel_requested)
+
+    _paygo_text = ctx.paygo_tier or "未知"
+    _timeout_text = ctx.transport_timeout_note or "未知"
+    ctx.emit(
+        "fake_stream_start",
+        f"🌊 [假流式] 已开始通过 {channel_call_text(channel_name)} 调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。"
+        f"应用层最多 {max_attempts} 次尝试（不等于 SDK 内部 HTTP 次数），退避 {backoff_sec} 秒；"
+        f"PayGo 请求头档位 {_paygo_text}；传输超时 {_timeout_text}。请求 ID {ctx.request_id}。",
+        "INFO", client_model=request_obj.model, call_model=model_for_api_call,
+        channel=channel_name, mode="fake_stream", max_attempts=max_attempts,
+        backoff_seconds=backoff_sec, keepalive_interval_seconds=outer_keep_alive_interval,
+        paygo_tier=ctx.paygo_tier, transport_timeout_note=ctx.transport_timeout_note,
+        phase="preparing")
+
     try:
         for attempt in range(max_retries + 1):
             if await _client_gone():
                 print(f"ℹ️ [客户端断开] 假流式请求前检测到客户端已断开，停止调用模型 {model_for_api_call}。")
+                _mark_cancelled()
                 return
 
+            _set_phase("waiting_upstream")
+            ctx.emit("attempt_start",
+                     f"📡 [尝试开始] {ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试 | "
+                     f"{channel_display_name(channel_name)} | 模型 {model_for_api_call}",
+                     "INFO", attempt=attempt + 1, max_attempts=max_attempts, channel=channel_name,
+                     call_model=model_for_api_call, phase="waiting_upstream")
             api_call_task = asyncio.create_task(
                 gemini_client_instance.aio.models.generate_content(
                     model=model_for_api_call,
@@ -584,6 +658,8 @@ async def gemini_fake_stream_generator(
                     config=gen_config_dict_for_api_call,
                 )
             )
+            observer = request_log.UpstreamWaitObserver(
+                ctx, api_call_task, attempt + 1, max_attempts).start()
 
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
             while not api_call_task.done():
@@ -597,22 +673,35 @@ async def gemini_fake_stream_generator(
                     await asyncio.sleep(0.2)
                 if await _client_gone():
                     print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
-                    api_call_task.cancel()
+                    _mark_cancelled()
                     return
 
             try:
                 raw_gemini_response = await api_call_task
+                _close_observer()
                 break
             except asyncio.CancelledError:
                 raise
             except Exception as e_call:
+                attempt_ms = _close_observer()
                 last_error = e_call
                 if isinstance(e_call, httpx.TransportError):
                     report_client_failure(gemini_client_instance, kind="conn")
-                if is_retryable_exception(e_call) and attempt < max_retries:
+                retryable = is_retryable_exception(e_call)
+                if retryable and attempt < max_retries:
                     stats.add_retry()
-                    print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
-                          f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。")
+                    ctx.retries += 1
+                    _set_phase("backoff")
+                    ctx.emit("attempt_failed",
+                             f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
+                             f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。"
+                             f"（{ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试失败，"
+                             f"本轮 {_seconds_text(attempt_ms)}，累计 {_seconds_text(ctx.elapsed_ms())}）",
+                             "WARN", attempt=attempt + 1, max_attempts=max_attempts, phase="backoff",
+                             attempt_elapsed_ms=attempt_ms, retryable=True,
+                             next_attempt=attempt + 2, backoff_seconds=backoff_sec,
+                             error_type=e_call.__class__.__name__,
+                             error_summary=request_log.redact(e_call), channel=channel_name)
                     waited = 0.0
                     while waited < backoff_sec:
                         step = min(max(0.5, outer_keep_alive_interval or 1.0), backoff_sec - waited)
@@ -620,6 +709,7 @@ async def gemini_fake_stream_generator(
                         waited += step
                         if await _client_gone():
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
+                            _mark_cancelled()
                             return
                         if outer_keep_alive_interval > 0:
                             keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
@@ -627,11 +717,23 @@ async def gemini_fake_stream_generator(
                                                "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
                             yield f"data: {json.dumps(keep_alive_data)}\n\n"
                     continue
+                ctx.emit("attempt_failed",
+                         f"❌ [尝试失败] {ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试失败"
+                         f"（{e_call.__class__.__name__}），"
+                         f"{'已无可用重试次数' if retryable else '该错误不可重试'}",
+                         "ERROR", attempt=attempt + 1, max_attempts=max_attempts,
+                         phase="waiting_upstream", attempt_elapsed_ms=attempt_ms,
+                         retryable=bool(retryable), error_type=e_call.__class__.__name__,
+                         error_summary=request_log.redact(e_call), channel=channel_name)
                 raise
 
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
 
+        _set_phase("converting_response")
+        convert_started = request_log.now_mono()
+        ctx.emit("phase", f"🔄 [阶段] {ctx.request_id} 已收到上游响应，开始转换为 OpenAI 格式",
+                 "INFO", phase="converting_response")
         if conversion_report is not None:
             conversion_report.inspect_response(raw_gemini_response)
         prompt_end = _classify_prompt_feedback(raw_gemini_response)
@@ -678,18 +780,39 @@ async def gemini_fake_stream_generator(
             openai_response_dict = _strip_input_relay_from_openai_dict(
                 openai_response_dict, input_relay_strip_tag)
         _prepend_prefill(openai_response_dict, prefill_text)
+        convert_ms = int((request_log.now_mono() - convert_started) * 1000)
+        _set_phase("sending_downstream")
+        ctx.emit("phase", f"📤 [阶段] {ctx.request_id} 转换完成，开始向下游发送 SSE",
+                 "INFO", phase="sending_downstream", convert_ms=convert_ms)
+        send_started = request_log.now_mono()
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict,
             response_id_override=response_id,
             include_usage=wants_usage(request_obj),        ):
             yield chunk_sse
+        # 走到这里 = 全部 SSE（含 [DONE]）已发出且下游继续拉取，才算成功。
+        outcome_state = "success"
+        try:
+            _finish_reason = ((openai_response_dict.get("choices") or [{}])[0]).get("finish_reason")
+        except Exception:
+            _finish_reason = None
+        ctx.set_outcome(
+            "success", phase="sending_downstream",
+            upstream_wait_ms=waited_ms_total if waited_ms_known else None,
+            convert_ms=convert_ms,
+            send_ms=int((request_log.now_mono() - send_started) * 1000),
+            finish_reason=_finish_reason,
+            usage=request_log.usage_of(raw_gemini_response))
 
     except asyncio.CancelledError:
-        print(f"ℹ️ [客户端断开] 假流式响应期间客户端已断开，正在清理模型 {request_obj.model} 的后台任务。")
-        if "api_call_task" in locals() and not api_call_task.done():
-            api_call_task.cancel()
+        print(f"ℹ️ [客户端断开] 假流式响应期间连接断开或任务取消，正在清理模型 {request_obj.model} 的后台任务。")
+        _close_observer()
+        _mark_cancelled()
         raise
     except Exception as e_outer_gemini:
+        outcome_state = "failed"
+        ctx.set_outcome("failed", phase=phase, error_type=type(e_outer_gemini).__name__,
+                        error_summary=request_log.redact(e_outer_gemini))
         err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
         print(f"❌ [API 错误响应] {channel_call_text(channel_name)} 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
         _sa_hint = sa_channel_hint(channel_name, str(e_outer_gemini))
@@ -725,6 +848,25 @@ async def gemini_fake_stream_generator(
             yield "data: [DONE]\n\n"
         if is_auto_attempt:
             raise
+    finally:
+        # 所有路径（成功、失败、取消、生成器 aclose）都要收尾：关观察器、不遗留上游任务。
+        _close_observer()
+        if api_call_task is not None and not api_call_task.done():
+            # 例如 GeneratorExit/aclose 时上游任务仍在运行：清理它（不改变异常传播）。
+            api_call_task.cancel()
+            upstream_cancel_forced = True
+        if outcome_state is None:
+            # 被 aclose / GeneratorExit 或其他 BaseException 打断，没有业务结论。
+            outcome_state = "cancelled"
+            ctx.set_outcome(
+                "cancelled", phase=phase,
+                upstream_task_done=(not upstream_cancel_forced) if api_call_task is not None else None,
+                cancel_requested=upstream_cancel_forced)
+        elif upstream_cancel_forced and ctx.outcome is not None:
+            ctx.outcome["cancel_requested"] = True
+            ctx.outcome["upstream_task_done"] = False
+        if ctx.owner:
+            request_log.finish(ctx)
 
 def is_location_pin_failure(err: Any) -> bool:
     """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
@@ -809,6 +951,7 @@ async def execute_gemini_call(
                 raise
             finally:
                 report.log()
+                await request_log.aclose_quietly(iterator)
 
         response.body_iterator = reported_stream()
         return response
