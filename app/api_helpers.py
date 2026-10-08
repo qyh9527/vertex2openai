@@ -221,6 +221,7 @@ def _record_usage(resp: Any, model_name: str = "") -> dict:
     if traffic_type:
         value = getattr(traffic_type, "value", None) or str(traffic_type)
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
+        request_log.note_traffic_type(value)
 
     usage = map_usage(usage_metadata)
     p_tk, c_tk, t_tk = usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
@@ -1120,6 +1121,8 @@ async def _execute_gemini_call(
                                         terminal_finish_reasons[candidate_index] = raw_end.finish_reason
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_usage = map_usage(chunk_item_call.usage_metadata)
+                                request_log.note_traffic_type(
+                                    getattr(chunk_item_call.usage_metadata, "traffic_type", None))
                                 # 纯用量块不代表已向客户端输出正文；安全反馈仍交由转换器处理。
                                 if (not getattr(chunk_item_call, "candidates", None)
                                         and not getattr(chunk_item_call, "prompt_feedback", None)):

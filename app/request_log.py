@@ -128,6 +128,8 @@ class RequestLogContext:
         self.retries = 0
         self.switches = 0
         self.paygo_tier: Optional[str] = None
+        self.traffic_type: Optional[str] = None
+        self.paygo_downgraded = False
         self.transport_timeout_note: Optional[str] = None
         self.outcome: Optional[dict] = None
         self.terminal_emitted = False
@@ -216,6 +218,29 @@ def note_transport(headers: Optional[dict], timeout: Optional[int]) -> None:
         pass
 
 
+def note_traffic_type(traffic_type: Any) -> None:
+    """记录上游实际 traffic_type；请求了优先档却拿到 ON_DEMAND 时明确告警“已降级”。
+
+    官方 Priority PayGo 文档：只有没有空闲算力按优先档处理时才降级到标准档，响应里 traffic_type=ON_DEMAND。
+    """
+    ctx = current()
+    if ctx is None or not traffic_type:
+        return
+    try:
+        value = str(getattr(traffic_type, "value", None) or traffic_type)
+        ctx.traffic_type = value
+        if ctx.paygo_tier == "priority" and value == "ON_DEMAND" and not ctx.paygo_downgraded:
+            ctx.paygo_downgraded = True
+            ctx.emit("paygo_downgraded",
+                     f"⚠️ [流量等级] {ctx.request_id} 优先档已被上游降级为标准档"
+                     f"（请求头 priority，实际 traffic_type=ON_DEMAND）：上游当时没有空闲算力按优先档处理，"
+                     f"本次按标准档计费，等待可能明显变长。",
+                     "WARN", paygo_tier=ctx.paygo_tier, traffic_type=value, paygo_downgraded=True,
+                     channel=ctx.channel)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 终态
 
 def _end_message(ctx: RequestLogContext, status: str, merged: dict, elapsed_ms: int) -> str:
@@ -258,6 +283,8 @@ def _end_message(ctx: RequestLogContext, status: str, merged: dict, elapsed_ms: 
         parts.append("该路径没有详细诊断结论")
     if ctx.slow:
         parts.append("慢请求")
+    if ctx.paygo_downgraded:
+        parts.append("优先档被降级为标准档")
     if ctx.retries or ctx.switches:
         parts.append(f"重试 {ctx.retries} 次 / 切换通道 {ctx.switches} 次")
     return " | ".join(parts)
@@ -287,6 +314,10 @@ def finish(ctx: Optional[RequestLogContext], status: Optional[str] = None, **fie
         }
         if ctx.slow:
             event["slow"] = True
+        if ctx.traffic_type:
+            event["traffic_type"] = ctx.traffic_type
+        if ctx.paygo_downgraded:
+            event["paygo_downgraded"] = True
         event.update(merged)
         message = _end_message(ctx, final_status, {**merged, "phase": event["phase"]}, elapsed_ms)
         ctx.emit("request_end", message, _STATUS_LEVELS.get(final_status, "WARN"), **event)

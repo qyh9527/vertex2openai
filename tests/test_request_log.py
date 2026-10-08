@@ -432,6 +432,28 @@ async def test_stream_exception_ends_failed_and_propagates(events):
     assert len(end) == 1 and end[0]["status"] == "failed" and end[0]["error_type"] == "RuntimeError"
 
 
+@pytest.mark.parametrize("tier,traffic,downgraded", [
+    ("priority", "ON_DEMAND", True),
+    ("priority", "ON_DEMAND_PRIORITY", False),
+    ("standard", "ON_DEMAND", False),
+    ("flex", "ON_DEMAND_FLEX", False),
+])
+async def test_paygo_downgrade_is_called_out(events, tier, traffic, downgraded):
+    ctx = request_log.begin_request(MODEL, "non_stream", "express")
+    ctx.paygo_tier = tier
+    request_log.note_traffic_type(SimpleNamespace(value=traffic))
+    request_log.note_traffic_type(traffic)          # 重复上报（流式多块带 usage）只告警一次
+    request_log.track_response(ctx, JSONResponse(content={"ok": 1}))
+    warn = of_type(events, "paygo_downgraded", ctx.request_id)
+    end = of_type(events, "request_end", ctx.request_id)[0]
+    assert end["traffic_type"] == traffic
+    assert len(warn) == (1 if downgraded else 0)
+    assert bool(end.get("paygo_downgraded")) is downgraded
+    assert ("优先档被降级为标准档" in end["message"]) is downgraded
+    if downgraded:
+        assert warn[0]["level"] == "WARN"
+
+
 # ------------------------------------------------------------------ 验收 5：并发与脱敏
 
 async def test_concurrent_requests_do_not_mix_request_ids(events):
