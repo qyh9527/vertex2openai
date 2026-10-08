@@ -2269,7 +2269,7 @@ function lvCreateNode(g){
   meta.append(time,idc,mode,ch,ph,rs,tgM.box);
   sum.append(chev,badge,model,elapsed,meta);
   const copy=lvMk('button','lv-copy','复制'); copy.type='button';
-  copy.setAttribute('aria-label','复制完整请求 ID'); copy.title='复制完整请求 ID';
+  copy.setAttribute('aria-label','复制该请求组的全部日志'); copy.title='复制该请求组的全部日志';
   head.append(sum,copy);
   const body=lvMk('div','lv-body'); body.id='lvb-'+idn;
   const info=lvMk('div','lv-info'), evBox=lvMk('div','lv-events');
@@ -2277,7 +2277,7 @@ function lvCreateNode(g){
   el.append(head,body);
   const id=g.id;
   sum.addEventListener('click',()=>lvToggleGroup(id));
-  copy.addEventListener('click',()=>lvCopyId(id,copy));
+  copy.addEventListener('click',()=>lvCopyGroup(id,copy));
   return {el,sum,badge,glyph,btxt,mname,mnFull,mnShort,elapsed,time,idc,mode,ch,ph,rs,rsL,rsS,tg:[tgD,tgM],info,evBox,lastN:-1,open:false,visible:true,infoSig:'',stateKey:''};
 }
 function lvToggleGroup(id){
@@ -2379,12 +2379,21 @@ function lvSyncGroup(id){
   if(!node){ node=lvCreateNode(g); lvNodes.set(id,node); lvGroupsEl.appendChild(node.el); }
   lvUpdateNode(node,g);
 }
-function lvCopyId(id,btn){
+/* 复制整组日志（不受当前筛选影响）：首行请求 ID，其后每条 “时间 消息” */
+function lvGroupText(g){
+  const lines=['请求 ID '+g.id];
+  if(g.omitted>0) lines.push('（已省略 '+g.omitted+' 条较早记录）');
+  for(const ev of g.events) lines.push((ev.time ? ev.time+' ' : '')+ev.message);
+  return lines.join('\n');
+}
+function lvCopyGroup(id,btn){
+  const g=logStore.getGroup(id);
+  const text=g ? lvGroupText(g) : id;
   const done=()=>{ btn.textContent='已复制'; setTimeout(()=>{ if(btn.isConnected) btn.textContent='复制'; },1200); };
-  const fail=()=>toast('复制失败，请手动选中请求 ID');
+  const fail=()=>toast('复制失败，请展开后手动选中日志');
   if(navigator.clipboard && window.isSecureContext){
-    navigator.clipboard.writeText(id).then(done).catch(()=>{ if(fallbackCopyText(id)) done(); else fail(); });
-  }else if(fallbackCopyText(id)) done();
+    navigator.clipboard.writeText(text).then(done).catch(()=>{ if(fallbackCopyText(text)) done(); else fail(); });
+  }else if(fallbackCopyText(text)) done();
   else fail();
 }
 

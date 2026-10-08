@@ -323,9 +323,48 @@ async def aclose_quietly(iterator) -> None:
         pass
 
 
+def _sse_error_fields(chunk: Any) -> Optional[dict]:
+    """SSE 错误块（`data: {"error": ...}`）的失败摘要；不是错误块返回 None。"""
+    try:
+        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        if '"error"' not in text:
+            return None
+        for line in text.splitlines():
+            if not line.startswith("data: {"):
+                continue
+            data = json.loads(line[6:])
+            error = data.get("error") if isinstance(data, dict) else None
+            if error is None:
+                continue
+            fields: dict = {"error_summary": None}
+            if isinstance(error, dict):
+                if error.get("message"):
+                    fields["error_summary"] = redact(error["message"])
+                if isinstance(error.get("code"), int):
+                    fields["http_status"] = error["code"]
+                if error.get("type"):
+                    fields["error_type"] = str(error["type"])
+            return fields
+    except Exception:
+        pass
+    return None
+
+
+def _is_sse_done(chunk: Any) -> bool:
+    try:
+        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        return "data: [DONE]" in text
+    except Exception:
+        return False
+
+
 async def _tracked_stream(ctx: RequestLogContext, inner):
     status = None
     extra: dict = {}
+    # 没有通道写结论的流式路径（真流式 / Cookie）：按下发的 SSE 推断终态——
+    # 出现错误块记失败，正常收到 [DONE] 记成功，两者都没有仍是 unknown。
+    sse_error: Optional[dict] = None
+    done_seen = False
     iterator = inner.__aiter__()
     try:
         while True:
@@ -336,7 +375,16 @@ async def _tracked_stream(ctx: RequestLogContext, inner):
                 chunk = await iterator.__anext__()
             except StopAsyncIteration:
                 break
+            if sse_error is None:
+                sse_error = _sse_error_fields(chunk)
+            if not done_seen:
+                done_seen = _is_sse_done(chunk)
             yield chunk
+        if ctx.outcome is None:
+            if sse_error is not None:
+                status, extra = "failed", sse_error
+            elif done_seen:
+                status = "success"
     except (asyncio.CancelledError, GeneratorExit):
         status = "cancelled"
         raise

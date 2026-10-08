@@ -381,6 +381,43 @@ async def test_stream_without_diagnosis_ends_unknown(events):
     assert len(end) == 1 and end[0]["status"] == "unknown" and end[0]["level"] == "INFO"
 
 
+async def test_stream_done_without_outcome_ends_success(events):
+    ctx = request_log.begin_request(MODEL, "stream", "hybrid")
+
+    async def ok():
+        yield ": keep-alive\n\n"
+        yield b'data: {"choices": [{"delta": {"content": "hi \\"error\\""}}]}\n\n'
+        yield "data: [DONE]\n\n"
+    resp = request_log.track_response(ctx, StreamingResponse(ok()))
+    _ = [line async for line in resp.body_iterator]
+    end = of_type(events, "request_end", ctx.request_id)
+    assert len(end) == 1 and end[0]["status"] == "success"
+
+
+async def test_stream_error_chunk_ends_failed(events):
+    ctx = request_log.begin_request(MODEL, "stream", "hybrid")
+
+    async def bad():
+        yield 'data: {"error": {"message": "quota Bearer sk-secret", "code": 429, "type": "upstream_error"}}\n\n'
+        yield "data: [DONE]\n\n"
+    resp = request_log.track_response(ctx, StreamingResponse(bad()))
+    _ = [line async for line in resp.body_iterator]
+    end = of_type(events, "request_end", ctx.request_id)
+    assert len(end) == 1 and end[0]["status"] == "failed" and end[0]["http_status"] == 429
+    assert "sk-secret" not in end[0]["error_summary"]
+
+
+async def test_stream_outcome_wins_over_sse_inference(events):
+    ctx = request_log.begin_request(MODEL, "fake_stream", "express")
+
+    async def gen():
+        ctx.set_outcome("cancelled", phase="sending")
+        yield "data: [DONE]\n\n"
+    resp = request_log.track_response(ctx, StreamingResponse(gen()))
+    _ = [line async for line in resp.body_iterator]
+    assert of_type(events, "request_end", ctx.request_id)[0]["status"] == "cancelled"
+
+
 async def test_stream_exception_ends_failed_and_propagates(events):
     ctx = request_log.begin_request(MODEL, "stream", "cookie")
 
