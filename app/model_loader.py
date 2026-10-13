@@ -22,6 +22,7 @@ _LOCAL_MODEL_FILE_CANDIDATES = [
 
 # 内置兜底模型列表：磁盘缓存与本地 vertexModels.json 都不可用时使用，保证 /v1/models 绝不返回空。
 _DEFAULT_FALLBACK_MODELS = [
+    "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
@@ -30,10 +31,9 @@ _DEFAULT_FALLBACK_MODELS = [
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3-pro-image",
     "gemini-3-flash-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
 ]
 
 _MODELS_DISK_FILE = os.path.join(os.environ.get("STATE_DIR", "."), "models.json")

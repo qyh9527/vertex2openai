@@ -5,6 +5,7 @@ import httpx
 
 from google.genai import types
 import config as app_config
+import model_capabilities as mc
 
 
 # ============================================================
@@ -89,8 +90,12 @@ def resolve_paygo_bundle(is_global: bool, settings: dict, model_name: str = ""):
     返回 (headers, timeout, warnings)；headers 为空 = 不打层级头。
     供 Express 与服务账号两通道共用（cookie 通道不适用）。
     Flex 层级对不支持的模型（gemini-2.x 系）自动降级并告警，避免 400。
+    auto 档对生图模型不打层级头：gemini-nano-banana-2.1 官方只支持 Standard PayGo
+    （模型页 Consumption options，核对于 2026-10-14），生图统一走普通请求。
     """
     tier = (settings.get("paygo_tier", "auto") or "auto").strip().lower()
+    if tier == "auto" and model_name and mc.get_profile(model_name)["is_image"]:
+        return {}, None, []
     paygo_only = bool(settings.get("paygo_only", False))
     headers, warnings = resolve_paygo_headers(tier, paygo_only, is_global)
     if tier == "flex" and headers and not is_flex_supported(model_name):

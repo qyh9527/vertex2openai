@@ -69,7 +69,6 @@ VERTEX_REASONING_TAG = REASONING_TAG
 DEFAULT_SETTINGS = {
     # 思考
     "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
-    "thinking_g25_budget": -1,            # Gemini 2.5 默认思考预算: -1=动态, 0=关(仅flash), 或整数
     # 生图
     "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
     "image_aspect_ratio": "",             # 默认宽高比, ""=自动
@@ -246,7 +245,6 @@ DEFAULT_SETTINGS = {
 PER_MODEL_KEYS = [
     "native_thinking_mode",
     "thinking_g3_level",
-    "thinking_g25_budget",
     "image_size",
     "image_aspect_ratio",
     "default_temperature",

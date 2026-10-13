@@ -2,7 +2,7 @@
 模型能力矩阵（按家族识别）
 
 用于决定：
-- 每个模型支持的思考方式（thinking_level / thinking_budget / 无）与合法档位
+- 每个模型支持的思考方式（thinking_level / 无）与合法档位
 - 可用的采样参数集合（避免把不支持的参数发给模型导致 400）
 - 生图模型支持的宽高比与分辨率白名单
 - 是否要求最后一条消息为 user（Gemini 3.x 强制，否则 400 → 影响预填充）
@@ -31,10 +31,13 @@ SAMPLING_KEYS = {
 # ---- 生图分辨率与比例白名单 ----
 # 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-image
 #      「1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9 aspect ratios」（核对于 2026-07-26）
-_PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-# 出处：Agent Platform gemini-3.1-flash-image 模型文档（核对于 2026-08）
-#      Flash Image 在 Pro Image 的 10 种比例外，额外支持 1:4、4:1、1:8、8:1、9:21。
-_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1", "9:21"}
+_LITE_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+# 出处：Agent Platform gemini-3-pro-image / gemini-3-1-flash-image / gemini-nano-banana-2-1
+#      模型文档（上游核对于 2026-10-13；nano-banana-2-1 页面本地复核于 2026-10-14）：三者均为 15 种宽高比
+#      「1:1, 3:2, 2:3, 3:4, 1:4, 4:1, 4:3, 4:5, 5:4, 1:8, 8:1, 9:16, 16:9, 21:9, 9:21」
+_PRO_IMAGE_ARS = _LITE_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1", "9:21"}
+_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS
+_NANO_BANANA_ARS = _PRO_IMAGE_ARS
 
 # ---- 思考档位阶梯（由低到高）----
 # 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
@@ -130,19 +133,37 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     name = _strip_known_suffixes(raw)
 
     # ---- 生图模型 ----
-    if "image" in name:
+    # 识别规则："image" in name 覆盖 3.x 生图；"nano-banana" in name 覆盖 Nano Banana 家族
+    # （gemini-nano-banana-2.1 名字里不带 image，不加这条会被误判为文本模型）。
+    if "image" in name or "nano-banana" in name:
+        is_nano = "nano-banana" in name
         is_lite = "flash-lite" in name
         is_flash = "flash" in name
-        if is_lite:
-            ars, sizes = _PRO_IMAGE_ARS, {"1K"}
+        # 合法 thinking 档位（Agent Platform Thinking 文档，核对于 2026-10-14）：
+        #   3.1-flash(-lite)-image: MINIMAL / HIGH；3-pro-image: 仅 HIGH
+        #   nano-banana-2.1: MINIMAL / MEDIUM / HIGH（照搬上游，官方档位表未列出）
+        # 默认档位统一 HIGH（跟随上游，用户决策 2026-10-14；官方 flash-image 默认为 MINIMAL）。
+        # 例外：3-pro-image 真机（SA 通道，2026-10-14）带 thinking_level 返回
+        #   400 "thinking_level is not supported by this model"，且其唯一档位 HIGH 即模型默认，
+        #   故 pro-image 及未知生图不下发思考配置（thinking_kind=None）。
+        if is_nano:
+            ars, sizes = _NANO_BANANA_ARS, {"1K", "2K", "4K"}
+            thinking_levels = {"minimal", "medium", "high"}
+        elif is_lite:
+            ars, sizes = _LITE_IMAGE_ARS, {"1K"}
+            thinking_levels = {"minimal", "high"}
         elif is_flash:
             ars, sizes = _FLASH_IMAGE_ARS, {"512", "1K", "2K", "4K"}
+            thinking_levels = {"minimal", "high"}
         else:  # pro-image 及未知生图
             ars, sizes = _PRO_IMAGE_ARS, {"1K", "2K", "4K"}
+            thinking_levels = set()
         return {
             "family": "image",
             "is_image": True,
-            "thinking_kind": None,
+            "thinking_kind": "level" if thinking_levels else None,
+            "thinking_levels": thinking_levels,
+            "default_level": "high",
             "allowed_sampling": set(),          # 生图剥离所有采样参数
             "image_aspect_ratios": ars,
             "image_sizes": sizes,
@@ -191,32 +212,10 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "sampling_advice": "deprecated" if temp_dep else "recommend_default",
             "supports_search": True,
             "requires_user_last_turn": True,
-        }
-
-    if major == 2 and minor >= 5:
-        # Gemini 2.5：thinking_budget；保留全部采样参数
-        # ⚠️ 停用预告：gemini-2.5-pro / 2.5-flash / 2.5-flash-lite 官方停用日期 2026-10-16。
-        #    届时本分支将没有活模型，可整体删除（连同 DEFAULT_SETTINGS.thinking_g25_budget）。
-        # 预算区间出处：Thinking 文档预算表（核对于 2026-07-26）
-        #   2.5 Pro        128 – 32768，不可关闭
-        #   2.5 Flash        0 – 24576，0 = 关闭
-        #   2.5 Flash-Lite 512 – 24576，0 = 关闭（非零最低 512，不是 0）
-        if is_pro:
-            budget_min, budget_max, can_zero = 128, 32768, False
-        elif "flash-lite" in name:
-            budget_min, budget_max, can_zero = 512, 24576, True
-        else:
-            budget_min, budget_max, can_zero = 0, 24576, True
-        return {
-            "family": "g25",
-            "is_image": False,
-            "thinking_kind": "budget",
-            "budget_min": budget_min,
-            "budget_max": budget_max,
-            "budget_can_zero": can_zero,
-            "allowed_sampling": set(SAMPLING_KEYS),
-            "supports_search": True,
-            "requires_user_last_turn": False,
+            # Gemini 4 长解码：max_output_tokens > 65536 时上游按 finish_reason=CONTINUATION
+            # 分段返回、要求带 continuation_token 续请求，本代理不做续传，故夹到单次上限。
+            # 出处：Agent Platform「Developer's guide to Gemini 4 Argon」（核对于 2026-10-14）。
+            "max_output_tokens_cap": 65536 if major >= 4 else None,
         }
 
     # ---- 更早（2.0 / 1.5 等）：无思考、全采样、宽松 ----
@@ -266,14 +265,14 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
                      prefill_active: bool = False, reporter=None) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
-    返回 {"mode": None} 或 {"mode":"level","level":..} 或 {"mode":"budget","budget":..}
+    返回 {"mode": None} 或 {"mode":"level","level":..}
 
     优先级（默认）：单次请求 reasoning_effort/thinking_budget > 控制台/该模型专属 > 家族默认。
 
     控制台 native_thinking_mode（原生思考控制，向后兼容旧 hide_thoughts/thinking_force_console 布尔）：
     - "request"（默认）：跟随请求 effort（无则控制台/模型默认），返回思考。
-    - "off"（关闭原生思考，酒馆预设推荐）：把思考压到该模型最低（3.x=minimal/low；2.5-flash=0、
-      2.5-pro=128），忽略前端 effort，并 include_thoughts=False。**重要：batchGraphql(Studio) 会忽略
+    - "off"（关闭原生思考，酒馆预设推荐）：把思考压到该模型最低合法档（3.x/4.x=minimal/low，
+      生图=minimal/high），忽略前端 effort，并 include_thoughts=False。**重要：batchGraphql(Studio) 会忽略
       includeThoughts，故 Cookie 通道还需在响应侧剥离思考块（见 chat_completions）；把档位压到 minimal
       才是 Studio 下真正减少原生思考、避免重预设思考阶段被截断的关键（已真机验证）。**
     - "console"（强制控制台档位）：忽略前端 effort，用控制台/该模型专属档位（未设则模型默认），返回思考。
@@ -281,7 +280,7 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     另外 prefill_suppress_thinking（默认开）：检测到预填充时等效走 "off" 压制路径。
     """
     prof = get_profile(model_name)
-    if prof["is_image"] or prof["thinking_kind"] is None:
+    if prof["thinking_kind"] is None:
         return {"mode": None}
 
     settings = settings or {}
@@ -332,41 +331,7 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
             reporter.record("reasoning_effort", "normalized", "clamped_to_supported_thinking_level")
         return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
-    # budget（2.5）
-    bmin, bmax, can_zero = prof["budget_min"], prof["budget_max"], prof["budget_can_zero"]
-    if suppress:
-        # 2.5-flash 可预算 0 完全关闭；2.5-pro 最低 128（无法全关）
-        budget = 0 if can_zero else bmin
-        return {"mode": "budget", "budget": budget, "include_thoughts": False}
-    rb = req_budget
-    eff = req_effort
-    if rb is not None:
-        try:
-            budget = int(rb)
-        except (TypeError, ValueError):
-            budget = -1
-    elif eff == "low":
-        budget = max(bmin, 1024)
-    elif eff in ("medium", "high"):
-        budget = -1
-    elif eff == "minimal":
-        budget = 0 if can_zero else bmin
-    else:
-        try:
-            budget = int(settings.get("thinking_g25_budget", -1))
-        except (TypeError, ValueError):
-            budget = -1
-    if budget == 0 and not can_zero:
-        budget = bmin
-    # 0 = 关闭思考，是合法值，不能被 max(bmin, ...) 抬成 512/128；仅夹取非 0 非 -1 的值。
-    if budget not in (-1, 0):
-        budget = max(bmin, min(bmax, budget))
-    # F-4：budget=0 表示关闭思考，此时上游拒绝 include_thoughts=True
-    # （"Thinking_config.include_thoughts is only enabled when thinking is enabled"），
-    # 即"用户主动关思考"这条路径必然 400。关思考就必须同时不要思考摘要。
-    if budget == 0:
-        include_thoughts = False
-    return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
+    return {"mode": None}
 
 
 def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -516,10 +481,6 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）
         thinking["levels"] = sort_levels(prof["thinking_levels"])
         thinking["can_off"] = False
-    elif prof["thinking_kind"] == "budget":
-        thinking["budget_min"] = prof["budget_min"]
-        thinking["budget_max"] = prof["budget_max"]
-        thinking["can_off"] = prof["budget_can_zero"]
     return {
         "family": prof["family"],
         "is_image": prof["is_image"],

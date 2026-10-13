@@ -1012,7 +1012,9 @@ async def _execute_gemini_call(
             return False
 
     if request_obj.stream:
-        is_image_request = "image" in request_obj.model.lower()
+        # 生图判定统一走能力档案（nano-banana-2.1 名字里不带 image，裸 "image" in 会漏判，
+        # 漏判会绕开下面的生图假流式保护，走真流式）
+        is_image_request = mc.get_profile(request_obj.model)["is_image"]
 
         # 假流式判定：仅请求模型名带 fake- 前缀（force_fake_streaming），或生图模型强制。
         # 全局 fake_streaming 开关不再直接强制所有模型，改由模型列表暴露 fake- 前缀模型

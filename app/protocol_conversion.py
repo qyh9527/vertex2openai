@@ -197,7 +197,8 @@ def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str,
     # 官方并未禁止生图模型使用系统指令，但为避免直接改变既有行为，
     # 改成控制台开关 image_system_instruction（默认关，保持旧行为）。
     if system_texts:
-        _is_image_name = "image" in request.model.lower()
+        # 生图判定统一走能力档案（"nano-banana" 家族名字里不带 image，裸 "image" in 会漏判）
+        _is_image_name = mc.get_profile(request.model)["is_image"]
         _allow_sys = (not _is_image_name) or bool(
             app_state.get_setting("image_system_instruction", False))
         if _allow_sys:
@@ -293,6 +294,19 @@ def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str,
     if is_image_model:
         config["response_modalities"] = ["TEXT", "IMAGE"]
 
+        # Nano Banana 家族专属（跟随上游 2026-10-13 决策）：
+        # - 追加 4 个图像安全分类，阈值全 OFF（官方示例基准）
+        # - media_resolution=HIGH：提升输入多媒体的理解精细度（非输出尺寸）
+        # 旧生图模型维持现状，不加。
+        if "nano-banana" in (request.model or "").lower():
+            config["safety_settings"].extend([
+                types.SafetySetting(category="HARM_CATEGORY_IMAGE_HATE", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", threshold="OFF"),
+            ])
+            config["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
+
         # 宽高比：两通道共用解析（请求额外字段 > OpenAI size 映射 > 提示词 > 控制台默认，按模型白名单校验）
         target_ar = mc.resolve_aspect_ratio(request.model, request, settings)
 
@@ -329,6 +343,14 @@ def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str,
 
     # 按模型家族剥离不支持的采样参数（例如 Gemini 3.x 弃用 temperature/top_p/top_k、不支持 candidate_count）
     mc.sanitize_sampling(config, profile, reporter=reporter)
+
+    # Gemini 4 长解码：超过单次上限会返回 CONTINUATION（本代理不续传），夹到单次上限
+    _max_cap = profile.get("max_output_tokens_cap")
+    if _max_cap and isinstance(config.get("max_output_tokens"), int) and config["max_output_tokens"] > _max_cap:
+        config["max_output_tokens"] = _max_cap
+        if reporter is not None:
+            reporter.record("generation_config.max_output_tokens", "normalized",
+                            "clamped_to_single_request_output_cap")
 
     if tools_list:
         config["tools"] = tools_list

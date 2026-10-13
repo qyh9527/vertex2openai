@@ -48,13 +48,15 @@ def test_penalty_stripped_from_36(model, stripped, policy, monkeypatch):
     assert keys == (set() if stripped else {"presence_penalty", "frequency_penalty"})
 
 
-def test_25_controls_unchanged(monkeypatch):
+def test_25_falls_back_to_legacy_after_retirement(monkeypatch):
+    # 2.5 已于 2026-10-16 停用，专用 thinking_budget 分支已删除：按 legacy 处理（不发思考配置、保留采样）
     monkeypatch.setattr(app_state, "get_effective_settings", lambda _: {})
     request = OpenAIRequest(model="gemini-2.5-flash", messages=[], temperature=0.5, top_p=0.8, top_k=10, n=2, thinking_budget=0)
     config = create_generation_config(request)
     assert config["candidate_count"] == 2
     assert config["temperature"] == 0.5
-    assert _build_thinking_config(request.model, request, False) == {"thinking_budget": 0, "include_thoughts": False}
+    assert mc.get_profile(request.model)["family"] == "legacy"
+    assert _build_thinking_config(request.model, request, False) is None
 
 
 def test_38_catalog():

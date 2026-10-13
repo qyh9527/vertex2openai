@@ -215,10 +215,8 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
                            prefill_active: bool = False,
                            channel_name: Optional[str] = None, reporter=None) -> dict | None:
-    """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
-    if is_image_model:
-        return None
-
+    """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。
+    生图模型同样下发 thinking_level（默认 HIGH，跟随上游 2026-10-13 决策）。"""
     settings = app_state.get_effective_settings(base_model_name)
     t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active,
                             reporter=reporter)
@@ -239,8 +237,6 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             thinking_config["thinking_level"] = t["level"]
         else:
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
-    else:  # budget（Gemini 2.5）
-        thinking_config["thinking_budget"] = t["budget"]
 
     if app_state.get_setting("debug_outbound", False):
         print(f"🔎 [出站调试] {channel_display_name(channel_name)} 模型={base_model_name} thinkingConfig={thinking_config}")

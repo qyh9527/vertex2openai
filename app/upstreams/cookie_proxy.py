@@ -223,17 +223,14 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
                            prefill_active: bool = False) -> Optional[dict]:
     """
     按模型能力档案 + 控制台设置 + 单次请求构建 thinkingConfig：
-    - Gemini 3 及以上：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH）
-    - Gemini 2.5：thinkingBudget（-1 动态；flash 可 0 关闭）
-    - 其它/生图：None
+    - Gemini 3 及以上（含生图模型）：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH，生图默认 HIGH）
+    - 其它：None
     prefill_active=True 时按控制台开关压制思考（见 mc.resolve_thinking）。
     """
     settings = app_state.get_effective_settings(model_name)
     t = mc.resolve_thinking(model_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") == "level":
         return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
-    if t.get("mode") == "budget":
-        return {"thinkingBudget": t["budget"], "includeThoughts": t.get("include_thoughts", True)}
     return None
 
 
@@ -708,7 +705,7 @@ def _build_batch_graphql_body(
     gen_config = {}
 
     if profile["is_image"]:
-        # 生图：设 responseModalities + imageConfig，不发采样/思考参数
+        # 生图：设 responseModalities + imageConfig + thinkingConfig；不发采样参数
         gen_config["responseModalities"] = ["TEXT", "IMAGE"]
         img_cfg = {}
         size = mc.resolve_image_size(model_name, request, settings)
@@ -719,6 +716,13 @@ def _build_batch_graphql_body(
             img_cfg["aspectRatio"] = ar
         if img_cfg:
             gen_config["imageConfig"] = img_cfg
+        # 生图思考档位：三模型默认 HIGH（跟随上游 2026-10-13 决策）
+        thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
+        if thinking_config:
+            gen_config["thinkingConfig"] = thinking_config
+        # Nano Banana 家族专属：media_resolution=HIGH（跟随上游 2026-10-13 决策）
+        if "nano-banana" in (model_name or "").lower():
+            gen_config["mediaResolution"] = "HIGH"
     else:
         # 文本/多模态：仅注入该模型支持、且被显式设置（请求或控制台）的采样参数。
         # 与标准（Express）通道对齐：都未设置时**不发**该参数，交给模型默认——
@@ -735,6 +739,10 @@ def _build_batch_graphql_body(
             mv = request.max_tokens if request.max_tokens is not None else getattr(request, "max_completion_tokens", None)
             if mv is None:
                 mv = settings.get("default_max_tokens")
+            # Gemini 4 长解码：超过单次上限会返回 CONTINUATION（本代理不续传），夹到单次上限
+            _max_cap = profile.get("max_output_tokens_cap")
+            if _max_cap and isinstance(mv, int) and mv > _max_cap:
+                mv = _max_cap
             if mv is not None:
                 gen_config["maxOutputTokens"] = mv
 
@@ -756,6 +764,15 @@ def _build_batch_graphql_body(
         # 已真机验证 batchGraphql 接受该分类（OFF / BLOCK_NONE 均可）。
         {"category": "HARM_CATEGORY_JAILBREAK", "threshold": _threshold},
     ]
+    # Nano Banana 家族生图：追加 4 个图像安全分类，阈值全 OFF（官方示例基准）；
+    # 旧生图模型维持 5 个文本分类不变（跟随上游 2026-10-13 决策）。
+    if profile["is_image"] and "nano-banana" in (model_name or "").lower():
+        safety_settings.extend([
+            {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+        ])
 
     variables = {
         "contents": contents,

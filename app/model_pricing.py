@@ -7,6 +7,8 @@
 美刀估算仅覆盖文本输入/输出部分。
 """
 
+import model_capabilities as mc
+
 # 模型名（前缀匹配，越长越优先）→ Standard 档 (input $/1M, output $/1M)
 MODEL_PRICING: dict = {
     "gemini-3.7-flash": (0.75, 3.75),          # introductory：2027-01-01 起 1.5 / 7.5
@@ -74,6 +76,9 @@ def estimate_cost(model_name: str, prompt_tokens: int, completion_tokens: int,
         return None
     # 2.x 模型不支持 flex：打 flex 头的请求实际被降级为标准，计费保持一致
     if tier == "flex" and (model_name or "").startswith("gemini-2"):
+        tier = "standard"
+    # auto 档对生图模型不打 Priority 头（http_options.resolve_paygo_bundle），按 Standard 计费
+    if tier == "auto" and mc.get_profile(model_name)["is_image"]:
         tier = "standard"
     factor = PRICING_FACTORS.get(tier or "standard", 1.0)
 

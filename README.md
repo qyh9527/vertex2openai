@@ -150,7 +150,7 @@ http://localhost:8050
 | **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
 | **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
-| **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |
+| **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Pro/Flash Image 与 Nano Banana 2.1 支持含 `9:21` 在内的 15 种比例，Flash-Lite Image 使用较小白名单 |
 
 思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
 
@@ -158,7 +158,7 @@ http://localhost:8050
 
 ## 控制台与模型参数
 
-控制台"模型参数"面板可在线调整全局默认值，并按所选模型显示其支持情况。可调项：思考强度（3.x 档位 / 2.5 预算）、生图分辨率与默认比例、采样默认值（temperature/top_p/max_tokens）、输入图压缩（开关/边长/质量）、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式与"预填充时压制原生思考"开关、续写指令模板、Cookie 调试日志，以及全局的可配置输入搬运。
+控制台"模型参数"面板可在线调整全局默认值，并按所选模型显示其支持情况。可调项：思考强度（3.x/4.x 与生图模型的档位）、生图分辨率与默认比例、采样默认值（temperature/top_p/max_tokens）、输入图压缩（开关/边长/质量）、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式与"预填充时压制原生思考"开关、续写指令模板、Cookie 调试日志，以及全局的可配置输入搬运。
 
 ### 参数优先级
 
@@ -183,20 +183,21 @@ http://localhost:8050
 - **采样参数弃用**：自 **Gemini 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）**，`temperature`/`top_p`/`top_k` 已废弃（现被忽略、未来返回 400），代理会**自动移除**；更早的 3.x（如 3.0–3.5 非 lite）仍可用，但官方建议保持默认。
 - **`candidate_count`**：所有 Gemini 3.x 不支持，自动移除。
 - **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；
-  - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
+  - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 已于 2026-10-16 停用，其 `thinking_budget` 专用分支已删除（2.5 名称按旧代模型处理，不下发思考配置）。
+  - **`gemini-4-argon`（2026-10 新增）**：档位 `low`/`medium`/`high`，默认 `medium`，无 `minimal`；采样与惩罚参数自动剥离。单次请求输出上限 65536，`max_tokens` 超过时代理**夹到 65536**（官方长解码会返回 `finish_reason=CONTINUATION` 并要求带 `continuation_token` 续请求，本代理不做续传）。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
-    - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低（3.x=`minimal`、2.5-flash 预算 `0`、2.5-pro `128`），并**不返回思考**。
+    - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低合法档（3.x=`minimal`、Pro/3.7+/4.x=`low`、生图=`minimal`；3-pro-image 不可调），并**不返回思考**。
     - **强制用上方档位**：忽略前端 effort，用你在卡片里选的档位（返回思考）。
   - 🎭 **酒馆预设“卡原生思维链”一键配置**：许多预设把思维链写在 **system 提示**里（不是预填充），并恒发 `reasoning_effort=xhigh`。把"原生思考控制"选 **“关闭原生思考”** 即可（可用"保存为该模型专属"只对 3.6-flash 生效），让预设自己的思维链接管。
   - ⚠️ **重要（Studio/Cookie 通道实测）**：`batchGraphql` 私有接口**会忽略 `includeThoughts=false`**——即使设了也照样回传思考。因此 Cookie 通道在"关闭原生思考"时会**在响应侧主动剥离思考块**，并**把档位压到 `minimal`**（这才是真正减少原生思考、避免重预设在思考阶段被截断/无正文的关键）。标准（Express）通道由 SDK 原生支持不返回思考。
   - 🩺 **3.6-flash 在 Studio 只返回思考、无正文（`FINISH_REASON_UNSPECIFIED`）怎么办**：真机定案——这是**原生思考在 HIGH 档跑飞/被截断**（SillyTavern 恒发 `reasoning_effort=xhigh` 覆盖了控制台档位），**不是**安全策略/`HARM_CATEGORY_JAILBREAK` 的问题（已用含/不含 jailbreak 的多组对照验证）。**解决：把"原生思考控制"设为"关闭原生思考"**（对 3.6-flash 用"保存为该模型专属"），即忽略前端 `xhigh`、压到 `minimal` 并剥离原生思考——真机验证可稳定输出正文与预设自带的思维链。仅设"思考档位=minimal"无效，因为会被前端 `xhigh` 覆盖。
-- **生图**：剥离全部采样参数；`response_modalities=["TEXT","IMAGE"]`；**两个生图模型比例白名单不同**（pro-image 10 种；flash-image 15 种，含 `1:4/4:1/1:8/8:1/9:21`），控制台按所选模型过滤，后端也会校验，选到不支持的比例会**自动回退为"由模型决定"（不报错）**。
+- **生图**：剥离全部采样参数；`response_modalities=["TEXT","IMAGE"]`；名字含 `image` 或 `nano-banana` 都识别为生图模型。**思考档位**：三通道对 3.1-flash-image（合法档 `minimal`/`high`）与 nano-banana-2.1（`minimal`/`medium`/`high`）下发 `thinking_level`，默认 `high`，可在控制台按模型调整；3-pro-image 不下发（真机带该参数返回 400，其唯一档位 `high` 即模型默认）。**比例白名单**：pro-image、flash-image、nano-banana-2.1 均为 15 种（含 `1:4/4:1/1:8/8:1/9:21`），flash-lite-image 10 种。**Nano Banana 专属**：追加 4 个 `HARM_CATEGORY_IMAGE_*` 安全分类（阈值 OFF）并设 `media_resolution=HIGH`（提升输入图理解精度，非输出尺寸）。控制台按所选模型过滤比例，后端也会校验，选到不支持的比例会**自动回退为"由模型决定"（不报错）**。
 - **预填充（重要，专为 SillyTavern 等酒馆预设优化）**：Gemini 3.x 拒绝以 `model` 轮次结尾的请求（返回 `Requests ending with a model turn are not supported.`）。代理内置"预填充智能兼容"（`smart`/`minimal`/`off`，默认 `smart`，控制台可切）：
   - **按模型能力自动选策略**：2.5 及更早模型允许以 model 轮次结尾 → **原生透传**，模型直接续写你的预填充，最忠实；3.x 拒绝 → 自动把末尾 assistant 预填充转成末尾 user 的“续写指令”（模板可在控制台自定义）。两种情况都会把预填充文本**拼回输出开头**，并对模型复述的重叠部分**自动去重**。
   - **真流式故障转移**：Express/SA 的本地预填充前缀延迟到有效上游输出或正常终止时发送，且仅发送一次。`hybrid` 下，Express 尚未输出有效内容就遇到 429/503，内部重试耗尽后仍可切换到下一个已启用通道（如 Vertex SA），不会因预填充提前下发而阻止切换或重复前缀；已输出有效上游内容后不再重试或切换。
   - **3.x 轮次出口兜底**：即使不是普通 assistant 纯文本预填充（例如末尾悬空 `tool_calls`、仅 `reasoning_content`、仅思考签名，或前端直接发送 `role=model`），转换后仍以 model 轮结尾也会触发同一个 400。代理在 Express/SA 共用的 `create_gemini_prompt` 与 Cookie 独立转换出口检查**转换结果**，对要求 user 收尾的 3.x 自动补一句极短 user 推动语；2.5 及更早保持原生 model 结尾透传。触发时日志为 `🩹 [轮次兜底]`，开启出站调试还会显示请求末条 role。
-  - **预填充时压制原生思考（"卡思维链"，默认开启）**：酒馆预设通常自带思维链，靠预填充卡掉模型原生思考、让预设的思维链接管。开启后，检测到预填充即把思考压到该模型最低并**不回传思考**：3.x 压到 `minimal`（`pro` 无 minimal 则 `low`，官方规定 3.x 无法完全关闭思考）；2.5-flash 预算设 `0` **完全关闭**、2.5-pro 降到最低 `128`。**单次请求显式传 `reasoning_effort` / `thinking_budget` 时不压制**（请求优先）。可在控制台关闭此开关恢复模型原生思考。
+  - **预填充时压制原生思考（"卡思维链"，默认开启）**：酒馆预设通常自带思维链，靠预填充卡掉模型原生思考、让预设的思维链接管。开启后，检测到预填充即把思考压到该模型最低并**不回传思考**：3.x 压到 `minimal`（`pro` 无 minimal 则 `low`，官方规定 3.x 无法完全关闭思考）。**单次请求显式传 `reasoning_effort` / `thinking_budget` 时不压制**（请求优先）。可在控制台关闭此开关恢复模型原生思考。
   - **与模型名无关，新模型自动生效**。
 - **可选输入处理**：控制台可配置输入搬运与顶部注入。顶部注入只将所选持久化方案的正文原样置于请求 `messages` 首位，开启后所有路由均注入；只有随机抽取按实际 Express/Cookie 路由限定时，SA 使用固定方案；它不读取或改写 user 输入，也不解析宏，和输入搬运独立。两项默认关闭，未完成各自所需配置时不改变请求。
 - **新增/未来模型**：按家族/版本模式自动归类；未知/未来型号按"最新代"前向安全处理（自动移除已废弃采样参数、走预填充兼容）。
@@ -367,7 +368,7 @@ curl http://localhost:8050/v1/chat/completions \
 }
 ```
 
-（文本模型可用 `reasoning_effort`：`low`/`medium`/`high`，或 2.5 用 `thinking_budget` 整数。）
+（文本模型可用 `reasoning_effort`：`low`/`medium`/`high`。）
 
 > **注**：`temperature`/`top_p`/`max_tokens` 等标准字段、以及上述扩展字段，其优先级恒高于"该模型专属"与"控制台全局"设置。若要为某模型设持久默认值又不想每次请求都带，请用控制台的"保存为该模型专属"。
 
@@ -386,6 +387,8 @@ curl http://localhost:8050/v1/chat/completions \
 ```json
 {
   "models": [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
@@ -393,15 +396,16 @@ curl http://localhost:8050/v1/chat/completions \
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3-pro-image",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash"
+    "gemini-3-flash-preview"
   ]
 }
 ```
 
 > ⏰ **停用时间线（核对于 2026-07-26，请自行复核官方 deprecations 页）**
-> - `gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`：**2026-10-16 停用**。届时 `thinking_budget` 分支与"2.5 原生预填充透传"路径将没有活模型，可整体删除。
+> - `gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`：**2026-10-16 停用**，已从默认清单移除，`thinking_budget` 专用分支与控制台 2.5 预算输入已删除（2026-10-14 同步上游）。
+> - `gemini-nano-banana-2.1`：GA 于 2026-10-06，**仅 `global`**，仅支持 Standard PayGo。
 > - `gemini-3-flash-preview`：官方推荐替代为 `gemini-3.5-flash`，但**该模型目前仍可正常调用**（2026-07-26 用 Express Key 实机验证通过），因此**保留在默认清单中**；待官方正式停用后再移除。
 > - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
@@ -452,7 +456,7 @@ Express / 服务账号的 `fake-` 假流式会输出生命周期诊断日志，�
 
 - **Token 用量**：标准 Express / 服务账号通道请求后由上游回传的 `usageMetadata` 累计（Cookie 私有接口通常不回传，不计入）。持久化在 `STATE_DIR/stats.json`，重建容器不丢；首页展示累计数字、**按实际输入/输出比例动态更新的 Token 条**，以及最近 7/30 天每日趋势。趋势图无论实际只积累了几天数据，都会补齐完整日期窗口，避免单日数据拉成整块柱；每一天以 **Prompt（蓝）/ Completion（橙）** 堆叠柱呈现，鼠标悬停或键盘聚焦可查看 token 与请求明细。
 - **缓存命中率**：`usageMetadata.cachedContentTokenCount` 报告命中上下文缓存的输入 token。**服务账号（标准 Vertex）通道默认开启隐式缓存（90% 折扣）**，命中率 = 缓存命中 / 输入 token——命中率越高越省钱。
-- **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值，官方调价后请更新 `MODEL_PRICING`（3.7/3.6-flash 的 introductory 价 2027-01 到期）。
+- **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority，但生图模型在 `auto` 下按 Standard；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值，官方调价后请更新 `MODEL_PRICING`（3.7/3.6-flash 的 introductory 价 2027-01 到期）。
 - **服务健康度**：圆环只表达互斥的**成功 / 错误**结果，中心显示已完成请求的成功率；“拥堵重试”是一次额外尝试、不属于请求最终结果，单列为独立指标，避免三者相加大于总请求时产生错误的部分-整体图示。
 
 ---
@@ -520,7 +524,7 @@ Express / 服务账号的 `fake-` 假流式会输出生命周期诊断日志，�
 
 | 等级 | 请求头 | 说明 |
 |---|---|---|
-| `auto`（默认） | global 请求自动打 Priority 头 | 保持改造前行为 |
+| `auto`（默认） | global 请求自动打 Priority 头；**生图模型不打**（nano-banana-2.1 官方只支持 Standard PayGo） | 文本模型保持改造前行为 |
 | `off` | 无 | 不打任何层级头 |
 | `standard` | 仅 `paygo_only=true` 时打 `X-Vertex-AI-LLM-Request-Type: shared` | 绕过预配吞吐、纯按量 |
 | `flex` | shared + `X-Vertex-AI-LLM-Shared-Request-Type: flex` + `X-Server-Timeout: 1800` | 允许排队至 30 分钟（同步放大 httpx 超时） |
