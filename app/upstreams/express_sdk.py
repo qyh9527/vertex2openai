@@ -437,9 +437,11 @@ class ExpressSDKUpstream(BaseUpstream):
         _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
         _top_input_active = bool(
             _top_input_config and top_input_injection_active_for_channel(
-                _top_input_config, self.channel_name))
+                _top_input_config, self.channel_name, is_fake=is_fake))
         if _top_input_config_note:
             print(_top_input_config_note)
+        elif _top_input_config and not _top_input_active:
+            print("ℹ️ [顶部注入] 已设为仅对 fake- 请求注入，本次非 fake- 请求，未改写。")
         if _top_input_active:
             _top_messages, _top_notes = apply_top_input_injection(
                 request_obj.messages, _top_input_config, channel=self.channel_name)

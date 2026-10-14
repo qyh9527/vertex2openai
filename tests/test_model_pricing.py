@@ -1,4 +1,7 @@
 """模型定价测试：官方按量价匹配（前缀/前缀剥离/未知）与美刀成本估算（含缓存折扣）。"""
+import datetime
+
+import model_pricing
 from model_pricing import get_model_price, estimate_cost, MODEL_PRICING
 
 
@@ -80,3 +83,55 @@ class TestTierFactors:
         pri = estimate_cost("gemini-3.6-flash", 1_000_000, 0, 1_000_000, tier="priority")
         # Priority input $1.35，命中按 10% → 0.135
         assert abs(pri - 0.135) < 1e-9
+
+
+class TestNewModelPrices:
+    """2026-10 新模型：官方 Agent Platform 定价页（2026-10-14 核对，global Standard 档）。"""
+
+    def test_argon_and_38_flash_prices(self):
+        assert get_model_price("gemini-4-argon") == (2.00, 10.00)
+        assert get_model_price("fake-gemini-4-argon-search") == (2.00, 10.00)
+        assert get_model_price("gemini-3.8-flash") == (0.75, 3.75)
+
+    def test_argon_cached_input_is_95_percent_off(self):
+        # 官方缓存输入 $0.1 / 输入 $2 → 按 5% 计费，不走默认的 10%
+        c = estimate_cost("gemini-4-argon", 1_000_000, 0, 1_000_000)
+        assert abs(c - 0.10) < 1e-9
+        c2 = estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, 500_000)
+        assert abs(c2 - (1.0 + 0.05 + 10.0)) < 1e-9
+
+    def test_argon_tier_factors(self):
+        # 官方 Priority：输入 $3.6 / 缓存 $0.18 / 输出 $18；Flex：$1 / $0.05 / $5
+        pri = estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, 500_000, tier="priority")
+        assert abs(pri - (1.8 + 0.09 + 18.0)) < 1e-9
+        flex = estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, 500_000, tier="flex")
+        assert abs(flex - (0.5 + 0.025 + 5.0)) < 1e-9
+
+    def test_other_models_keep_default_cache_ratio(self):
+        c = estimate_cost("gemini-3.8-flash", 1_000_000, 0, 1_000_000)
+        assert abs(c - 0.075) < 1e-9
+
+
+class TestPriceSchedule:
+    """官方定时调价按服务器日期自动切换（4-argon 2026-12-01 翻倍，3.6/3.7/3.8-flash 2027-01-01 翻倍）。"""
+
+    def test_argon_doubles_on_dec_1(self):
+        assert get_model_price("gemini-4-argon", datetime.date(2026, 11, 30)) == (2.00, 10.00)
+        assert get_model_price("gemini-4-argon", datetime.date(2026, 12, 1)) == (4.00, 20.00)
+        # 缓存系数不变：$0.2 / $4 仍是 5%
+        c = estimate_cost("gemini-4-argon", 1_000_000, 0, 1_000_000, on_date=datetime.date(2026, 12, 1))
+        assert abs(c - 0.20) < 1e-9
+
+    def test_flash_introductory_ends_2027(self):
+        for model in ("gemini-3.8-flash", "gemini-3.7-flash", "fake-gemini-3.6-flash"):
+            assert get_model_price(model, datetime.date(2026, 12, 31)) == (0.75, 3.75)
+            assert get_model_price(model, datetime.date(2027, 1, 1)) == (1.50, 7.50)
+
+    def test_unscheduled_models_unchanged(self):
+        assert get_model_price("gemini-3.5-flash", datetime.date(2030, 1, 1)) == (1.50, 9.00)
+
+    def test_defaults_to_server_today(self, monkeypatch):
+        monkeypatch.setattr(model_pricing, "_today", lambda: datetime.date(2026, 12, 2))
+        assert get_model_price("gemini-4-argon") == (4.00, 20.00)
+        c = estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, 0)
+        assert abs(c - 24.0) < 1e-9

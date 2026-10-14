@@ -22,6 +22,7 @@ SETTING_MODE = "top_input_injection_mode"
 SETTING_PLANS = "top_input_injection_plans"
 SETTING_SELECTED_PLAN_ID = "top_input_injection_selected_plan_id"
 SETTING_RANDOM = "top_input_injection_random"
+SETTING_FAKE_ONLY = "top_input_injection_fake_only"
 MAX_PLANS = 32
 MAX_PLAN_CONTENT_CHARS = 100_000
 
@@ -44,6 +45,8 @@ class TopInputInjectionConfig:
     plans: tuple[TopInputPlan, ...]
     selected_plan_id: str
     random_mode: str
+    # 仅对 fake- 前缀请求注入：其余请求保持原始前缀，不影响上游隐式缓存
+    fake_only: bool = False
 
 
 def normalize_random_mode(value: Any) -> str:
@@ -118,15 +121,17 @@ def get_top_input_injection_config(
         plans=plans,
         selected_plan_id=str(settings.get(SETTING_SELECTED_PLAN_ID) or "").strip(),
         random_mode=random_mode,
+        fake_only=bool(settings.get(SETTING_FAKE_ONLY, False)),
     ), None
 
 
 def top_input_injection_active_for_channel(
     config: TopInputInjectionConfig,
     channel: str,
+    is_fake: bool = False,
 ) -> bool:
-    """注入只受总开关控制，任何实际通道都可注入。"""
-    return config.mode == MODE_ALWAYS
+    """注入受总开关控制，任何实际通道都可注入；勾选「仅 fake」时只注入 fake- 前缀请求。"""
+    return config.mode == MODE_ALWAYS and (not config.fake_only or is_fake)
 
 
 def random_active_for_channel(config: TopInputInjectionConfig, channel: str) -> bool:

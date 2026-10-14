@@ -736,6 +736,8 @@
             <div class="flex w-full flex-wrap items-center gap-2"><span class="text-sm whitespace-nowrap">随机抽取<span class="helpq" onclick="hlp(this,'h_top_random')">?</span></span><select id="top_input_injection_random" class="inp min-w-0" style="max-width:240px"><option value="off">关闭 · 使用固定方案</option><option value="always">打开 · 所有路由随机</option><option value="non_vertex_only">仅 Express / Cookie 随机</option></select></div>
           </div>
           <div id="h_top_random" class="helpbox">随机抽取有三态：关闭时所有路由使用固定方案；打开时所有路由随机；仅 Express / Cookie 随机时，实际 SA（vertex）路由仍注入固定方案。判断实际执行的三种路由，不读取四选一上游调用策略。随机模式会从所有有效方案中抽取一套。它让每轮请求前缀发生变化，通常会降低上游隐式上下文缓存命中率；仅在确实需要变体时打开。</div>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">仅对 fake- 请求注入<span class="helpq" onclick="hlp(this,'h_top_fake_only')">?</span></span><label class="switch"><input type="checkbox" id="top_input_injection_fake_only"><span class="slider"></span></label></div>
+          <div id="h_top_fake_only" class="helpbox">勾选后，只有模型名带 <code>fake-</code> 前缀的请求才注入顶部方案（三种路由都按下游请求的模型名判断）；其余请求原样转发，不改写消息开头，上游隐式上下文缓存不受顶部注入影响。不勾选时按总开关对所有请求注入。</div>
           <div id="top_input_injection_plan_list" class="space-y-3"></div>
           <button type="button" class="btn-ghost px-3 py-2 text-sm w-full" onclick="addTopInputInjectionPlan()">＋ 新增顶部方案</button>
         </div>
@@ -1503,7 +1505,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','anti_truncation_side_buffer_bytes','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','anti_truncation_partial_args'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_fake_only','anti_truncation_partial_args'].forEach(k=>setV(k,s[k]));
     const legacyTop=['fake_stream_only','non_vertex_only'].includes(s.top_input_injection_mode);
     if(legacyTop) setV('top_input_injection_mode','always');
     const randomValue=String(s.top_input_injection_random??'off').trim().toLowerCase();
@@ -1731,6 +1733,7 @@ async function saveSettings(){
     top_input_injection_plans:TOP_INPUT_INJECTION_PLANS.map(p=>({id:p.id,name:p.name||'',role:p.role||'system',content:p.content||''})),
     top_input_injection_selected_plan_id:$('top_input_injection_selected_plan_id').value||'',
     top_input_injection_random:$('top_input_injection_random').value,
+    top_input_injection_fake_only:$('top_input_injection_fake_only').checked,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,

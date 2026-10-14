@@ -84,3 +84,10 @@ def test_top_injection_has_binary_switch_and_ternary_random():
     assert values('top_input_injection_random') == ['off', 'always', 'non_vertex_only']
     assert "top_input_injection_random:$('top_input_injection_random').value" in DASHBOARD_HTML
     assert "top_input_injection_random:$('top_input_injection_random').checked" not in DASHBOARD_HTML
+
+
+def test_top_injection_fake_only_checkbox_round_trips():
+    """「仅对 fake- 请求注入」是复选框：加载走 setV 布尔列表，保存取 checked。"""
+    assert '<input type="checkbox" id="top_input_injection_fake_only">' in DASHBOARD_HTML
+    assert "'top_input_injection_fake_only'" in DASHBOARD_HTML
+    assert "top_input_injection_fake_only:$('top_input_injection_fake_only').checked" in DASHBOARD_HTML

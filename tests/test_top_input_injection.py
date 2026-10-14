@@ -139,3 +139,37 @@ class TestApplyTopInputInjection:
         assert updated[0].role == "assistant"
         assert "AI 方案" in notes[0]
         assert "随机" in notes[0]
+
+
+class TestFakeOnly:
+    """勾选「仅对 fake- 请求注入」：非 fake 请求保持原始前缀，不破坏上游隐式缓存。"""
+
+    def _config(self, fake_only):
+        config, note = get_top_input_injection_config({
+            "top_input_injection_mode": "always",
+            "top_input_injection_plans": [{"id": "p", "role": "system", "content": "内容"}],
+            "top_input_injection_fake_only": fake_only,
+        })
+        assert note is None
+        return config
+
+    def test_default_off_injects_every_request(self):
+        config = self._config(False)
+        for channel in ("express", "cookie", "vertex"):
+            assert top_input_injection_active_for_channel(config, channel)
+            assert top_input_injection_active_for_channel(config, channel, is_fake=True)
+
+    def test_fake_only_skips_non_fake_requests(self):
+        config = self._config(True)
+        assert config.fake_only is True
+        for channel in ("express", "cookie", "vertex"):
+            assert not top_input_injection_active_for_channel(config, channel)
+            assert top_input_injection_active_for_channel(config, channel, is_fake=True)
+
+    def test_missing_setting_defaults_to_all_requests(self):
+        config, _ = get_top_input_injection_config({
+            "top_input_injection_mode": "always",
+            "top_input_injection_plans": [{"id": "p", "role": "system", "content": "内容"}],
+        })
+        assert config.fake_only is False
+        assert top_input_injection_active_for_channel(config, "express")

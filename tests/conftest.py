@@ -31,3 +31,12 @@ def _clear_account_context():
     yield
     runtime_state._current_cookie_account.set(None)
     runtime_state._current_sa_account.set(None)
+
+
+@pytest.fixture(autouse=True)
+def _pin_pricing_date(monkeypatch):
+    """计费按服务器日期切换官方调价（model_pricing.PRICE_SCHEDULE）；测试统一钉在价格核对日，
+    避免过了调价日期后断言 introductory 价的用例随真实时间失败。需要别的日期时显式传 on_date。"""
+    import datetime
+    import model_pricing
+    monkeypatch.setattr(model_pricing, "_today", lambda: datetime.date(2026, 10, 14))

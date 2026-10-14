@@ -201,10 +201,12 @@ DEFAULT_SETTINGS = {
     # 所选方案正文原样按其 role 放在 messages 第 1 条；与原第 1 条同 role 时用换行融合。
     # 不读取、不复制、不替换 user 输入，不解析宏或占位符，和输入搬运完全独立。
     # random：off=固定；always=全路由随机；non_vertex_only=Express/Cookie 随机、SA 固定。
+    # fake_only：勾选后只对模型名带 fake- 前缀的请求注入；其余请求不改写，保留上游隐式缓存。
     "top_input_injection_mode": "off",
     "top_input_injection_plans": [],
     "top_input_injection_selected_plan_id": "",
     "top_input_injection_random": "off",
+    "top_input_injection_fake_only": False,
     # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
     # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
     # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。

@@ -21,6 +21,7 @@
 - Express/SA 共享执行路径传入 `self.channel_name`，Cookie 传入 `cookie`。不读取控制台的 express/cookie/vertex/hybrid 四选一策略；hybrid 转到 SA 时须重新按固定方案处理原请求。
 - 旧随机布尔值 true/false 兼容为 always/off；旧主开关 non_vertex_only 或 fake_stream_only 兼容为 always + 随机 non_vertex_only。前端回显与后端读取同步转换，保存后写入新值。
 - 随机选择可能降低隐式缓存命中率，SA 固定方案可保持前缀稳定。
+- `top_input_injection_fake_only`（布尔，默认 false）勾选后只注入下游模型名带 `fake-` 前缀的请求；三种路由都按请求模型名判断（Cookie 虽无假流式实现，也按原始模型名的前缀判断），非 fake 请求不改写 messages。
 
 上游管线当前先执行顶部注入，再独立执行输入搬运，随后处理控制台 system / prefill 注入与预填充兼容。这个执行顺序仅是消息变换的顺序，**不构成两项功能的逻辑依赖**。
 
