@@ -175,6 +175,8 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         try:
             key = sa_budget.credential_id(sa_json)
             budget = sa_budget.status(key)
+            if budget.get("expired"):
+                raise sa_budget.BudgetError("SA 赠金日期未确认或已到期，已触发日期熔断。")
             if not budget["initialized"] or budget["blocked"]:
                 raise sa_budget.BudgetError("SA 历史花费未确认或独立额度已用尽，请检查控制台额度账本。")
             sa_budget.price(base_model_name, 1, 1)

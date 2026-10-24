@@ -1348,6 +1348,7 @@ function saRowHtml(acc, isNew){
     ? `<section class="sa-budget mb-3" data-budget-index="${idx}" aria-label="账号额度明细"><div class="flex flex-wrap justify-between gap-2 mb-2"><strong class="text-sm">独立额度 $295</strong><span class="text-xs sa-budget-status"></span></div><div style="height:56px;position:relative"><canvas class="sa-budget-chart" role="img" aria-label="历史花费、新增费用与预留额度分布"></canvas></div><dl class="sa-budget-values" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px;font-variant-numeric:tabular-nums"></dl><p class="text-xs text-neutral-500 mt-2">保护账本含未返还促销金额；预留不等于实扣。搜索结算后熔断，可能超额。</p><p class="text-xs sa-budget-refresh text-neutral-500 mt-1" aria-live="polite"></p></section>`
     : `<div class="flex flex-wrap gap-2 mb-2"><label class="text-xs">历史已用美元（未确认前禁止调用）<input class="inp acc-sa-baseline" type="number" min="0" step="0.000001" placeholder="请输入已用金额，零也需确认"></label><button class="px-3 py-1 text-xs rounded-lg border border-neutral-300" onclick="initSaBudget(this,${idx})">确认历史花费</button></div>`;
   row.innerHTML=head+budgetHtml+
+    (acc?`<div class="flex flex-wrap items-end gap-2 mb-3"><label class="text-xs text-neutral-500">赠金初始日期（UTC）<input class="inp acc-sa-start-date" type="date" value="${escapeHtml(budget?.start_date||'')}"></label><button class="px-3 py-1 text-xs rounded-lg border border-neutral-300" onclick="saveSaTrialDate(this,${idx})">保存日期</button><span class="text-xs text-neutral-500 sa-trial-summary">${budget?.expires_on?'本地截止 '+escapeHtml(budget.expires_on)+' 00:00 UTC，剩余 '+budget.days_remaining+' 天':'日期待确认'}</span><p class="text-xs text-neutral-500" style="flex-basis:100%">默认按首次录入日计算，不等于 Google 实际赠金起算日；请按结算控制台校正。日期缺失或到期即停止新请求，修改日期不重置费用。</p></div>`:'')+
     `<textarea class="inp log mb-2 acc-sa-json" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
     `<div class="flex flex-wrap gap-2 mb-2">`+
       `<input class="inp acc-sa-project" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:180px">`+
@@ -1358,6 +1359,16 @@ function saRowHtml(acc, isNew){
     `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveSaRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
     `</div>`;
   return row;
+}
+async function saveSaTrialDate(btn,idx){
+  const row=btn.closest('.account-row'),day=row.querySelector('.acc-sa-start-date').value;
+  if(!day){toast('请选择赠金初始日期');return;}
+  if(!confirm('将赠金初始日期设为 '+day+'？这可能改变日期熔断状态，但不会清零费用。'))return;
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/sa-trial-date',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:row.dataset.credentialId,start_date:day})});
+    const d=await r.json();if(r.ok){toast('赠金日期已保存');loadRuntime();}else toast(d.error||'保存失败');
+  }catch(e){toast('网络请求失败');}finally{btn.disabled=false;}
 }
 async function initSaBudget(btn,idx){
   const amount=btn.closest('.account-row').querySelector('.acc-sa-baseline').value.trim();
@@ -1384,7 +1395,9 @@ function updateSaBudget(acc){
     return;
   }
   const used=b.baseline+b.spent, occupied=used+b.reserved;
-  section.querySelector('.sa-budget-status').textContent=b.blocked?(used>=b.limit?'已熔断：累计费用达限':'暂停派发：额度被预留占满'):(occupied>=b.limit*0.9?'额度接近上限':'额度保护中');
+  section.querySelector('.sa-budget-status').textContent=b.expired?'已熔断：赠金日期缺失或已到期':b.blocked?(used>=b.limit?'已熔断：累计费用达限':'暂停派发：额度被预留占满'):(occupied>=b.limit*0.9?'额度接近上限':'额度保护中');
+  const summary=section.closest('.account-row').querySelector('.sa-trial-summary');
+  if(summary)summary.textContent=b.expires_on?'本地截止 '+b.expires_on+' 00:00 UTC，剩余 '+b.days_remaining+' 天':'日期待确认';
   const entries=[['历史已用',b.baseline],['本代理新增',b.spent],['待结算预留',b.reserved],['可用额度',b.remaining],['累计已用',used],['占用比例',Math.min(100,occupied/b.limit*100).toFixed(2)+'%']];
   section.querySelector('.sa-budget-values').innerHTML=entries.map(([label,value])=>`<div><dt class="text-xs text-neutral-500">${label}</dt><dd class="text-sm font-medium" style="white-space:nowrap">${typeof value==='number'?saBudgetMoney.format(value):value}</dd></div>`).join('');
   section.querySelector('.sa-budget-refresh').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');

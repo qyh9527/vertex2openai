@@ -1,5 +1,7 @@
 """SA 独立预算：SQLite 原子预留、逐尝试结算；未知费用保留预留金额。"""
 import asyncio
+import datetime
+import calendar
 import hashlib
 import json
 import os
@@ -33,6 +35,7 @@ def _connect():
     db.execute("PRAGMA synchronous=FULL")
     db.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, baseline INTEGER NOT NULL, spent INTEGER NOT NULL DEFAULT 0)")
     db.execute("CREATE TABLE IF NOT EXISTS holds (id TEXT PRIMARY KEY, account TEXT NOT NULL, amount INTEGER NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS trial_dates (id TEXT PRIMARY KEY, start_date TEXT NOT NULL)")
     db.commit()
     try:
         with db:
@@ -51,6 +54,48 @@ def money(value):
     return int((value * 1_000_000_000).to_integral_value(rounding=ROUND_CEILING))
 
 
+def _today():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _parse_start_date(value):
+    try:
+        day = datetime.date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("初始日期必须是 YYYY-MM-DD。") from exc
+    if day.isoformat() != value or day > _today():
+        raise ValueError("初始日期不能晚于今天（UTC）。")
+    return day
+
+
+def ensure_trial_date(key, start_date=None):
+    day = _parse_start_date(start_date) if start_date is not None else _today()
+    with _connect() as db:
+        db.execute("INSERT OR IGNORE INTO trial_dates VALUES (?, ?)", (key, day.isoformat()))
+
+
+def set_trial_date(key, start_date):
+    day = _parse_start_date(start_date)
+    with _connect() as db:
+        db.execute("INSERT INTO trial_dates VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET start_date=excluded.start_date",
+                   (key, day.isoformat()))
+
+
+def _trial_status(db, key):
+    row = db.execute("SELECT start_date FROM trial_dates WHERE id=?", (key,)).fetchone()
+    if row is None:
+        return {"start_date": None, "expires_on": None, "days_remaining": None, "expired": True}
+    start = datetime.date.fromisoformat(row[0])
+    # 官方文档为90天，条款为3个月；取两者更早日作为本地保护截止。
+    month = start.month + 3
+    year, month = start.year + (month - 1) // 12, (month - 1) % 12 + 1
+    three_months = datetime.date(year, month, min(start.day, calendar.monthrange(year, month)[1]))
+    end = min(start + datetime.timedelta(days=90), three_months)
+    today = _today()
+    return {"start_date": start.isoformat(), "expires_on": end.isoformat(),
+            "days_remaining": max(0, (end - today).days), "expired": today >= end}
+
+
 def initialize(key, amount):
     amount = money(amount)
     with _connect() as db:
@@ -58,18 +103,20 @@ def initialize(key, amount):
         if db.execute("SELECT 1 FROM accounts WHERE id=?", (key,)).fetchone():
             raise ValueError("历史花费已确认，不能重复初始化或清零。")
         db.execute("INSERT INTO accounts(id, baseline) VALUES (?, ?)", (key, amount))
+        db.execute("INSERT OR IGNORE INTO trial_dates VALUES (?, ?)", (key, _today().isoformat()))
 
 
 def status(key):
     with _connect() as db:
         row = db.execute("SELECT baseline, spent, (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
+        trial = _trial_status(db, key)
     if row is None:
-        return {"initialized": False, "limit": 295, "blocked": True}
+        return {"initialized": False, "limit": 295, "blocked": True, **trial}
     baseline, spent, reserved = row
     return {"initialized": True, "limit": 295, "baseline": baseline / 1e9,
             "spent": spent / 1e9, "reserved": reserved / 1e9,
             "remaining": max(0, LIMIT - baseline - spent - reserved) / 1e9,
-            "blocked": baseline + spent + reserved >= LIMIT}
+            "blocked": trial["expired"] or baseline + spent + reserved >= LIMIT, **trial}
 
 
 def reserve(key, amount):
@@ -79,6 +126,8 @@ def reserve(key, amount):
         row = db.execute("SELECT baseline + spent + (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
         if row is None:
             raise BudgetError("SA 尚未确认历史花费，请在控制台初始化额度账本。")
+        if _trial_status(db, key)["expired"]:
+            raise BudgetError("SA 赠金日期未确认或已到期，已触发日期熔断。")
         if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
             raise ValueError("预留金额必须是非负纳美元整数。")
         if row[0] >= LIMIT or row[0] + amount > LIMIT:

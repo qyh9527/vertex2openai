@@ -179,7 +179,9 @@ def mask_sa_account(a: dict, index: int) -> dict:
         pass
     import sa_budget
     try:
-        budget = sa_budget.status(sa_budget.credential_id(a.get("sa_json", "")))
+        key = sa_budget.credential_id(a.get("sa_json", ""))
+        sa_budget.ensure_trial_date(key)
+        budget = sa_budget.status(key)
     except (ValueError, OSError, sa_budget.BudgetError):
         budget = {"initialized": False, "blocked": True, "limit": 295}
     return {
@@ -384,6 +386,28 @@ def initialize_sa_budget(item: SABudgetInitialization, _auth: bool = Depends(req
     except (ValueError, ArithmeticError, sa_budget.BudgetError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return JSONResponse(content={"status": "success", "budget": sa_budget.status(key)})
+
+
+class SATrialDate(BaseModel):
+    index: int
+    credential_id: str
+    start_date: str
+
+
+@app.post("/api/sa-trial-date")
+def save_sa_trial_date(item: SATrialDate, _auth: bool = Depends(require_auth)):
+    import sa_budget
+    accounts = app_state.get_sa_accounts()
+    if not 0 <= item.index < len(accounts):
+        return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
+    key = sa_budget.credential_id(accounts[item.index]["sa_json"])
+    if key != item.credential_id:
+        return JSONResponse(status_code=409, content={"error": "账号列表已变化，请刷新后重新确认。"})
+    try:
+        sa_budget.set_trial_date(key, item.start_date)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"status": "success", "budget": sa_budget.status(key)}
 
 
 class ServiceAccountItem(BaseModel):

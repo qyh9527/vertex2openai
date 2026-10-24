@@ -333,6 +333,8 @@ class AppState:
             if not sa_json or sa_json in seen:
                 continue
             seen.add(sa_json)
+            import sa_budget
+            sa_budget.ensure_trial_date(sa_budget.credential_id(sa_json))
             clean.append({
                 "project_id": str(a.get("project_id") or "").strip(),
                 "location": (str(a.get("location") or "global").strip() or "global"),

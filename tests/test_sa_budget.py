@@ -402,3 +402,93 @@ async def test_media_without_modality_details_keeps_hold(model):
     await _budget_models(sdk).generate_content(**kwargs)
     assert sa_budget.status("acct")["spent"] == 0
     assert sa_budget.status("acct")["reserved"] > 0
+
+
+def test_trial_date_persists_without_resetting_spend(monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 1, 1))
+    key = _init("dated", 100)
+    token = sa_budget.reserve(key, NANO)
+    sa_budget.settle(token, NANO)
+    sa_budget.set_trial_date(key, "2025-12-15")
+    sa_budget.ensure_trial_date(key, "2026-01-01")
+    data = sa_budget.status(key)
+    assert data["start_date"] == "2025-12-15"
+    assert data["spent"] == 1
+    assert data["baseline"] == 100
+
+
+def test_trial_expiry_exact_boundary_and_settlement(monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 1, 1))
+    key = _init("dated", 0)
+    token = sa_budget.reserve(key, NANO)
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 3, 31))
+    assert not sa_budget.status(key)["expired"]
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 4, 1))
+    assert sa_budget.status(key)["expired"]
+    assert sa_budget.status(key)["blocked"]
+    with pytest.raises(sa_budget.BudgetError, match="日期"):
+        sa_budget.reserve(key, 1)
+    sa_budget.settle(token, NANO)
+    assert sa_budget.status(key)["spent"] == 1
+
+
+@pytest.mark.parametrize("day", ["2026-02-30", "2026-1-01", "2027-01-01", ""])
+def test_invalid_trial_date_rejected(day, monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 1, 1))
+    with pytest.raises(ValueError):
+        sa_budget.set_trial_date("dated", day)
+
+
+def test_legacy_account_without_date_fails_closed():
+    key = _init("legacy", 0)
+    with sa_budget._connect() as db:
+        db.execute("DELETE FROM trial_dates WHERE id=?", (key,))
+    assert sa_budget.status(key)["expired"]
+    with pytest.raises(sa_budget.BudgetError):
+        sa_budget.reserve(key, 1)
+
+
+def test_trial_date_api_rejects_stale_identity(monkeypatch):
+    import main
+    key = _init(sa_budget.credential_id(SA_JSON), 123)
+    monkeypatch.setattr(main.app_state, "get_sa_accounts", lambda: [{"sa_json": SA_JSON}])
+    result = main.save_sa_trial_date(main.SATrialDate(index=0, credential_id="wrong", start_date="2026-01-01"), True)
+    assert result.status_code == 409
+    result = main.save_sa_trial_date(main.SATrialDate(index=0, credential_id=key, start_date="2026-01-01"), True)
+    assert result["budget"]["expired"]
+    assert result["budget"]["baseline"] == 123
+
+
+def test_trial_date_default_does_not_reset_on_reimport(monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 1, 1))
+    sa_budget.ensure_trial_date("imported")
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 2, 1))
+    sa_budget.ensure_trial_date("imported")
+    assert sa_budget.status("imported")["start_date"] == "2026-01-01"
+
+
+def test_trial_status_reads_clock_once(monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 1, 1))
+    _init("midnight", 0)
+    calls = []
+    def clock():
+        calls.append(1)
+        return datetime.date(2026, 3, 31) if len(calls) == 1 else datetime.date(2026, 4, 1)
+    monkeypatch.setattr(sa_budget, "_today", clock)
+    data = sa_budget.status("midnight")
+    assert len(calls) == 1
+    assert data["days_remaining"] == 1
+    assert not data["expired"]
+
+
+@pytest.mark.parametrize("start,end", [("2026-01-31", "2026-04-30"), ("2026-05-01", "2026-07-30"), ("2025-11-30", "2026-02-28")])
+def test_trial_uses_earlier_of_90_days_and_three_months(start,end,monkeypatch):
+    import datetime
+    monkeypatch.setattr(sa_budget, "_today", lambda: datetime.date(2026, 6, 1))
+    sa_budget.ensure_trial_date("month-end", start)
+    assert sa_budget.status("month-end")["expires_on"] == end
