@@ -214,6 +214,12 @@ class TestSaClientCache:
 
 
 class TestResolveClient:
+    @pytest.fixture(autouse=True)
+    def initialized_budget(self, tmp_path, monkeypatch):
+        import sa_budget
+        monkeypatch.setenv("STATE_DIR", str(tmp_path))
+        sa_budget.initialize(sa_budget.credential_id(_SA_A), 0)
+
     def test_channel_name_is_vertex(self):
         """每通道独立重试靠 channel_name 区分：SA 通道必须是 vertex，不是继承的 express。"""
         up = ServiceAccountUpstream()

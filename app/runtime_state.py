@@ -381,6 +381,19 @@ class AppState:
         account = _current_sa_account.get()
         if account is None:
             accounts = self.get_sa_accounts()
+            if accounts:
+                import sa_budget
+                eligible = []
+                for candidate in accounts:
+                    try:
+                        budget = sa_budget.status(sa_budget.credential_id(candidate.get("sa_json", "")))
+                        if budget["initialized"] and not budget["blocked"]:
+                            eligible.append(candidate)
+                    except (ValueError, OSError, sa_budget.BudgetError):
+                        pass
+                # 全部不可用时仍保留候选，让上游明确返回额度错误而非“未配置”。
+                if eligible:
+                    accounts = eligible
             if not accounts:
                 return (None, None, None)
             if len(accounts) == 1:

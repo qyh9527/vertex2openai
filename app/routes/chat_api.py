@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import time
@@ -325,7 +326,15 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         upstream = CHANNELS[channel]
         request_log.note_channel(channel)
         # 候选粒度：本次请求在该通道选中的凭证（脱敏 id；express 留空=通道粒度）
-        cred = _current_credential_id(channel)
+        if channel == "vertex":
+            # 在请求任务设置快照；线程仅进行数据库访问，避免 ContextVar 写入丢失。
+            account = await asyncio.to_thread(app_state.get_current_sa_account)
+            from runtime_state import _current_sa_account
+            if account[2]:
+                _current_sa_account.set(dict(zip(("project_id", "location", "sa_json"), account)))
+            cred = await asyncio.to_thread(_current_credential_id, channel)
+        else:
+            cred = _current_credential_id(channel)
         try:
             resp = await upstream.chat_completions(
                 request, fastapi_request, failover_mode=failover_mode)

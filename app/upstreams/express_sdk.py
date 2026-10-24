@@ -1,3 +1,4 @@
+import asyncio
 import re
 import threading
 from functools import partial
@@ -412,7 +413,10 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        resolved = self._resolve_client(fastapi_request, base_model_name, _inj_settings)
+        if self.channel_name == "vertex":
+            resolved = await asyncio.to_thread(self._resolve_client, fastapi_request, base_model_name, _inj_settings)
+        else:
+            resolved = self._resolve_client(fastapi_request, base_model_name, _inj_settings)
         if "error" in resolved:
             return resolved["error"]
         client_to_use = resolved["client"]

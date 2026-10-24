@@ -171,6 +171,16 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"))}
 
+        import sa_budget
+        try:
+            key = sa_budget.credential_id(sa_json)
+            budget = sa_budget.status(key)
+            if not budget["initialized"] or budget["blocked"]:
+                raise sa_budget.BudgetError("SA 历史花费未确认或独立额度已用尽，请检查控制台额度账本。")
+            sa_budget.price(base_model_name, 1, 1)
+        except (sa_budget.BudgetError, ValueError, OSError) as exc:
+            return {"error": JSONResponse(status_code=429, content=create_openai_error_response(
+                429, str(exc), "insufficient_quota"))}
         location = location or "global"
         is_global = location == "global"
         headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
@@ -178,6 +188,9 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         for w in warnings:
             print(f"⚠️ [流量等级] {w}")
         client_to_use = _get_cached_sa_client(sa_json, project_id, location, headers, timeout)
+        client_to_use = sa_budget.BudgetClient(
+            client_to_use, key, location,
+            headers.get("X-Vertex-AI-LLM-Shared-Request-Type", "standard"))
         # 每次调用标明通道身份 + 脱敏 project/location（P0-2/12.3：SA 请求不再被误认为 Express）
         _proj = (project_id or "（取 SA JSON 自带 project_id）") if project_id else "（取 SA JSON 自带 project_id）"
         print(f"🌐 [上游请求] 服务账号（Vertex SA）通道：使用 SA 凭证（Bearer）调用模型 {base_model_name}，"

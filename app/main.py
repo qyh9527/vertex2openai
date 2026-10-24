@@ -177,7 +177,14 @@ def mask_sa_account(a: dict, index: int) -> dict:
         email = str(json.loads(a.get("sa_json", "")).get("client_email") or "")
     except Exception:
         pass
+    import sa_budget
+    try:
+        budget = sa_budget.status(sa_budget.credential_id(a.get("sa_json", "")))
+    except (ValueError, OSError, sa_budget.BudgetError):
+        budget = {"initialized": False, "blocked": True, "limit": 295}
     return {
+        "budget": budget,
+        "credential_id": sa_budget.credential_id(a.get("sa_json", "")) if email else "",
         "index": index,
         "client_email": email,
         "project_id": a.get("project_id", ""),
@@ -350,6 +357,33 @@ async def save_cookie_account(item: CookieAccountItem, _auth: bool = Depends(req
     app_state.set_cookie_accounts(accounts)
     print(f"🔑 [账号管理] 已新增 Cookie 账号（当前共 {len(accounts)} 个）。")
     return JSONResponse(content={"status": "success", "count": len(accounts)})
+
+
+class SABudgetInitialization(BaseModel):
+    index: int
+    credential_id: str
+    historical_usd: str
+
+
+@app.get("/api/sa-budget")
+def get_sa_budgets(_auth: bool = Depends(require_auth)):
+    return {"accounts": [mask_sa_account(a, i) for i, a in enumerate(app_state.get_sa_accounts())]}
+
+
+@app.post("/api/sa-budget")
+def initialize_sa_budget(item: SABudgetInitialization, _auth: bool = Depends(require_auth)):
+    import sa_budget
+    accounts = app_state.get_sa_accounts()
+    if not 0 <= item.index < len(accounts):
+        return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
+    try:
+        key = sa_budget.credential_id(accounts[item.index]["sa_json"])
+        if key != item.credential_id:
+            return JSONResponse(status_code=409, content={"error": "账号列表已变化，请刷新后重新确认。"})
+        sa_budget.initialize(key, item.historical_usd)
+    except (ValueError, ArithmeticError, sa_budget.BudgetError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(content={"status": "success", "budget": sa_budget.status(key)})
 
 
 class ServiceAccountItem(BaseModel):

@@ -1339,10 +1339,15 @@ function saRowHtml(acc, isNew){
   const idx=acc?acc.index:-1;
   const row=document.createElement('div');
   row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
+  if(acc)row.dataset.credentialId=acc.credential_id||'';
   const head=acc
     ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
     : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
-  row.innerHTML=head+
+  const budget=acc?.budget;
+  const budgetHtml=!acc?'':budget?.initialized
+    ? `<section class="sa-budget mb-3" data-budget-index="${idx}" aria-label="账号额度明细"><div class="flex flex-wrap justify-between gap-2 mb-2"><strong class="text-sm">独立额度 $295</strong><span class="text-xs sa-budget-status"></span></div><div style="height:56px;position:relative"><canvas class="sa-budget-chart" role="img" aria-label="历史花费、新增费用与预留额度分布"></canvas></div><dl class="sa-budget-values" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px;font-variant-numeric:tabular-nums"></dl><p class="text-xs text-neutral-500 mt-2">保护账本含未返还促销金额；预留不等于实扣。搜索结算后熔断，可能超额。</p><p class="text-xs sa-budget-refresh text-neutral-500 mt-1" aria-live="polite"></p></section>`
+    : `<div class="flex flex-wrap gap-2 mb-2"><label class="text-xs">历史已用美元（未确认前禁止调用）<input class="inp acc-sa-baseline" type="number" min="0" step="0.000001" placeholder="请输入已用金额，零也需确认"></label><button class="px-3 py-1 text-xs rounded-lg border border-neutral-300" onclick="initSaBudget(this,${idx})">确认历史花费</button></div>`;
+  row.innerHTML=head+budgetHtml+
     `<textarea class="inp log mb-2 acc-sa-json" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
     `<div class="flex flex-wrap gap-2 mb-2">`+
       `<input class="inp acc-sa-project" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:180px">`+
@@ -1354,11 +1359,70 @@ function saRowHtml(acc, isNew){
     `</div>`;
   return row;
 }
+async function initSaBudget(btn,idx){
+  const amount=btn.closest('.account-row').querySelector('.acc-sa-baseline').value.trim();
+  if(amount===''||!Number.isFinite(Number(amount))||Number(amount)<0){toast('请输入有效的非负美元金额');return;}
+  if(!confirm('确认该账号历史已用 $'+amount+'？只能初始化一次，不能清零。'))return;
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/sa-budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:btn.closest('.account-row').dataset.credentialId,historical_usd:amount})});
+    const d=await r.json();
+    if(r.ok){toast('额度账本已初始化');loadRuntime();}else toast(d.error||'初始化失败');
+  }catch(e){toast('网络请求失败');}finally{btn.disabled=false;}
+}
 function addSaAccount(){ $('sa-accounts').appendChild(saRowHtml(null,true)); }
+const saBudgetCharts=new Map();
+const saBudgetMoney=new Intl.NumberFormat('zh-CN',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:6});
+function updateSaBudget(acc){
+  const section=document.querySelector(`[data-budget-index="${acc.index}"]`);
+  const b=acc.budget;
+  if(!section)return;
+  if(section.closest('.account-row').dataset.credentialId!==acc.credential_id||!b?.initialized){
+    section.querySelector('.sa-budget-status').textContent='账号状态已变化，请刷新页面';
+    section.querySelector('.sa-budget-values').replaceChildren();
+    const chart=saBudgetCharts.get(acc.index);if(chart){chart.destroy();saBudgetCharts.delete(acc.index);}
+    return;
+  }
+  const used=b.baseline+b.spent, occupied=used+b.reserved;
+  section.querySelector('.sa-budget-status').textContent=b.blocked?(used>=b.limit?'已熔断：累计费用达限':'暂停派发：额度被预留占满'):(occupied>=b.limit*0.9?'额度接近上限':'额度保护中');
+  const entries=[['历史已用',b.baseline],['本代理新增',b.spent],['待结算预留',b.reserved],['可用额度',b.remaining],['累计已用',used],['占用比例',Math.min(100,occupied/b.limit*100).toFixed(2)+'%']];
+  section.querySelector('.sa-budget-values').innerHTML=entries.map(([label,value])=>`<div><dt class="text-xs text-neutral-500">${label}</dt><dd class="text-sm font-medium" style="white-space:nowrap">${typeof value==='number'?saBudgetMoney.format(value):value}</dd></div>`).join('');
+  section.querySelector('.sa-budget-refresh').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
+  if(typeof Chart==='undefined'){section.querySelector('.sa-budget-refresh').textContent+=' · 图表未加载，金额明细仍可查看';return;}
+  const reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const colors=['#2a78d6','#eb6834','#1baf7a'];
+  const datasets=['历史已用','本代理新增','待结算预留'].map((label,i)=>({label,data:[[b.baseline,b.spent,b.reserved][i]],backgroundColor:colors[i],borderColor:'#ffffff',borderWidth:2,borderRadius:4,barThickness:16}));
+  let chart=saBudgetCharts.get(acc.index);
+  if(chart){chart.data.datasets.forEach((d,i)=>{d.data=datasets[i].data;});chart.options.animation=reduced?false:{duration:400,easing:'easeOutQuart'};chart.options.scales.x.max=Math.max(b.limit,occupied);chart.update(reduced?'none':undefined);}
+  else{chart=new Chart(section.querySelector('canvas'),{type:'bar',data:{labels:['额度占用'],datasets},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:500,easing:'easeOutQuart'},scales:{x:{stacked:true,min:0,max:Math.max(b.limit,occupied),display:false},y:{stacked:true,display:false}},plugins:{legend:{position:'bottom',labels:{boxWidth:9,boxHeight:9,font:{size:11},color:'#525252'},onClick:()=>{}},tooltip:{callbacks:{label:c=>c.dataset.label+'：'+saBudgetMoney.format(c.raw)}}}}});saBudgetCharts.set(acc.index,chart);}
+}
 function renderSaAccounts(accounts){
+  saBudgetCharts.forEach(chart=>chart.destroy());saBudgetCharts.clear();
   const box=$('sa-accounts'); box.innerHTML='';
   (accounts||[]).forEach(a=>box.appendChild(saRowHtml(a,false)));
+  (accounts||[]).forEach(updateSaBudget);
 }
+let saBudgetRefreshing=false;
+async function refreshSaBudgets(){
+  if(saBudgetRefreshing||document.hidden||!document.querySelector('.sa-budget'))return;
+  saBudgetRefreshing=true;
+  try{
+    const r=await fetch('/api/sa-budget');if(!r.ok)throw new Error('refresh');
+    const d=await r.json();
+    const accounts=d.accounts||[];
+    document.querySelectorAll('[data-budget-index]').forEach(section=>{
+      const index=Number(section.dataset.budgetIndex);
+      if(!accounts.some(a=>a.index===index)){
+        section.querySelector('.sa-budget-status').textContent='账号列表已变化，请刷新页面';
+        section.querySelector('.sa-budget-values').replaceChildren();
+        const chart=saBudgetCharts.get(index);if(chart){chart.destroy();saBudgetCharts.delete(index);}
+      }
+    });
+    accounts.forEach(updateSaBudget);
+  }catch(e){document.querySelectorAll('.sa-budget-refresh').forEach(el=>{el.textContent='刷新失败，以上为上次数据';});}
+  finally{saBudgetRefreshing=false;}
+}
+setInterval(refreshSaBudgets,5000);
 async function saveSaRow(btn, idx){
   const row=btn.closest('.account-row');
   const sa=row.querySelector('.acc-sa-json').value.trim();

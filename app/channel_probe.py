@@ -243,6 +243,9 @@ async def _probe_sa(account: dict, model: str) -> dict:
         credentials=build_sa_credentials(sa_json),
         http_options=_probe_http_options(),
     )
+    import sa_budget
+    key = sa_budget.credential_id(sa_json)
+    client = sa_budget.BudgetClient(client, key, location, "standard")
     started = time.monotonic()
     try:
         await client.aio.models.generate_content(
