@@ -4,7 +4,7 @@
 
 **为什么需要它**：重提示词场景（SillyTavern 复杂预设/角色卡、超长历史）下，模型回答
 经常被 max_output_tokens 提前截断，丢尾巴、破格式。参考网关的思路是——给请求注入一个
-请求级唯一的高熵随机名「合成传输工具」（`v2o_emit_<96bit hex>`），指示模型把最终可见
+名称稳定且避开真实工具名的「合成传输工具」（`sanbox_rp_content`），指示模型把最终可见
 回答放进该工具调用的 `content` 参数输出（Function Call 通道），从而绕开普通文本生成
 通道的截断；代理收到响应后解构合成工具调用、还原为标准 `assistant.content`，对下游
 完全透明。真实工具调用原样保留、不被吞。
@@ -28,7 +28,6 @@
 """
 
 import json
-import secrets
 import re
 from dataclasses import dataclass
 from outcome import GenerationEndError, classify_generation_end
@@ -36,8 +35,8 @@ from typing import Any, Optional
 
 from models import OpenAIMessage
 
-# 合成工具名统一前缀（v2o = vertex2openai；后接 24 hex = 96-bit 随机 nonce）
-TOOL_PREFIX = "v2o_emit_"
+# 合成工具名保持稳定，避免每次改写工具声明而破坏上游隐式缓存。
+TOOL_PREFIX = "sanbox_rp_"
 # 控制台设置键：启用字段名（下游请求体里置 true 即启用）
 SETTING_FIELD = "anti_truncation_field"
 DEFAULT_FIELD = "anti_truncation"
@@ -130,12 +129,15 @@ def enable_stream_partial_args(gen_config_dict: dict) -> bool:
 
 
 def generate_synthetic_tool_name(existing_names: Optional[list] = None) -> str:
-    """生成请求级唯一合成工具名：96-bit 随机 nonce，天然不与真实工具名冲突。"""
+    """稳定传输工具名；与真实工具冲突时按确定性后缀避让。"""
     existing = set(existing_names or [])
-    while True:
-        name = TOOL_PREFIX + secrets.token_hex(12)  # 12 bytes = 96 bits = 24 hex
-        if name not in existing:
-            return name
+    base = TOOL_PREFIX + "content"
+    name = base
+    suffix = 1
+    while name in existing:
+        name = f"{base}_{suffix}"
+        suffix += 1
+    return name
 
 
 def build_synthetic_tool(tool_name: str) -> dict:

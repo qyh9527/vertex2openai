@@ -50,11 +50,14 @@ def _req(**kw):
 
 
 class TestToolName:
-    def test_unique_and_prefixed(self):
+    def test_stable_and_prefixed(self):
         names = {generate_synthetic_tool_name() for _ in range(50)}
-        assert len(names) == 50
-        for n in names:
-            assert n.startswith(TOOL_PREFIX)
+        assert names == {TOOL_PREFIX + "content"}
+
+    def test_collision_suffix_is_stable_and_order_independent(self):
+        existing = [TOOL_PREFIX + "content", TOOL_PREFIX + "content_1", "weather_api"]
+        assert generate_synthetic_tool_name(existing) == TOOL_PREFIX + "content_2"
+        assert generate_synthetic_tool_name(list(reversed(existing))) == TOOL_PREFIX + "content_2"
 
     def test_avoids_existing_names(self):
         n = generate_synthetic_tool_name(["v2o_emit_abc", "weather_api"])
@@ -88,6 +91,18 @@ class TestInjectRequest:
         # 原请求不被污染
         assert req.tools is None
         assert len(req.messages) == 1
+
+    def test_repeated_injection_of_original_request_is_stable(self):
+        req = _req(tools=[{"type": "function", "function": {
+            "name": TOOL_PREFIX + "content", "parameters": {"type": "object"},
+        }}])
+        original = req.model_dump()
+        first, name = inject_request(req)
+        second, other_name = inject_request(req)
+        assert name == other_name == TOOL_PREFIX + "content_1"
+        assert first.model_dump() == second.model_dump()
+        assert first.tools[0] == req.tools[0]
+        assert req.model_dump() == original
 
     def test_tool_choice_none_overridden_to_auto(self):
         req = _req(tool_choice="none")

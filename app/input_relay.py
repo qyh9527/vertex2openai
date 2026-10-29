@@ -136,12 +136,16 @@ def apply_input_relay(messages: list[OpenAIMessage], config: InputRelayConfig) -
     if not payload.strip():
         return messages, ["ℹ️ [输入搬运] 配置标签内为空，未改写。"]
 
-    target_idx = next((
-        i for i in range(source_idx - 1, -1, -1)
-        if str(getattr(messages[i], "role", "")).lower() in ("assistant", "model")
-        and not getattr(messages[i], "tool_calls", None)
-        and isinstance(messages[i].content, str)
-    ), -1)
+    target_idx = -1
+    for i in range(source_idx - 1, -1, -1):
+        candidate = messages[i]
+        role = str(getattr(candidate, "role", "")).lower()
+        if role in ("user", "tool", "function") or getattr(candidate, "tool_calls", None):
+            return messages, ["ℹ️ [输入搬运] 前一轮消息边界不明确，未改写（避免跨轮或跨工具调用搬运）。"]
+        if role in ("assistant", "model"):
+            if isinstance(candidate.content, str):
+                target_idx = i
+            break
     if target_idx < 0:
         return messages, ["ℹ️ [输入搬运] 未找到可追加的前一条 assistant 消息，未改写。"]
 

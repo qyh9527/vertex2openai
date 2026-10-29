@@ -80,6 +80,8 @@ def test_top_injection_has_binary_switch_and_ternary_random():
         select = re.search(r'<select id="' + element_id + r'"[^>]*>(.*?)</select>', DASHBOARD_HTML, re.S)
         assert select
         return re.findall(r'<option value="([^"]+)"', select.group(1))
+    assert values('history_tool_mode') == ['off', 'fake_stream_only', 'all']
+    assert "history_tool_mode:$('history_tool_mode').value" in DASHBOARD_HTML
     assert values('top_input_injection_mode') == ['off', 'always']
     assert values('top_input_injection_random') == ['off', 'always', 'non_vertex_only']
     assert "top_input_injection_random:$('top_input_injection_random').value" in DASHBOARD_HTML

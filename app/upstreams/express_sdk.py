@@ -22,6 +22,7 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
+from history_tool import history_tool_active, validate_history_tool, carry_history
 from input_relay import apply_input_relay, get_input_relay_config, input_relay_active_for_stream
 from top_input_injection import (
     apply_top_input_injection,
@@ -413,6 +414,15 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         _inj_settings = app_state.get_effective_settings(base_model_name)
+        _history_active = history_tool_active(_inj_settings, is_fake)
+        if _history_active:
+            try:
+                validate_history_tool(request_obj)
+                if mc.get_profile(base_model_name)["is_image"]:
+                    raise ValueError("历史工具承载仅支持文本模型。")
+            except ValueError as exc:
+                return JSONResponse(status_code=400, content=create_openai_error_response(
+                    400, str(exc), "invalid_request_error"))
         if self.channel_name == "vertex":
             resolved = await asyncio.to_thread(self._resolve_client, fastapi_request, base_model_name, _inj_settings)
         else:
@@ -446,13 +456,6 @@ class ExpressSDKUpstream(BaseUpstream):
             print(_top_input_config_note)
         elif _top_input_config and not _top_input_active:
             print("ℹ️ [顶部注入] 已设为仅对 fake- 请求注入，本次非 fake- 请求，未改写。")
-        if _top_input_active:
-            _top_messages, _top_notes = apply_top_input_injection(
-                request_obj.messages, _top_input_config, channel=self.channel_name)
-            for _top_note in _top_notes:
-                print(_top_note)
-            if _top_messages is not request_obj.messages:
-                request_obj = request_obj.model_copy(update={"messages": _top_messages})
 
         _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
         _relay_is_active = bool(
@@ -467,6 +470,12 @@ class ExpressSDKUpstream(BaseUpstream):
             if _relayed_messages is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
         _relay_strip_tag = (_relay_config.tag if _relay_is_active and _relay_config.strip_generated else None)
+        if _history_active:
+            try:
+                request_obj = carry_history(request_obj)
+            except ValueError as exc:
+                return JSONResponse(status_code=400, content=create_openai_error_response(
+                    400, str(exc), "invalid_request_error"))
 
         # 预填充智能兼容：按控制台模式 + 模型能力处理末尾 assistant 预填充（新模型自动生效）
         # - 2.5 及更早（允许 model 结尾）：原生透传，模型直接续写；
@@ -519,7 +528,7 @@ class ExpressSDKUpstream(BaseUpstream):
         synthetic_tool_name = None
         at_transport = "fake_stream" if request_obj.stream and is_fake else "stream" if request_obj.stream else "buffered"
         at_field = get_enabled_field()
-        if is_enabled_for_request(request_obj, {"value": at_field}):
+        if _history_active or is_enabled_for_request(request_obj, {"value": at_field}):
             if is_image_model:
                 log_integrity(status="skipped", transport=at_transport, synthetic_seen=False)
                 print(f"⛔ [防截断] 本次调用下游已启用（字段「{at_field}」=true），"
@@ -532,6 +541,14 @@ class ExpressSDKUpstream(BaseUpstream):
             log_integrity(status="disabled", transport=at_transport, synthetic_seen=False)
             print(f"⛔ [防截断] 本次调用下游未启用（请求体无「{at_field}」字段或值非 true）→ "
                   "走普通文本生成，重提示词场景存在 max_output_tokens 截断风险。")
+
+        if _top_input_active:
+            _top_messages, _top_notes = apply_top_input_injection(
+                request_obj.messages, _top_input_config, channel=self.channel_name)
+            for _top_note in _top_notes:
+                print(_top_note)
+            if _top_messages is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _top_messages})
 
         report = ConversionReport(self.channel_name)
         report.inspect_request(request_obj)

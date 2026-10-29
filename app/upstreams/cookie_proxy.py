@@ -45,6 +45,7 @@ from message_processing import (
 from logger import stats
 from api_helpers import get_retry_settings, FAKE_PREFIX
 from usage_mapping import map_usage, with_usage_null
+from history_tool import history_tool_active
 from anti_truncation import is_enabled_for_request, get_enabled_field
 from input_relay import (
     RelayBlockStreamStripper,
@@ -1401,6 +1402,10 @@ class CookieProxyUpstream(BaseUpstream):
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
         _inj_settings = app_state.get_effective_settings(base_model_name)
+        if history_tool_active(_inj_settings, model_display.startswith(FAKE_PREFIX)):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "Cookie 通道不支持历史工具承载及配套抗截断，请使用 Express 或 SA 通道。",
+                "type": "invalid_request_error", "code": 400}})
         # `_is_fake_stream` 仅供输入搬运的旧三态使用；顶部注入按实际候选通道判断。
         # Cookie 文本通道没有 fake- 假流式，输入搬运仍把「只在假流开」按全请求处理。
         _is_fake_stream = bool(request_obj.stream and _profile["is_image"])

@@ -191,6 +191,7 @@ DEFAULT_SETTINGS = {
     # 仅当最新 user 文本完整包在 input_relay_tag 标签中时，才把其载荷追加到前一条
     # assistant 消息尾部，并把该 user 文本换成 input_relay_placeholder。
     # 标签名与占位语任一留空时严格空操作；二者均由控制台配置，避免预设任何 XML 约定。
+    "history_tool_mode": "off",  # off / fake_stream_only / all
     "input_relay_mode": "off",
     "input_relay_tag": "",
     "input_relay_placeholder": "",

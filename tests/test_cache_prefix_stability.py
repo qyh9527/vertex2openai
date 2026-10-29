@@ -81,7 +81,7 @@ class TestAntiTruncationOff:
     async def test_enabled_field_injects(self, monkeypatch):
         app_state.update_settings({"anti_truncation_field": "anti_qyh"})
         captured = await _capture_express(monkeypatch, "fake-gemini-3.7-flash", anti_qyh=True)
-        assert captured["synthetic"] and captured["synthetic"].startswith("v2o_emit_")
+        assert captured["synthetic"] and captured["synthetic"].startswith("sanbox_rp_")
         assert captured["tools"] == [captured["synthetic"]]
 
 

@@ -102,6 +102,37 @@ class TestApplyInputRelay:
         assert updated is messages
         assert "未找到可追加" in notes[0]
 
+    def test_does_not_cross_user_or_tool_boundary(self):
+        for boundary in (
+            OpenAIMessage(role="user", content="上一轮输入"),
+            OpenAIMessage(role="tool", content="工具结果", tool_call_id="call_1"),
+            OpenAIMessage(role="assistant", content="", tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]),
+            OpenAIMessage(role="assistant", content=[{"type": "text", "text": "多段回复"}]),
+        ):
+            messages = _messages("<relay_input>真实输入</relay_input>")
+            messages.insert(2, boundary)
+            updated, notes = apply_input_relay(messages, CONFIG)
+            assert updated is messages
+            assert updated[-1].content == "<relay_input>真实输入</relay_input>"
+            assert "未改写" in notes[0]
+
+    def test_keeps_system_entries_and_prefill_without_changing_history(self):
+        messages = _messages("<relay_input>真实输入</relay_input>")
+        messages.insert(2, OpenAIMessage(role="system", content="本轮附加规则"))
+        messages.append(OpenAIMessage(role="assistant", content="<planning>"))
+        original = [m.model_dump() for m in messages]
+        updated, _ = apply_input_relay(messages, CONFIG)
+        assert updated[1].content.endswith("<relay_input>\n真实输入\n</relay_input>")
+        assert updated[2] is messages[2]
+        assert updated[3].content == CONFIG.placeholder
+        assert updated[4] is messages[4]
+        assert [m.model_dump() for m in messages] == original
+        repeated, _ = apply_input_relay(updated, CONFIG)
+        assert repeated is updated
+
     def test_skips_multimodal_user_to_avoid_losing_parts(self):
         messages = _messages("<relay_input>旧输入</relay_input>")
         messages[-1] = OpenAIMessage(role="user", content=[{"type": "text", "text": "输入"}])
