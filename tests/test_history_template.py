@@ -47,7 +47,14 @@ def test_eight_messages_and_original_input():
     assert "PREFILL" in description
     assert all(s in result.messages[-1].content for s in ("LATEST", "CONSOLE_PREFILL"))
     assert "PREFILL" not in result.messages[-1].content.replace("CONSOLE_PREFILL", "")
-    assert result.tool_choice["function"]["name"] == name == "sanbox_rp_content"
+    assert name == "sanbox_rp_content"
+    assert result.tool_choice == "required"
+    from protocol_conversion import create_generation_config
+    config = create_generation_config(result)
+    calling = config["tool_config"]["function_calling_config"]
+    assert calling["mode"] == "ANY"
+    assert not calling.get("allowed_function_names")
+    assert {f["name"] for t in config["tools"] for f in t["function_declarations"]} == {name, "context"}
     schema = result.tools[0]["function"]["parameters"]
     assert schema["required"] == ["planning", "content"]
     assert schema["propertyOrdering"] == ["planning", "content", "extra"]
@@ -224,3 +231,8 @@ def test_strip_and_reject_missing_call():
     assert "tool_calls" not in result["choices"][0]["message"]
     with pytest.raises(GenerationEndError):
         strip_synthetic_from_openai_dict({"choices": [{"message": {"content": "plain"}}]}, "sanbox_rp_content", template_fields=DEFAULT_TEMPLATE)
+    for names in (["context"], ["sanbox_rp_content", "context"]):
+        with pytest.raises(GenerationEndError):
+            strip_synthetic_from_openai_dict({"choices": [{"message": {"tool_calls": [
+                {"function": {"name": n, "arguments": '{"query":"sync"}'}} for n in names
+            ]}}]}, "sanbox_rp_content", template_fields=DEFAULT_TEMPLATE)

@@ -105,7 +105,7 @@ def inject_template_history(request, fields, prefill=""):
         {"role": "tool", "tool_call_id": "call_sync_01", "content": tail},
     ]
     return request.model_copy(update={"messages": [OpenAIMessage(**m) for m in messages], "tools": tools,
-        "tool_choice": {"type": "function", "function": {"name": reply_name}}}), reply_name
+        "tool_choice": "required"}), reply_name
 
 
 def restore_template_args(parsed, fields):
