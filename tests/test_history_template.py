@@ -236,3 +236,38 @@ def test_strip_and_reject_missing_call():
             strip_synthetic_from_openai_dict({"choices": [{"message": {"tool_calls": [
                 {"function": {"name": n, "arguments": '{"query":"sync"}'}} for n in names
             ]}}]}, "sanbox_rp_content", template_fields=DEFAULT_TEMPLATE)
+
+
+def test_refusal_warning_does_not_change_result():
+    from history_template import warn_if_refusal
+    normal = "<content>她说不行，我根本拦不住。</content>"
+    assert warn_if_refusal(normal) is False
+    refusal = "我无法生成露骨的性行为描写。"
+    assert warn_if_refusal(refusal) is True
+    assert restore_synthetic_args({"planning": "p", "content": refusal}, DEFAULT_TEMPLATE).text
+
+
+async def test_template_skips_are_logged(capsys):
+    from fastapi.responses import JSONResponse
+    from runtime_state import app_state
+    from upstreams import express_sdk
+    from unittest.mock import patch
+    upstream = express_sdk.ExpressSDKUpstream()
+    req = make_request(stream=True)
+    req.model = "fake-gemini-3.8-flash"
+    req.messages.append(req.messages[-1].model_copy(update={"role": "user", "content": "input", "tool_calls": None}))
+    req.messages[-1] = req.messages[-1].model_copy(update={"content": "input"})
+    async def execute(*a, **k):
+        return JSONResponse({"ok": True})
+    with patch.object(app_state, "get_effective_settings", return_value={
+            "history_tool_mode": "fake_stream_only", "input_relay_mode": "always",
+            "input_relay_tag": "advice", "input_relay_placeholder": "P", "prefill_mode": "smart",
+            "prefill_instruction": "continue", "anti_truncation_field": "anti_truncation"}):
+        with patch.object(upstream, "_resolve_client", return_value={
+                "client": object(), "model_to_call": "gemini-3.8-flash", "priority_paygo": False}):
+            with patch.object(express_sdk, "_log_resolved_endpoint", lambda *a, **k: None):
+                with patch.object(express_sdk, "execute_gemini_call", execute):
+                    await upstream.chat_completions(req, None)
+    err = capsys.readouterr().out
+    assert "⏭️ [输入搬运] 已跳过" in err
+    assert "⏭️ [预填充兼容] 已跳过" in err

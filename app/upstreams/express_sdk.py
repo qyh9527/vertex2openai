@@ -468,6 +468,9 @@ class ExpressSDKUpstream(BaseUpstream):
         _relay_is_active = bool(
             not _template_active and _relay_config and input_relay_active_for_stream(
                 _relay_config, _is_fake_stream))
+        if _template_active and _relay_config:
+            print("⏭️ [输入搬运] 已跳过：字段模板承载接管本次请求（模板自带最新输入交接），"
+                  "原搬运配置保留，非 fake 或关闭历史承载后恢复生效。")
         if _relay_config_note:
             print(_relay_config_note)
         if _relay_is_active:
@@ -506,6 +509,9 @@ class ExpressSDKUpstream(BaseUpstream):
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
+        if _template_active and _prefill_mode != "off":
+            print("⏭️ [预填充兼容] 已跳过：字段模板承载接管本次请求（尾部 assistant 原文保留在上下文中），"
+                  "原预填充模式保留，非 fake 或关闭历史承载后恢复生效。")
         if _prefill_mode != "off" and not _template_active:
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
@@ -536,6 +542,11 @@ class ExpressSDKUpstream(BaseUpstream):
         at_transport = "fake_stream" if request_obj.stream and is_fake else "stream" if request_obj.stream else "buffered"
         at_field = get_enabled_field()
         if _template_active:
+            if is_enabled_for_request(request_obj, {"value": at_field}):
+                log_integrity(status="skipped", transport=at_transport,
+                              synthetic_seen=False)
+                print(f"⏭️ [防截断] 已跳过：字段模板承载接管本次请求（请求体带「{at_field}」但由模板的"
+                      "合成工具承担传输），不追加旧控制消息。")
             try:
                 request_obj, synthetic_tool_name = inject_template_history(
                     request_obj, _template_fields, _inj_settings.get("inject_prefill", ""))

@@ -108,6 +108,17 @@ def inject_template_history(request, fields, prefill=""):
         "tool_choice": "required"}), reply_name
 
 
+def warn_if_refusal(text):
+    """只记录，不改变返回：剧情内的角色拒绝是合法文本，不能当协议失败。"""
+    head = text[:400]
+    for marker in ("无法", "我不能", "cannot", "I can't", "安全准则", "安全策略"):
+        if marker in head:
+            print(f"⚠️ [历史工具承载] 正文疑似模型拒绝语（命中「{marker}」），"
+                  "仍按正常正文返回；如非剧情所需请检查请求内容。")
+            return True
+    return False
+
+
 def restore_template_args(parsed, fields):
     if not isinstance(parsed, dict) or set(parsed) - {f["name"] for f in fields}:
         raise ValueError("invalid_fields")

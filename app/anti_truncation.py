@@ -528,9 +528,10 @@ def restore_synthetic_args(args: Any, template_fields=None) -> SyntheticRestoreR
             if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > MAX_ARGS_BYTES:
                 return SyntheticRestoreResult(None, False, False, "resource_limit")
         if template_fields is not None:
-            from history_template import restore_template_args
+            from history_template import restore_template_args, warn_if_refusal
             text = restore_template_args(parsed, template_fields)
             text.encode("utf-8")
+            warn_if_refusal(text)
             return SyntheticRestoreResult(text, True, False, None)
         complete = (isinstance(parsed, dict) and set(parsed) == {"content"}
                     and isinstance(parsed["content"], str))
