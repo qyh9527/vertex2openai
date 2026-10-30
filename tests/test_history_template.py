@@ -44,8 +44,9 @@ def test_eight_messages_and_original_input():
     assert [m.role for m in result.messages] == ["user", "assistant", "assistant", "tool"] * 2
     description = result.tools[1]["function"]["description"]
     assert all(s in description for s in ("RULE", "HISTORY", "LATEST"))
-    assert "PREFILL" not in description
-    assert all(s in result.messages[-1].content for s in ("LATEST", "PREFILL", "CONSOLE_PREFILL"))
+    assert "PREFILL" in description
+    assert all(s in result.messages[-1].content for s in ("LATEST", "CONSOLE_PREFILL"))
+    assert "PREFILL" not in result.messages[-1].content.replace("CONSOLE_PREFILL", "")
     assert result.tool_choice["function"]["name"] == name == "sanbox_rp_content"
     schema = result.tools[0]["function"]["parameters"]
     assert schema["required"] == ["planning", "content"]
@@ -63,8 +64,44 @@ def test_system_after_latest_user_is_context_not_prefill():
     request.messages.insert(-1, OpenAIMessage(role="system", content="TAIL_RULE"))
     result, _ = inject_template_history(request, DEFAULT_TEMPLATE)
     assert "TAIL_RULE" in result.tools[1]["function"]["description"]
-    assert "PREFILL" in result.messages[-1].content
+    assert "PREFILL" in result.tools[1]["function"]["description"]
+    assert "PREFILL" not in result.messages[-1].content
     assert "TAIL_RULE" not in result.messages[-1].content
+
+
+def test_merged_input_handoff_excludes_history_and_flow():
+    from models import OpenAIMessage
+    request = make_request()
+    merged = 'RULE<history>OLD_REPLY</history><Master_input>写个寻宝故事</Master_input>FORMAT_FLOW'
+    request.messages = [OpenAIMessage(role="user", content=merged)]
+    result, _ = inject_template_history(request, DEFAULT_TEMPLATE)
+    assert merged in result.tools[1]["function"]["description"]
+    tail = result.messages[-1].content
+    assert "写个寻宝故事" in tail
+    assert all(s not in tail for s in ("OLD_REPLY", "FORMAT_FLOW", "<Master_input>"))
+
+
+@pytest.mark.parametrize("text", [
+    '<Master_input>one</Master_input><Master_input>two</Master_input>',
+    '<Master_input>one', '</Master_input>', '<Master_input> </Master_input>',
+    '<Master_input><Master_input>one</Master_input></Master_input>',
+    '<Master_input', '<Master_input>one</Master_input>\n<Master_input',
+    '<Master_input attr="x">one</Master_input>',
+])
+def test_ambiguous_or_broken_input_marker_rejected(text):
+    from models import OpenAIMessage
+    request = make_request()
+    request.messages[-2] = OpenAIMessage(role="user", content=text)
+    with pytest.raises(ValueError, match="Master_input"):
+        inject_template_history(request, DEFAULT_TEMPLATE)
+
+
+def test_history_input_marker_does_not_override_latest_user():
+    request = make_request()
+    request.messages[1].content = '<Master_input>OLD_TASK</Master_input>'
+    result, _ = inject_template_history(request, DEFAULT_TEMPLATE)
+    assert "LATEST" in result.messages[-1].content
+    assert "OLD_TASK" not in result.messages[-1].content
 
 
 @pytest.mark.parametrize("kwargs", [{"tools": [{"type": "function", "function": {"name": "weather"}}]}])

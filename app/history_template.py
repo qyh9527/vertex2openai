@@ -52,14 +52,27 @@ def validate_template_request(request):
         raise ValueError("历史工具承载需要至少一条 user 消息。")
 
 
+def _latest_input(text):
+    tokens = list(re.finditer(r"</?Master_input\s*>", text, re.IGNORECASE))
+    fragments = list(re.finditer(r"</?Master_input\b", text, re.IGNORECASE))
+    if len(fragments) != len(tokens):
+        raise ValueError("最新 user 中的 Master_input 标签残缺或含不支持的属性。")
+    if not tokens:
+        return text
+    if (len(tokens) != 2 or tokens[0].group().startswith("</")
+            or not tokens[1].group().startswith("</")):
+        raise ValueError("最新 user 中的 Master_input 必须只有一组完整标签，无法确定本轮输入。")
+    value = text[tokens[0].end():tokens[1].start()].strip()
+    if not value:
+        raise ValueError("最新 user 中的 Master_input 不能为空。")
+    return value
+
+
 def inject_template_history(request, fields, prefill=""):
     validate_template_request(request)
     last_user = max(i for i, m in enumerate(request.messages) if m.role == "user")
-    context_end = len(request.messages)
-    while context_end > last_user + 1 and request.messages[context_end - 1].role == "assistant":
-        context_end -= 1
-    guidance = "\n\n".join(filter(None, [_text(m.content) for m in request.messages[context_end:]] + [prefill]))
-    body = "\n\n".join(f"[{m.role}]\n{_text(m.content)}" for m in request.messages[:context_end])
+    latest_input = _latest_input(_text(request.messages[last_user].content))
+    body = "\n\n".join(f"[{m.role}]\n{_text(m.content)}" for m in request.messages)
     properties = {f["name"]: {"type": "string", "description": f["description"]} for f in fields}
     reply_name = "sanbox_rp_content"
     tools = [
@@ -77,9 +90,9 @@ def inject_template_history(request, fields, prefill=""):
         return {"role": "assistant", "tool_calls": [{"id": call_id, "type": "function",
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}, "extra_content": signature}]}
     sample = {f["name"]: "Initialization complete; the next reply follows the actual context." for f in fields if f["required"]}
-    tail = "Latest user input:\n" + _text(request.messages[last_user].content)
-    if guidance:
-        tail += "\n\nReply continuation guidance (not an output prefix):\n" + guidance
+    tail = "Latest user input:\n" + latest_input
+    if prefill:
+        tail += "\n\nConsole reply guidance (not an output prefix):\n" + prefill
     tail += f"\n\nReturn the complete reply through {reply_name}. Do not call context again."
     messages = [
         {"role": "user", "content": "Initialize the reply transport."},
