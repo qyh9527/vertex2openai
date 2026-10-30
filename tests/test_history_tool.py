@@ -105,10 +105,12 @@ async def test_pipeline_top_injection_after_history_and_auto_transport(monkeypat
     assert response.status_code == 200
     output = captured["request"]
     assert captured["name"] == "sanbox_rp_content"
-    description = output.tools[0]["function"]["description"]
+    description = output.tools[1]["function"]["description"]
     assert "HISTORY" in description
+    assert "ORIGINAL" in description
     assert "TOP_ONLY" not in description
-    assert output.messages[0].content == "TOP_ONLY\nORIGINAL"
+    assert output.messages[0].content == "TOP_ONLY"
+    assert output.messages[-1].role == "tool"
 
 
 async def test_media_rejected_before_client_resolution(monkeypatch):

@@ -509,6 +509,12 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
         patch = {}
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    if "history_tool_template" in patch:
+        from history_template import parse_template
+        try:
+            patch["history_tool_template"] = parse_template(patch["history_tool_template"])
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
     updated = app_state.update_settings(patch)
     return JSONResponse(content=updated)
 

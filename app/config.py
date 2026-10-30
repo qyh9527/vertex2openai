@@ -192,6 +192,11 @@ DEFAULT_SETTINGS = {
     # assistant 消息尾部，并把该 user 文本换成 input_relay_placeholder。
     # 标签名与占位语任一留空时严格空操作；二者均由控制台配置，避免预设任何 XML 约定。
     "history_tool_mode": "off",  # off / fake_stream_only / all
+    "history_tool_template": [
+        {"name": "planning", "description": "按上下文要求生成的规划文本。", "required": True, "tag": "konatan_planning~"},
+        {"name": "content", "description": "完整正文；保留正文内部要求的格式与穿插内容。", "required": True, "tag": "content"},
+        {"name": "extra", "description": "上下文要求的其它附加内容，保留自身标签；没有则省略。", "required": False, "tag": ""},
+    ],
     "input_relay_mode": "off",
     "input_relay_tag": "",
     "input_relay_placeholder": "",

@@ -23,6 +23,7 @@ from api_helpers import (
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
 from history_tool import history_tool_active, validate_history_tool, carry_history
+from history_template import parse_template, validate_template_request, inject_template_history
 from input_relay import apply_input_relay, get_input_relay_config, input_relay_active_for_stream
 from top_input_injection import (
     apply_top_input_injection,
@@ -415,9 +416,15 @@ class ExpressSDKUpstream(BaseUpstream):
 
         _inj_settings = app_state.get_effective_settings(base_model_name)
         _history_active = history_tool_active(_inj_settings, is_fake)
+        _template_active = _history_active and is_fake
+        _template_fields = None
         if _history_active:
             try:
                 validate_history_tool(request_obj)
+                if _template_active:
+                    validate_template_request(request_obj)
+                    _template_fields = parse_template(_inj_settings.get(
+                        "history_tool_template", app_config.DEFAULT_SETTINGS["history_tool_template"]))
                 if mc.get_profile(base_model_name)["is_image"]:
                     raise ValueError("历史工具承载仅支持文本模型。")
             except ValueError as exc:
@@ -459,7 +466,7 @@ class ExpressSDKUpstream(BaseUpstream):
 
         _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
         _relay_is_active = bool(
-            _relay_config and input_relay_active_for_stream(
+            not _template_active and _relay_config and input_relay_active_for_stream(
                 _relay_config, _is_fake_stream))
         if _relay_config_note:
             print(_relay_config_note)
@@ -470,7 +477,7 @@ class ExpressSDKUpstream(BaseUpstream):
             if _relayed_messages is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
         _relay_strip_tag = (_relay_config.tag if _relay_is_active and _relay_config.strip_generated else None)
-        if _history_active:
+        if _history_active and not _template_active:
             try:
                 request_obj = carry_history(request_obj)
             except ValueError as exc:
@@ -488,7 +495,7 @@ class ExpressSDKUpstream(BaseUpstream):
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
             system_text=_inj_settings.get("inject_system_instruction", ""),
-            prefill_text=_inj_settings.get("inject_prefill", ""),
+            prefill_text="" if _template_active else _inj_settings.get("inject_prefill", ""),
             has_tools=bool(getattr(request_obj, "tools", None)),
             is_image_model=is_image_model,
             allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
@@ -499,7 +506,7 @@ class ExpressSDKUpstream(BaseUpstream):
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
-        if _prefill_mode != "off":
+        if _prefill_mode != "off" and not _template_active:
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
@@ -528,7 +535,16 @@ class ExpressSDKUpstream(BaseUpstream):
         synthetic_tool_name = None
         at_transport = "fake_stream" if request_obj.stream and is_fake else "stream" if request_obj.stream else "buffered"
         at_field = get_enabled_field()
-        if _history_active or is_enabled_for_request(request_obj, {"value": at_field}):
+        if _template_active:
+            try:
+                request_obj, synthetic_tool_name = inject_template_history(
+                    request_obj, _template_fields, _inj_settings.get("inject_prefill", ""))
+                print(f"✅ [历史工具承载] 已启用字段模板（{len(_template_fields)} 个字段），"
+                      f"正文通过 {synthetic_tool_name} 输出；输入搬运已跳过，预填充仅作生成引导。")
+            except ValueError as exc:
+                return JSONResponse(status_code=400, content=create_openai_error_response(
+                    400, str(exc), "invalid_request_error"))
+        elif _history_active or is_enabled_for_request(request_obj, {"value": at_field}):
             if is_image_model:
                 log_integrity(status="skipped", transport=at_transport, synthetic_seen=False)
                 print(f"⛔ [防截断] 本次调用下游已启用（字段「{at_field}」=true），"
@@ -629,6 +645,7 @@ class ExpressSDKUpstream(BaseUpstream):
             fallback_client_factory=fallback_client_factory,
             channel_name=self.channel_name,
             synthetic_tool_name=synthetic_tool_name,
+            template_fields=_template_fields,
             input_relay_strip_tag=_relay_strip_tag,
             conversion_report=report,
         )

@@ -508,7 +508,7 @@ def integrity_error() -> GenerationEndError:
     return GenerationEndError(classify_generation_end("MALFORMED_FUNCTION_CALL", is_final=True))
 
 
-def restore_synthetic_args(args: Any) -> SyntheticRestoreResult:
+def restore_synthetic_args(args: Any, template_fields=None) -> SyntheticRestoreResult:
     """Strict integrity proof is independent of the existing salvage parser."""
     def unique_object(pairs):
         result = {}
@@ -527,6 +527,11 @@ def restore_synthetic_args(args: Any) -> SyntheticRestoreResult:
             parsed = args
             if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > MAX_ARGS_BYTES:
                 return SyntheticRestoreResult(None, False, False, "resource_limit")
+        if template_fields is not None:
+            from history_template import restore_template_args
+            text = restore_template_args(parsed, template_fields)
+            text.encode("utf-8")
+            return SyntheticRestoreResult(text, True, False, None)
         complete = (isinstance(parsed, dict) and set(parsed) == {"content"}
                     and isinstance(parsed["content"], str))
         if complete:
@@ -534,6 +539,8 @@ def restore_synthetic_args(args: Any) -> SyntheticRestoreResult:
             return SyntheticRestoreResult(parsed["content"], True, False, None)
     except (ValueError, TypeError, UnicodeError, RecursionError):
         pass
+    if template_fields is not None:
+        return SyntheticRestoreResult(None, False, False, "invalid_arguments")
     text = extract_content_from_args(args)
     return SyntheticRestoreResult(text, False, text is not None, "invalid_arguments")
 
@@ -565,7 +572,8 @@ def has_synthetic_tool_call(openai_dict: dict, tool_name: str) -> bool:
 
 
 def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str, *,
-                                     transport: str = "buffered", native_finish_reasons=None) -> dict:
+                                     transport: str = "buffered", native_finish_reasons=None,
+                                     template_fields=None) -> dict:
     """非流式/假流式：从 OpenAI 响应 dict 解构合成工具调用，还原为标准 assistant.content。
 
     - 合成内容作为最终正文（绝不与非合成 content 拼接，杜绝双来源拼接错误）；
@@ -574,13 +582,25 @@ def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str, *,
     """
     if not tool_name or not isinstance(openai_dict, dict):
         return openai_dict
+    if template_fields is not None and not openai_dict.get("choices"):
+        raise integrity_error()
     for choice in openai_dict.get("choices", []):
         if not isinstance(choice, dict):
+            if template_fields is not None:
+                raise integrity_error()
             continue
         message = choice.get("message")
         if not isinstance(message, dict):
+            if template_fields is not None:
+                raise integrity_error()
             continue
         tool_calls = message.get("tool_calls")
+        if template_fields is not None and (
+                not isinstance(tool_calls, list) or len(tool_calls) != 1
+                or not isinstance(tool_calls[0], dict)
+                or not isinstance(tool_calls[0].get("function"), dict)
+                or tool_calls[0]["function"].get("name") != tool_name):
+            raise integrity_error()
         if not isinstance(tool_calls, list) or not tool_calls:
             continue
 
@@ -597,7 +617,9 @@ def strip_synthetic_from_openai_dict(openai_dict: dict, tool_name: str, *,
                 if synthetic_found:
                     raise integrity_error()
                 synthetic_found = True
-                restored = restore_synthetic_args(fn.get("arguments"))
+                restored = restore_synthetic_args(fn.get("arguments"), template_fields)
+                if template_fields is not None and not restored.structurally_complete:
+                    raise integrity_error()
                 content = restored.text
                 log_integrity(transport=transport, synthetic_seen=True,
                               status="integrity_failed" if not restored.structurally_complete and choice.get("finish_reason") in ("stop", "tool_calls") else

@@ -555,6 +555,7 @@ async def gemini_fake_stream_generator(
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
     input_relay_strip_tag: Optional[str] = None,
+    template_fields=None,
     conversion_report=None,
 ):
     # 请求日志上下文：正常由路由入口创建；测试直接调用生成器时没有（或只剩已结束的），
@@ -779,11 +780,11 @@ async def gemini_fake_stream_generator(
             if not has_synthetic_tool_call(openai_response_dict, synthetic_tool_name):
                 log_integrity(status="not_called", transport="fake_stream", synthetic_seen=False,
                               native_finish_reason=next(iter(native_reasons.values()), None))
-                print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
-                      "本次未生效（如实透传普通输出）。")
+                print(f"⚠️ [防截断] 模型未调用合成工具 {synthetic_tool_name}，" +
+                      ("本次按协议失败处理。" if template_fields is not None else "本次未生效（如实透传普通输出）。"))
             openai_response_dict = strip_synthetic_from_openai_dict(
                 openai_response_dict, synthetic_tool_name, transport="fake_stream",
-                native_finish_reasons=native_reasons)
+                native_finish_reasons=native_reasons, template_fields=template_fields)
         if input_relay_strip_tag:
             openai_response_dict = _strip_input_relay_from_openai_dict(
                 openai_response_dict, input_relay_strip_tag)
@@ -906,7 +907,7 @@ async def execute_gemini_call(
     fallback_client_factory: Optional[Callable[[], Any]] = None,
     failover_mode: bool = False, force_fake_streaming: bool = False,
     channel_name: Optional[str] = None, synthetic_tool_name: Optional[str] = None,
-    input_relay_strip_tag: Optional[str] = None, conversion_report=None,
+    input_relay_strip_tag: Optional[str] = None, conversion_report=None, template_fields=None,
 ):
     from conversion_report import ConversionReport
 
@@ -920,6 +921,7 @@ async def execute_gemini_call(
             fallback_client_factory=fallback_client_factory, failover_mode=failover_mode,
             force_fake_streaming=force_fake_streaming, channel_name=channel_name,
             synthetic_tool_name=synthetic_tool_name, input_relay_strip_tag=input_relay_strip_tag,
+            template_fields=template_fields,
             conversion_report=report)
     except BaseException as error:
         if request_obj.compatibility_report and isinstance(error, Exception):
@@ -985,6 +987,7 @@ async def _execute_gemini_call(
     channel_name: Optional[str] = None,
     synthetic_tool_name: Optional[str] = None,
     input_relay_strip_tag: Optional[str] = None,
+    template_fields=None,
     conversion_report=None,
 ):
     fallback_client = None
@@ -1029,6 +1032,7 @@ async def _execute_gemini_call(
                     fastapi_request=fastapi_request, failover_mode=failover_mode,
                     channel_name=channel_name, synthetic_tool_name=synthetic_tool_name,
                     input_relay_strip_tag=input_relay_strip_tag,
+                    template_fields=template_fields,
                     conversion_report=conversion_report,
                 ), wants_usage(request_obj)), media_type="text/event-stream"
             )
@@ -1624,12 +1628,12 @@ async def _execute_gemini_call(
             if not has_synthetic_tool_call(openai_response_content, synthetic_tool_name):
                 log_integrity(status="not_called", transport="buffered", synthetic_seen=False,
                               native_finish_reason=next(iter(native_reasons.values()), None))
-                print(f"⚠️ [防截断] 请求已启用防截断但模型未调用合成工具 {synthetic_tool_name}，"
-                      "本次未生效（如实透传普通输出）。")
+                print(f"⚠️ [防截断] 模型未调用合成工具 {synthetic_tool_name}，" +
+                      ("本次按协议失败处理。" if template_fields is not None else "本次未生效（如实透传普通输出）。"))
             try:
                 openai_response_content = strip_synthetic_from_openai_dict(
                     openai_response_content, synthetic_tool_name,
-                    native_finish_reasons=native_reasons)
+                    native_finish_reasons=native_reasons, template_fields=template_fields)
             except GenerationEndError as error:
                 return _generation_end_error_response(error)
         if input_relay_strip_tag:
