@@ -189,6 +189,14 @@ def test_price_rejects_unknown_or_image_model():
     assert sa_budget.price(MODEL, 1000, 1000) > 0
 
 
+def test_price_reserves_carbon_at_post_introductory_rate():
+    """4-carbon 与 4-argon 同价：额度保护按调价后的 $4 / $20 预留，不吃 introductory 返还。"""
+    assert sa_budget.price("gemini-4-carbon", 1_000_000, 1_000_000) == sa_budget.money(24)
+    assert sa_budget.price("gemini-4-argon", 1_000_000, 1_000_000) == sa_budget.money(24)
+    # 缓存命中仍按官方 95% 折扣
+    assert sa_budget.price("gemini-4-carbon", 1_000_000, 0, cached=1_000_000) == sa_budget.money("0.2")
+
+
 # ---------- BudgetModels：非流 / 流 / 中断 ----------
 
 class FakeModels:

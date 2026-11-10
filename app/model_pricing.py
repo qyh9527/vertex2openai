@@ -1,7 +1,8 @@
 """Gemini 官方按量定价表（Agent Platform，USD / 1M tokens，global ≤200K 输入档）。
 
 来源：https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
-核对于 2026-08-31（gemini-4-argon / gemini-3.8-flash 补核于 2026-10-14）。
+核对于 2026-08-31（gemini-4-argon / gemini-3.8-flash 补核于 2026-10-14；
+gemini-4-carbon 于 2026-11-11 补核，与 4-argon 同价同调价日）。
 官方按「Standard / Priority / Flex-Batch」三张独立表计价（global 档）。
 规律：Priority = Standard × 1.8，Flex = Standard × 0.5（半价）；缓存命中输入默认 90% 折扣，
 个别模型另有折扣（见 CACHED_INPUT_RATIO_OVERRIDES）。
@@ -16,6 +17,7 @@ import model_capabilities as mc
 # 模型名（前缀匹配，越长越优先）→ Standard 档 (input $/1M, output $/1M)，即当前生效价；
 # 官方已公布的调价见 PRICE_SCHEDULE，到日期后自动切换，无需改这里。
 MODEL_PRICING: dict = {
+    "gemini-4-carbon": (2.00, 10.00),          # introductory，见 PRICE_SCHEDULE
     "gemini-4-argon": (2.00, 10.00),           # introductory，见 PRICE_SCHEDULE
     "gemini-3.8-flash": (0.75, 3.75),          # introductory，见 PRICE_SCHEDULE
     "gemini-3.7-flash": (0.75, 3.75),          # introductory，见 PRICE_SCHEDULE
@@ -34,6 +36,7 @@ MODEL_PRICING: dict = {
 # 官方已公布的定时调价：MODEL_PRICING 的键 → [(生效日期, Standard 档价), ...]（按日期升序）。
 # 按服务器本地日期（日志时区，默认 Asia/Shanghai）切换；官方生效时刻与本地零点可能差几个小时。
 PRICE_SCHEDULE: dict = {
+    "gemini-4-carbon": [(datetime.date(2026, 12, 1), (4.00, 20.00))],
     "gemini-4-argon": [(datetime.date(2026, 12, 1), (4.00, 20.00))],
     "gemini-3.8-flash": [(datetime.date(2027, 1, 1), (1.50, 7.50))],
     "gemini-3.7-flash": [(datetime.date(2027, 1, 1), (1.50, 7.50))],
@@ -53,8 +56,9 @@ PRICING_FACTORS: dict = {
 # 缓存命中输入的折扣后单价系数：官方隐式/显式缓存命中 90% 折扣 → 按 10% 计费
 CACHED_INPUT_DISCOUNT = 0.1
 
-# 个别模型的缓存命中系数（同样按最长前缀匹配）：gemini-4-argon 缓存输入 $0.1 / 输入 $2 → 95% 折扣
+# 个别模型的缓存命中系数（同样按最长前缀匹配）：4 系缓存输入 $0.1 / 输入 $2 → 95% 折扣
 CACHED_INPUT_RATIO_OVERRIDES: dict = {
+    "gemini-4-carbon": 0.05,
     "gemini-4-argon": 0.05,
 }
 

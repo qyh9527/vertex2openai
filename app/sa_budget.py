@@ -167,8 +167,9 @@ def price(model, prompt, output, cached=0, tier="standard", location="global", i
         raise BudgetError("该 SA 模型尚无可靠预算价表，已阻止调用：" + name)
     inp, out = IMAGE_PRICING[name][:2] if name in IMAGE_PRICING else get_model_price(name)
     # 官方 introductory 是事后 credits back；额度保护不能提前消费返还。
-    if name in ("gemini-4-argon", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
-        inp, out = max(inp, 4 if name == "gemini-4-argon" else 1.5), max(out, 20 if name == "gemini-4-argon" else 7.5)
+    if name in ("gemini-4-carbon", "gemini-4-argon", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
+        is_g4 = name.startswith("gemini-4-")
+        inp, out = max(inp, 4 if is_g4 else 1.5), max(out, 20 if is_g4 else 7.5)
     if prompt > 200_000:
         if name in ("gemini-3.1-pro", "gemini-3.1-pro-preview"):
             inp, out = 4, 18

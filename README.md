@@ -195,6 +195,7 @@ http://localhost:8050
 - **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；
   - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 已于 2026-10-16 停用，其 `thinking_budget` 专用分支已删除（2.5 名称按旧代模型处理，不下发思考配置）。
   - **`gemini-4-argon`（2026-10 新增）**：档位 `low`/`medium`/`high`，默认 `medium`，无 `minimal`；采样与惩罚参数自动剥离。单次请求输出上限 65536，`max_tokens` 超过时代理**夹到 65536**（官方长解码会返回 `finish_reason=CONTINUATION` 并要求带 `continuation_token` 续请求，本代理不做续传）。
+  - **`gemini-4-carbon`（2026-11-11 新增）**：能力档案与计费同 4-argon 一类——档位 `low`/`medium`/`high`、默认 `medium`、无 `minimal`，采样与惩罚参数剥离，单次输出上限 65536（超长解码夹断）。官方首发价与 4-argon 相同（$2 / $10，缓存输入 95% 折扣），并同样在 **2026-12-01 起翻倍到 $4 / $20**，已写入 `MODEL_PRICING` / `PRICE_SCHEDULE` / `CACHED_INPUT_RATIO_OVERRIDES`；SA 额度保护按调价后价格预留（$4 / $20）。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
     - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低合法档（3.x=`minimal`、Pro/3.7+/4.x=`low`、生图=`minimal`；3-pro-image 不可调），并**不返回思考**。
@@ -397,6 +398,7 @@ curl http://localhost:8050/v1/chat/completions \
 ```json
 {
   "models": [
+    "gemini-4-carbon",
     "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -466,7 +468,7 @@ Express / 服务账号的 `fake-` 假流式会输出生命周期诊断日志，�
 
 - **Token 用量**：标准 Express / 服务账号通道请求后由上游回传的 `usageMetadata` 累计（Cookie 私有接口通常不回传，不计入）。持久化在 `STATE_DIR/stats.json`，重建容器不丢；首页展示累计数字、**按实际输入/输出比例动态更新的 Token 条**，以及最近 7/30 天每日趋势。趋势图无论实际只积累了几天数据，都会补齐完整日期窗口，避免单日数据拉成整块柱；每一天以 **Prompt（蓝）/ Completion（橙）** 堆叠柱呈现，鼠标悬停或键盘聚焦可查看 token 与请求明细。
 - **缓存命中率**：`usageMetadata.cachedContentTokenCount` 报告命中上下文缓存的输入 token。**服务账号（标准 Vertex）通道默认开启隐式缓存（90% 折扣）**，命中率 = 缓存命中 / 输入 token——命中率越高越省钱。
-- **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣；`gemini-4-argon` 官方为 95% 折扣，按 5% 计）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority，但生图模型在 `auto` 下按 Standard；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值（`gemini-4-argon`、`gemini-3.8-flash` 于 2026-10-14 补核），官方调价后请更新 `MODEL_PRICING`；已公布的定时调价写在 `PRICE_SCHEDULE`，按服务器本地日期（日志时区，默认 Asia/Shanghai）自动切换：4-argon 2026-12-01 起 $4 / $20，3.8/3.7/3.6-flash 2027-01-01 起 $1.5 / $7.5。
+- **估算美刀花费**：按官方 [Agent Platform 按量价](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)（`app/model_pricing.py`）估算：未命中输入全价 + **命中输入 10%**（90% 折扣；`gemini-4-argon` / `gemini-4-carbon` 官方为 95% 折扣，按 5% 计）+ 输出全价。**按 PayGo 档位计费**：Standard ×1（基准） / **Priority ×1.8** / **Flex ×0.5**（半价），由控制台 `paygo_tier` 设置决定（`auto` = Priority，但生图模型在 `auto` 下按 Standard；2.x 模型不支持 flex 会自动降级 standard）。未知/未来模型不计费（避免误报）；生图模型图片输出按张计费、token 统计无法覆盖，仅文本部分计入。价格为 2026-08 核实值（`gemini-4-argon`、`gemini-3.8-flash` 于 2026-10-14 补核，`gemini-4-carbon` 于 2026-11-11 新增），官方调价后请更新 `MODEL_PRICING`；已公布的定时调价写在 `PRICE_SCHEDULE`，按服务器本地日期（日志时区，默认 Asia/Shanghai）自动切换：4-argon / 4-carbon 2026-12-01 起 $4 / $20，3.8/3.7/3.6-flash 2027-01-01 起 $1.5 / $7.5。
 - **服务健康度**：圆环只表达互斥的**成功 / 错误**结果，中心显示已完成请求的成功率；“拥堵重试”是一次额外尝试、不属于请求最终结果，单列为独立指标，避免三者相加大于总请求时产生错误的部分-整体图示。
 
 ---

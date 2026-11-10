@@ -112,6 +112,36 @@ class TestNewModelPrices:
         assert abs(c - 0.075) < 1e-9
 
 
+class TestCarbonPrices:
+    """2026-11 新模型 4-carbon：官方定价页与发布博客（2026-11-11 核对），与 4-argon 同价同调价日。"""
+
+    def test_carbon_prices_and_proxy_aliases(self):
+        assert get_model_price("gemini-4-carbon") == (2.00, 10.00)
+        assert get_model_price("fake-gemini-4-carbon-search") == (2.00, 10.00)
+        assert get_model_price("[EXPRESS] gemini-4-carbon") == (2.00, 10.00)
+
+    def test_carbon_cached_input_is_95_percent_off(self):
+        # 官方缓存输入 $0.1 / 输入 $2 → 按 5% 计费
+        c = estimate_cost("gemini-4-carbon", 1_000_000, 0, 1_000_000)
+        assert abs(c - 0.10) < 1e-9
+        c2 = estimate_cost("gemini-4-carbon", 1_000_000, 1_000_000, 500_000)
+        assert abs(c2 - (1.0 + 0.05 + 10.0)) < 1e-9
+
+    def test_carbon_tier_factors(self):
+        # 官方 Priority：$3.6 / $0.18 / $18；Flex：$1 / $0.05 / $5
+        pri = estimate_cost("gemini-4-carbon", 1_000_000, 1_000_000, 500_000, tier="priority")
+        assert abs(pri - (1.8 + 0.09 + 18.0)) < 1e-9
+        flex = estimate_cost("gemini-4-carbon", 1_000_000, 1_000_000, 500_000, tier="flex")
+        assert abs(flex - (0.5 + 0.025 + 5.0)) < 1e-9
+
+    def test_carbon_doubles_on_dec_1(self):
+        assert get_model_price("gemini-4-carbon", datetime.date(2026, 11, 30)) == (2.00, 10.00)
+        assert get_model_price("gemini-4-carbon", datetime.date(2026, 12, 1)) == (4.00, 20.00)
+        c = estimate_cost("gemini-4-carbon", 1_000_000, 1_000_000,
+                          on_date=datetime.date(2026, 12, 1))
+        assert abs(c - 24.0) < 1e-9
+
+
 class TestPriceSchedule:
     """官方定时调价按服务器日期自动切换（4-argon 2026-12-01 翻倍，3.6/3.7/3.8-flash 2027-01-01 翻倍）。"""
 
