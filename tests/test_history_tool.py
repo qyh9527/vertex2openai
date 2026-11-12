@@ -113,6 +113,56 @@ async def test_pipeline_top_injection_after_history_and_auto_transport(monkeypat
     assert output.messages[-1].role == "tool"
 
 
+async def test_nonfake_history_forces_transport_and_accepts_explicit_call_close(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from google.genai import types
+    from runtime_state import app_state
+    from upstreams import express_sdk
+    from anti_truncation import get_enabled_field
+
+    app_state.update_settings({"history_tool_mode": "all", "input_relay_mode": "off",
+                               "top_input_injection_mode": "off", "inject_prefill": ""})
+    captured = {}
+
+    async def generate_stream(**kwargs):
+        captured.update(kwargs)
+        async def source():
+            for fc, finish in [
+                ({"name": "sanbox_rp_content", "will_continue": True}, None),
+                ({"partial_args": [{"json_path": "$.content", "string_value": "complete",
+                                    "will_continue": True}], "will_continue": False}, None),
+                (None, "STOP"),
+            ]:
+                parts = [types.Part(function_call=types.FunctionCall(**fc))] if fc else []
+                yield types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(role="model", parts=parts), finish_reason=finish)])
+        return source()
+
+    client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(
+        generate_content_stream=generate_stream)))
+    upstream = express_sdk.ExpressSDKUpstream()
+    monkeypatch.setattr(upstream, "_resolve_client", lambda *a: {
+        "client": client, "model_to_call": "gemini-4-hydrogen", "priority_paygo": False})
+    monkeypatch.setattr(express_sdk, "_log_resolved_endpoint", lambda *a, **k: None)
+    req = OpenAIRequest(model="gemini-4-hydrogen", stream=True,
+        messages=[{"role": "system", "content": "rule"}, {"role": "user", "content": "old"},
+                  {"role": "assistant", "content": "history"}, {"role": "user", "content": "next"}],
+        **{get_enabled_field(): False})
+    response = await upstream.chat_completions(req, None)
+    wire = "".join([chunk async for chunk in response.body_iterator])
+    records = [json.loads(line[6:]) for line in wire.splitlines() if line.startswith("data: {")]
+    declarations = captured["config"]["tools"][0]["function_declarations"]
+    assert {tool["name"] for tool in declarations} == {"context", "sanbox_rp_content"}
+    assert "history" in next(t["description"] for t in declarations if t["name"] == "context")
+    assert not any("error" in r for r in records)
+    assert "".join(c.get("delta", {}).get("content") or "" for r in records
+                   for c in r.get("choices", [])) == "complete"
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+    assert wire.count("data: [DONE]") == 1
+
+
 async def test_media_rejected_before_client_resolution(monkeypatch):
     from runtime_state import app_state
     from upstreams.express_sdk import ExpressSDKUpstream

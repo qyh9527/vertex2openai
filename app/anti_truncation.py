@@ -470,7 +470,8 @@ def log_integrity(**fields) -> None:
     """Only fixed protocol metadata belongs in request-scoped diagnostics."""
     allowed = {"status", "transport", "synthetic_seen", "restored", "structurally_complete",
                "recovered_partial", "finish_reason", "native_finish_reason", "failure_category",
-               "selected_text_channel", "stream_done"}
+               "selected_text_channel", "stream_done", "content_closed", "call_closed",
+               "synthetic_complete"}
     fields = {key: value for key, value in fields.items() if key in allowed}
     fields.setdefault("transport", "buffered")
     fields.setdefault("status", "integrity_failed" if fields.get("failure_category") else
@@ -498,7 +499,10 @@ def log_integrity(**fields) -> None:
         import request_log
         ctx = request_log.current()
         if ctx is not None:
-            ctx.emit("anti_truncation_integrity", "防截断完整性诊断", **fields)
+            summary = " ".join(f"{key}={fields[key]}" for key in (
+                "status", "native_finish_reason", "structurally_complete",
+                "content_closed", "call_closed", "synthetic_complete") if key in fields)
+            ctx.emit("anti_truncation_integrity", "防截断完整性诊断 | " + summary, **fields)
     except Exception:
         pass
 
@@ -841,9 +845,11 @@ class _CandidatePartialState:
         self.synthetic_seen = False
         self.synthetic_id = None
         self.synthetic_content_seen = False  # 是否已经吐出过合成正文（防重复输出）
+        self.content_path_seen = False
         self.content_closed = False
         self.call_closed = False
         self.synthetic_complete = False
+        self.synthetic_invalid = False
         self.synthetic_bytes = 0
         self.unicode_pending = ""
         self.real_bytes = 0
@@ -895,6 +901,7 @@ class StreamPartialState:
                 raise integrity_error()
             if cs.content_closed or cs.call_closed:
                 raise integrity_error()
+            cs.content_path_seen = True
             value = cs.unicode_pending + value
             cs.unicode_pending = ""
             if value and 0xD800 <= ord(value[-1]) <= 0xDBFF:
@@ -917,6 +924,14 @@ class StreamPartialState:
             cs.synthetic_content_seen = True
             self.partial_args_seen = True
         return text
+
+    def _close_synthetic(self, cs: _CandidatePartialState) -> None:
+        """显式 FunctionCall 结束同时终结唯一的 content 参数。"""
+        if (cs.unicode_pending or cs.synthetic_invalid
+                or not (cs.content_path_seen or cs.synthetic_complete)):
+            raise integrity_error()
+        cs.content_closed = True
+        cs.call_closed = True
 
     def _feed_real(self, cs: _CandidatePartialState, partials: list) -> None:
         """累积真实调用分片到 cs.real_args。"""
@@ -978,13 +993,15 @@ class StreamPartialState:
     def validate_terminal(self, candidate_index: int, finish_reason: Optional[str],
                           native_finish_reason=None) -> None:
         cs = self._cand(candidate_index)
-        complete = (cs.synthetic_complete or cs.content_closed) and cs.call_closed
+        complete = (cs.synthetic_complete or cs.content_closed) and cs.call_closed and not cs.synthetic_invalid
         log_integrity(transport="stream", synthetic_seen=cs.synthetic_seen,
                       status="integrity_failed" if cs.real_part is not None or (cs.synthetic_seen and not complete and finish_reason in ("stop", "tool_calls")) else
                       "not_called" if not cs.synthetic_seen else
                       "partial" if not complete or finish_reason in ("length", "content_filter") else "restored",
                       native_finish_reason=native_finish_reason,
                       restored=cs.synthetic_content_seen, structurally_complete=complete,
+                      content_closed=cs.content_closed, call_closed=cs.call_closed,
+                      synthetic_complete=cs.synthetic_complete,
                       recovered_partial=cs.synthetic_content_seen and not complete,
                       finish_reason=finish_reason)
         if cs.real_part is not None:
@@ -1057,14 +1074,17 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                 # 已经吐过分片正文时忽略整段参数，避免同一份正文输出两次。
                 restored = restore_synthetic_args(args)
                 cs.synthetic_complete = restored.structurally_complete
+                cs.synthetic_invalid |= not restored.structurally_complete
                 content = restored.text
                 if content:
                     cs.synthetic_content_seen = True
                     synthetic_texts.append(content)
             elif args is not None:
                 cs.synthetic_complete = restore_synthetic_args(args).structurally_complete
-            if (getattr(fc, "will_continue", None) is False
-                    or (getattr(fc, "will_continue", None) is None and args is not None)):
+                cs.synthetic_invalid |= not cs.synthetic_complete
+            if getattr(fc, "will_continue", None) is False:
+                state._close_synthetic(cs)
+            elif getattr(fc, "will_continue", None) is None and args is not None:
                 cs.call_closed = True
             continue
 
@@ -1122,8 +1142,9 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                 text = state._feed_synthetic(cs, partials)
                 if text:
                     synthetic_texts.append(text)
-            if (getattr(fc, "will_continue", None) is False
-                    or (getattr(fc, "will_continue", None) is None and not partials)):
+            if getattr(fc, "will_continue", None) is False:
+                state._close_synthetic(cs)
+            elif getattr(fc, "will_continue", None) is None and not partials:
                 cs.call_closed = True
             continue
         if cs.mode == "real":

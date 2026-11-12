@@ -370,6 +370,106 @@ def test_foreign_id_fragment_is_not_assigned_to_current_call():
         transform_stream_chunk(stream_chunk({"id": "second", "partial_args": [partial("$.city", "Paris")]}), 0, state)
 
 
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("separate_close", [False, True])
+async def test_function_close_terminates_synthetic_content(named, separate_close):
+    """FunctionCall 的显式结束是最终边界，不要求 PartialArg 重复标记结束。"""
+    chunks = [stream_chunk({"name": TOOL, "will_continue": True})]
+    last = {"partial_args": [partial("$.content", "complete")], "will_continue": False}
+    if named:
+        last["name"] = TOOL
+    if separate_close:
+        chunks.append(stream_chunk({"partial_args": last.pop("partial_args")}))
+    chunks.extend([stream_chunk(last), stream_chunk(finish="STOP")])
+    wire, records = await stream_output(chunks)
+    assert not any("error" in r for r in records)
+    assert "".join(c.get("delta", {}).get("content") or ""
+                   for r in records for c in r.get("choices", [])) == "complete"
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+    assert wire.count("data: [DONE]") == 1
+
+
+async def test_function_close_does_not_accept_dangling_unicode():
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "answer\ud83d")],
+                      "will_continue": False}), stream_chunk(finish="STOP")])
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+@pytest.mark.parametrize("close", [None, True])
+async def test_empty_call_close_does_not_close_unfinished_content(close):
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "partial")]}),
+        stream_chunk({"will_continue": close}), stream_chunk(finish="STOP")])
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+async def test_explicit_close_does_not_accept_invalid_whole_arguments():
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "args": {"content": 123}, "will_continue": False}),
+        stream_chunk(finish="STOP")])
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("args", [{"content": "answer", "extra": 1}, {"content": 123}])
+async def test_explicit_close_preserves_earlier_invalid_whole_arguments(named, args):
+    close = {"will_continue": False}
+    if named:
+        close["name"] = TOOL
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "args": args, "will_continue": True}),
+        stream_chunk(close), stream_chunk(finish="STOP")])
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+def test_integrity_summary_exposes_closure_without_private_arguments(monkeypatch):
+    import request_log
+    from anti_truncation import log_integrity
+    from types import SimpleNamespace
+    events = []
+    ctx = SimpleNamespace(emit=lambda *args, **fields: events.append((args, fields)))
+    monkeypatch.setattr(request_log, "current", lambda: ctx)
+    log_integrity(status="integrity_failed", transport="stream", native_finish_reason="STOP",
+                  structurally_complete=False, content_closed=True, call_closed=False,
+                  synthetic_complete=False, arguments="private fixture")
+    args, fields = events[0]
+    assert "native_finish_reason=STOP" in args[1]
+    assert "content_closed=True" in args[1]
+    assert "call_closed=False" in args[1]
+    assert fields["content_closed"] is True
+    assert "private fixture" not in json.dumps(events)
+
+
+@pytest.mark.parametrize("named", [False, True])
+async def test_explicit_close_requires_content_argument(named):
+    close = {"will_continue": False}
+    if named:
+        close["name"] = TOOL
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk(close), stream_chunk(finish="STOP")])
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+async def test_explicit_close_accepts_present_empty_content_argument():
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "")], "will_continue": False}),
+        stream_chunk(finish="STOP")])
+    assert not any("error" in r for r in records)
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+
+
 async def test_explicit_function_close_on_last_partial_is_accepted():
     _, records = await stream_output([
         stream_chunk({"name": TOOL, "will_continue": True}),
