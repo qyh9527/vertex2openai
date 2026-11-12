@@ -196,6 +196,7 @@ http://localhost:8050
   - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 已于 2026-10-16 停用，其 `thinking_budget` 专用分支已删除（2.5 名称按旧代模型处理，不下发思考配置）。
   - **`gemini-4-argon`（2026-10 新增）**：档位 `low`/`medium`/`high`，默认 `medium`，无 `minimal`；采样与惩罚参数自动剥离。单次请求输出上限 65536，`max_tokens` 超过时代理**夹到 65536**（官方长解码会返回 `finish_reason=CONTINUATION` 并要求带 `continuation_token` 续请求，本代理不做续传）。
   - **`gemini-4-carbon`（2026-11-11 新增）**：能力档案与计费同 4-argon 一类——档位 `low`/`medium`/`high`、默认 `medium`、无 `minimal`，采样与惩罚参数剥离，单次输出上限 65536（超长解码夹断）。官方首发价与 4-argon 相同（$2 / $10，缓存输入 95% 折扣），并同样在 **2026-12-01 起翻倍到 $4 / $20**，已写入 `MODEL_PRICING` / `PRICE_SCHEDULE` / `CACHED_INPUT_RATIO_OVERRIDES`；SA 额度保护按调价后价格预留（$4 / $20）。
+  - **`gemini-4-hydrogen`（2026-11-12 新增计费）**：按 [Google Cloud 官方 SKU 目录](https://cloud.google.com/skus/?filter=hydrogen) 的 global 标准价计费：输入 **$1.50**、文本输出 **$7.50**、缓存输入 **$0.075**／百万 token（缓存按 5% 计费）；Flex 为 **$0.75 / $3.75 / $0.0375**，Priority 沿用现有 1.8 倍系数。未查到官方首发返还或定时调价规则，不套用 Carbon/Argon 的翻倍计划；SA 额度按标准 SKU 价及所选档位计算。已加入本地与兜底模型目录；按社区 Vertex 成功调用反馈加入模型 ID `gemini-4-hydrogen`，但官方模型文档尚未收录，开放范围未知，不能保证所有项目或 Express/Cookie 通道可用；本次未做真实模型调用。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
     - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低合法档（3.x=`minimal`、Pro/3.7+/4.x=`low`、生图=`minimal`；3-pro-image 不可调），并**不返回思考**。
@@ -398,6 +399,7 @@ curl http://localhost:8050/v1/chat/completions \
 ```json
 {
   "models": [
+    "gemini-4-hydrogen",
     "gemini-4-carbon",
     "gemini-4-argon",
     "gemini-3.8-flash",

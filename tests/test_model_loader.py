@@ -53,6 +53,7 @@ class TestGetModelsConfig:
         cfg = await ml.get_models_config()
         assert len(cfg["models"]) > 0
         assert "gemini-3.7-flash" in cfg["models"]
+        assert "gemini-4-hydrogen" in cfg["models"]
 
 
 class TestListModelsRoute:

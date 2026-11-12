@@ -142,6 +142,32 @@ class TestCarbonPrices:
         assert abs(c - 24.0) < 1e-9
 
 
+class TestHydrogenPrices:
+    """2026-11-12 官方 SKU：Standard $1.5/$7.5，缓存 $0.075，无已公布调价日。"""
+
+    def test_hydrogen_prices_and_proxy_aliases(self):
+        for model in ("gemini-4-hydrogen", "fake-gemini-4-hydrogen-search",
+                      "[EXPRESS] gemini-4-hydrogen", "[PAY] gemini-4-hydrogen-openai"):
+            assert get_model_price(model) == (1.50, 7.50)
+            assert model_pricing.get_cached_input_ratio(model) == 0.05
+
+    def test_hydrogen_cached_input_is_95_percent_off(self):
+        assert abs(estimate_cost("gemini-4-hydrogen", 1_000_000, 0, 1_000_000) - 0.075) < 1e-9
+        cost = estimate_cost("gemini-4-hydrogen", 1_000_000, 1_000_000, 500_000)
+        assert abs(cost - (0.75 + 0.0375 + 7.50)) < 1e-9
+
+    def test_hydrogen_tier_factors(self):
+        for tier, factor in (("standard", 1), ("priority", 1.8), ("auto", 1.8), ("flex", 0.5)):
+            cost = estimate_cost("gemini-4-hydrogen", 1_000_000, 1_000_000, 500_000, tier=tier)
+            assert abs(cost - (0.75 + 0.0375 + 7.50) * factor) < 1e-9
+
+    def test_hydrogen_has_no_announced_price_schedule(self):
+        assert "gemini-4-hydrogen" not in model_pricing.PRICE_SCHEDULE
+        for day in (datetime.date(2026, 11, 30), datetime.date(2026, 12, 1),
+                    datetime.date(2027, 1, 1)):
+            assert get_model_price("gemini-4-hydrogen", day) == (1.50, 7.50)
+
+
 class TestPriceSchedule:
     """官方定时调价按服务器日期自动切换（4-argon 2026-12-01 翻倍，3.6/3.7/3.8-flash 2027-01-01 翻倍）。"""
 

@@ -197,6 +197,17 @@ def test_price_reserves_carbon_at_post_introductory_rate():
     assert sa_budget.price("gemini-4-carbon", 1_000_000, 0, cached=1_000_000) == sa_budget.money("0.2")
 
 
+def test_price_reserves_hydrogen_at_sku_rate():
+    """Hydrogen 无已公布促销返还，不套用 Carbon/Argon 的 $4/$20 预留价。"""
+    model = "gemini-4-hydrogen"
+    assert sa_budget.price(model, 1_000_000, 1_000_000) == sa_budget.money(9)
+    assert sa_budget.price(model, 1_000_000, 0, cached=1_000_000) == sa_budget.money("0.075")
+    assert sa_budget.price(model, 1_000_000, 1_000_000, cached=500_000,
+                           tier="priority") == sa_budget.money("14.9175")
+    assert sa_budget.price(model, 1_000_000, 1_000_000, cached=500_000,
+                           tier="flex") == sa_budget.money("4.14375")
+
+
 # ---------- BudgetModels：非流 / 流 / 中断 ----------
 
 class FakeModels:
