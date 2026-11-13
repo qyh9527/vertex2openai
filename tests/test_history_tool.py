@@ -113,7 +113,8 @@ async def test_pipeline_top_injection_after_history_and_auto_transport(monkeypat
     assert output.messages[-1].role == "tool"
 
 
-async def test_nonfake_history_forces_transport_and_accepts_explicit_call_close(monkeypatch):
+@pytest.mark.parametrize("function_continue", [False, None])
+async def test_nonfake_history_forces_transport_and_accepts_explicit_call_close(monkeypatch, function_continue):
     import json
     from types import SimpleNamespace
     from google.genai import types
@@ -131,7 +132,7 @@ async def test_nonfake_history_forces_transport_and_accepts_explicit_call_close(
             for fc, finish in [
                 ({"name": "sanbox_rp_content", "will_continue": True}, None),
                 ({"partial_args": [{"json_path": "$.content", "string_value": "complete",
-                                    "will_continue": True}], "will_continue": False}, None),
+                                    "will_continue": True}], "will_continue": function_continue}, None),
                 (None, "STOP"),
             ]:
                 parts = [types.Part(function_call=types.FunctionCall(**fc))] if fc else []

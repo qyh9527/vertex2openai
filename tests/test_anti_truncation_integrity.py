@@ -228,7 +228,7 @@ async def stream_output(chunks, *, synthetic_tool_name=TOOL, n=1, **kwargs):
 async def test_stop_with_unclosed_synthetic_stream_is_error_not_success():
     wire, records = await stream_output([
         stream_chunk({"name": TOOL, "will_continue": True}),
-        stream_chunk({"partial_args": [partial("$.content", "partial")]}),
+        stream_chunk({"partial_args": [partial("$.content", "partial")], "will_continue": True}),
         stream_chunk(finish="STOP"),
     ])
     assert any("error" in r for r in records)
@@ -399,7 +399,67 @@ async def test_function_close_does_not_accept_dangling_unicode():
     assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
 
 
-@pytest.mark.parametrize("close", [None, True])
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("separate_close", [False, True])
+async def test_omitted_function_continue_closes_at_normal_terminal(named, separate_close):
+    state = StreamPartialState(TOOL)
+    transform_stream_chunk(stream_chunk({"name": TOOL, "will_continue": True}), 0, state)
+    final = {"partial_args": [partial("$.content", "complete")]}
+    if named:
+        final["name"] = TOOL
+    if separate_close:
+        transform_stream_chunk(stream_chunk({**final, "will_continue": True}), 0, state)
+        final.pop("partial_args")
+    _, texts = transform_stream_chunk(stream_chunk(final), 0, state)
+    if not separate_close:
+        assert texts == ["complete"]  # 字段省略也逐片下发，不等全量缓冲。
+    state.validate_terminal(0, "tool_calls", "STOP")
+    assert state._cand(0).call_closed
+    assert state._cand(0).content_closed
+
+
+async def test_omitted_function_continue_successfully_finishes_sse():
+    wire, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "complete")]}),
+        stream_chunk(finish="STOP")])
+    assert not any("error" in r for r in records)
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+    assert wire.count("data: [DONE]") == 1
+
+
+@pytest.mark.parametrize("finish, expected", [("MAX_TOKENS", "length"), ("SAFETY", "content_filter")])
+async def test_implicit_end_preserves_nonstop_reason(finish, expected):
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "partial")]}),
+        stream_chunk(finish=finish)])
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == [expected]
+
+
+@pytest.mark.parametrize("shape", ["no_content", "surrogate", "invalid_args", "no_stop", "continuing"])
+async def test_implicit_final_marker_does_not_mask_incomplete_input(shape):
+    chunks = [stream_chunk({"name": TOOL, "will_continue": True})]
+    if shape == "no_content":
+        chunks.append(stream_chunk({}))
+    elif shape == "invalid_args":
+        chunks.extend([stream_chunk({"name": TOOL, "args": {"content": "answer", "extra": 1},
+                                     "will_continue": True}), stream_chunk({})])
+    else:
+        fc = {"partial_args": [partial("$.content", "answer\ud83d" if shape == "surrogate" else "answer")]}
+        if shape == "continuing":
+            fc["will_continue"] = True
+        chunks.append(stream_chunk(fc))
+    if shape != "no_stop":
+        chunks.append(stream_chunk(finish="STOP"))
+    _, records = await stream_output(chunks)
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") for r in records for c in r.get("choices", []))
+
+
+@pytest.mark.parametrize("close", [True])
 async def test_empty_call_close_does_not_close_unfinished_content(close):
     _, records = await stream_output([
         stream_chunk({"name": TOOL, "will_continue": True}),

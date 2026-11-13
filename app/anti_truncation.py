@@ -471,7 +471,7 @@ def log_integrity(**fields) -> None:
     allowed = {"status", "transport", "synthetic_seen", "restored", "structurally_complete",
                "recovered_partial", "finish_reason", "native_finish_reason", "failure_category",
                "selected_text_channel", "stream_done", "content_closed", "call_closed",
-               "synthetic_complete"}
+               "synthetic_complete", "implicit_final_pending"}
     fields = {key: value for key, value in fields.items() if key in allowed}
     fields.setdefault("transport", "buffered")
     fields.setdefault("status", "integrity_failed" if fields.get("failure_category") else
@@ -501,7 +501,7 @@ def log_integrity(**fields) -> None:
         if ctx is not None:
             summary = " ".join(f"{key}={fields[key]}" for key in (
                 "status", "native_finish_reason", "structurally_complete",
-                "content_closed", "call_closed", "synthetic_complete") if key in fields)
+                "content_closed", "call_closed", "synthetic_complete", "implicit_final_pending") if key in fields)
             ctx.emit("anti_truncation_integrity", "防截断完整性诊断 | " + summary, **fields)
     except Exception:
         pass
@@ -846,6 +846,7 @@ class _CandidatePartialState:
         self.synthetic_id = None
         self.synthetic_content_seen = False  # 是否已经吐出过合成正文（防重复输出）
         self.content_path_seen = False
+        self.implicit_final_pending = False
         self.content_closed = False
         self.call_closed = False
         self.synthetic_complete = False
@@ -993,6 +994,11 @@ class StreamPartialState:
     def validate_terminal(self, candidate_index: int, finish_reason: Optional[str],
                           native_finish_reason=None) -> None:
         cs = self._cand(candidate_index)
+        # 官方 FunctionCall.willContinue 省略等价于 false。延至正常终态确认，
+        # 兼容部分上游在中间片同样省略此字段；不以 STOP 单独证明完整性。
+        if (native_finish_reason == "STOP" and finish_reason in ("stop", "tool_calls")
+                and cs.synthetic_seen and cs.implicit_final_pending and not cs.call_closed):
+            self._close_synthetic(cs)
         complete = (cs.synthetic_complete or cs.content_closed) and cs.call_closed and not cs.synthetic_invalid
         log_integrity(transport="stream", synthetic_seen=cs.synthetic_seen,
                       status="integrity_failed" if cs.real_part is not None or (cs.synthetic_seen and not complete and finish_reason in ("stop", "tool_calls")) else
@@ -1002,6 +1008,7 @@ class StreamPartialState:
                       restored=cs.synthetic_content_seen, structurally_complete=complete,
                       content_closed=cs.content_closed, call_closed=cs.call_closed,
                       synthetic_complete=cs.synthetic_complete,
+                      implicit_final_pending=cs.implicit_final_pending,
                       recovered_partial=cs.synthetic_content_seen and not complete,
                       finish_reason=finish_reason)
         if cs.real_part is not None:
@@ -1064,6 +1071,7 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                 cs.synthetic_id = getattr(fc, "id", None)
             cs.synthetic_seen = True
             cs.mode = "synthetic"
+            cs.implicit_final_pending = getattr(fc, "will_continue", None) is None
             changed = True
             if partials:
                 text = state._feed_synthetic(cs, partials)
@@ -1129,6 +1137,7 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
         if cs.mode == "synthetic":
             if cs.call_closed or (getattr(fc, "id", None) and fc.id != cs.synthetic_id):
                 raise integrity_error()
+            cs.implicit_final_pending = getattr(fc, "will_continue", None) is None
             changed = True
             if args is not None:
                 restored = restore_synthetic_args(args)
@@ -1144,7 +1153,8 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
                     synthetic_texts.append(text)
             if getattr(fc, "will_continue", None) is False:
                 state._close_synthetic(cs)
-            elif getattr(fc, "will_continue", None) is None and not partials:
+            elif (getattr(fc, "will_continue", None) is None and not partials
+                  and (cs.content_closed or cs.synthetic_complete)):
                 cs.call_closed = True
             continue
         if cs.mode == "real":
