@@ -205,7 +205,7 @@ def test_unknown_synthetic_path_is_not_user_text():
         transform_stream_chunk(stream_chunk({"partial_args": [partial("$.answer", "private")]}), 0, state)
 
 
-async def stream_output(chunks, *, synthetic_tool_name=TOOL, n=1, **kwargs):
+async def stream_output(chunks, *, synthetic_tool_name=TOOL, n=1, model="gemini-test", **kwargs):
     from api_helpers import execute_gemini_call
     from models import OpenAIRequest
     from types import SimpleNamespace
@@ -217,7 +217,7 @@ async def stream_output(chunks, *, synthetic_tool_name=TOOL, n=1, **kwargs):
         return source()
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate)))
-    request = OpenAIRequest(model="gemini-test", messages=[{"role": "user", "content": "fixture"}], stream=True, n=n)
+    request = OpenAIRequest(model=model, messages=[{"role": "user", "content": "fixture"}], stream=True, n=n)
     response = await execute_gemini_call(client, request.model, lambda _: [], {}, request,
                                          synthetic_tool_name=synthetic_tool_name, **kwargs)
     wire = "".join([item async for item in response.body_iterator])
@@ -416,6 +416,152 @@ async def test_omitted_function_continue_closes_at_normal_terminal(named, separa
     state.validate_terminal(0, "tool_calls", "STOP")
     assert state._cand(0).call_closed
     assert state._cand(0).content_closed
+
+
+@pytest.mark.parametrize("model", ["gemini-4-hydrogen", "projects/p/locations/global/publishers/google/models/gemini-4-hydrogen"])
+async def test_hydrogen_accepts_native_stop_without_close_and_warns(model, capsys, monkeypatch):
+    import anti_truncation
+    import api_helpers
+    events = []
+    monkeypatch.setattr(anti_truncation, "log_integrity", lambda **fields: events.append(fields))
+    monkeypatch.setattr(api_helpers, "log_integrity", lambda **fields: events.append(fields))
+    wire, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "complete")], "will_continue": True}),
+        stream_chunk(finish="STOP")], model=model)
+    assert not any("error" in r for r in records)
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+    assert wire.count("data: [DONE]") == 1
+    assert "结构完整性未经确认" in capsys.readouterr().out
+    assert any(e.get("compat_stop_accepted") and e.get("structurally_complete") is False for e in events)
+    assert events[-1]["status"] == "compat_stop"
+
+
+@pytest.mark.parametrize("shape", ["missing", "surrogate", "invalid", "real_tool", "no_stop", "error"])
+async def test_hydrogen_compatibility_keeps_invalid_stream_failures(shape):
+    chunks = [stream_chunk({"name": TOOL, "will_continue": True})]
+    if shape == "missing":
+        pass
+    elif shape == "invalid":
+        chunks.append(stream_chunk({"name": TOOL, "args": {"content": "answer", "extra": 1}, "will_continue": True}))
+    else:
+        chunks.append(stream_chunk({"partial_args": [partial("$.content", "answer\ud83d" if shape == "surrogate" else "answer")], "will_continue": True}))
+    if shape == "real_tool":
+        chunks.append(stream_chunk({"name": "lookup", "args": {"city": "Paris"}}))
+    if shape != "no_stop":
+        chunks.append(stream_chunk(finish="MALFORMED_FUNCTION_CALL" if shape == "error" else "STOP"))
+    _, records = await stream_output(chunks, model="gemini-4-hydrogen")
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") == "stop" for r in records for c in r.get("choices", []))
+
+
+@pytest.mark.parametrize("model", ["gemini-4-carbon", "gemini-4-hydrogen-preview", "gemini-test"])
+async def test_hydrogen_compatibility_is_exact_model_only(model):
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "answer")], "will_continue": True}),
+        stream_chunk(finish="STOP")], model=model)
+    assert any("error" in r for r in records)
+
+
+@pytest.mark.parametrize("finish, expected", [("MAX_TOKENS", "length"), ("SAFETY", "content_filter")])
+async def test_hydrogen_compatibility_does_not_upgrade_cut_short_finish(finish, expected):
+    _, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "partial")], "will_continue": True}),
+        stream_chunk(finish=finish)], model="gemini-4-hydrogen")
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == [expected]
+
+
+async def test_captured_hydrogen_shape_remains_incremental_before_compat_stop():
+    """脱敏复现：仅借用真实流的形状，正文用固定片段替代。"""
+    from api_helpers import execute_gemini_call
+    from models import OpenAIRequest
+    from types import SimpleNamespace
+    observed = {"produced": 0}
+    async def generate(**kwargs):
+        async def source():
+            yield stream_chunk({"name": TOOL, "will_continue": True})
+            for _ in range(94):
+                observed["produced"] += 1
+                yield stream_chunk({"partial_args": [partial("$.content", "fragment")],
+                                    "will_continue": True})
+            yield stream_chunk(finish="STOP")
+        return source()
+    client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate)))
+    req = OpenAIRequest(model="gemini-4-hydrogen", stream=True,
+                        messages=[{"role": "user", "content": "fixture"}])
+    response = await execute_gemini_call(client, req.model, lambda _: [], {}, req,
+                                         synthetic_tool_name=TOOL)
+    records = []
+    first_content_at = None
+    async for chunk in response.body_iterator:
+        for line in chunk.splitlines():
+            if not line.startswith("data: {"):
+                continue
+            record = json.loads(line[6:])
+            records.append(record)
+            if first_content_at is None and any(c.get("delta", {}).get("content") for c in record.get("choices", [])):
+                first_content_at = observed["produced"]
+    assert first_content_at == 1
+    assert not any("error" in r for r in records)
+    assert sum(len(c.get("delta", {}).get("content") or "") for r in records
+               for c in r.get("choices", [])) == 94 * len("fragment")
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+
+
+@pytest.mark.parametrize("shape", ["real_tool_after_path_close", "plain_committed", "mixed_args"])
+async def test_hydrogen_compatibility_does_not_bypass_transport_guards(shape):
+    chunks = []
+    if shape == "plain_committed":
+        chunks.append(stream_chunk(text="plain answer"))
+    chunks.append(stream_chunk({"name": TOOL, "will_continue": True}))
+    fc = {"partial_args": [partial("$.content", "synthetic answer", shape != "real_tool_after_path_close")],
+          "will_continue": True}
+    if shape == "mixed_args":
+        fc.update(name=TOOL, args={"content": "synthetic answer", "extra": 1})
+    chunks.append(stream_chunk(fc))
+    if shape == "real_tool_after_path_close":
+        chunks.append(stream_chunk({"name": "lookup", "args": {"city": "Paris"}}))
+    chunks.append(stream_chunk(finish="STOP"))
+    _, records = await stream_output(chunks, model="gemini-4-hydrogen")
+    assert any("error" in r for r in records)
+    assert not any(c.get("finish_reason") == "stop" for r in records for c in r.get("choices", []))
+
+
+async def test_content_end_marker_and_native_stop_without_call_close_finishes_sse():
+    """原请求捕获：路径结束片仍带调用 will_continue=True，随后直接 STOP。"""
+    wire, records = await stream_output([
+        stream_chunk({"name": TOOL, "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "complete")], "will_continue": True}),
+        stream_chunk({"partial_args": [partial("$.content", "", None)], "will_continue": True}),
+        stream_chunk(finish="STOP")])
+    assert not any("error" in r for r in records)
+    assert "".join(c.get("delta", {}).get("content") or "" for r in records
+                   for c in r.get("choices", [])) == "complete"
+    assert [c["finish_reason"] for r in records for c in r.get("choices", [])
+            if c.get("finish_reason")] == ["stop"]
+    assert wire.count("data: [DONE]") == 1
+
+
+@pytest.mark.parametrize("finish", [None, "MAX_TOKENS", "SAFETY", "MALFORMED_FUNCTION_CALL"])
+async def test_closed_content_without_call_close_preserves_terminal(finish):
+    chunks = [stream_chunk({"name": TOOL, "will_continue": True}),
+              stream_chunk({"partial_args": [partial("$.content", "answer", False)],
+                            "will_continue": True})]
+    if finish:
+        chunks.append(stream_chunk(finish=finish))
+    _, records = await stream_output(chunks)
+    endings = [c["finish_reason"] for r in records for c in r.get("choices", [])
+               if c.get("finish_reason")]
+    if finish in ("MAX_TOKENS", "SAFETY"):
+        assert endings == ["length" if finish == "MAX_TOKENS" else "content_filter"]
+    else:
+        assert any("error" in r for r in records)
+        assert not endings
 
 
 async def test_omitted_function_continue_successfully_finishes_sse():

@@ -1069,7 +1069,9 @@ async def _execute_gemini_call(
                 selected_text_channel = None
                 # 真流式增量参数状态机（3.33）：合成正文逐片实时下发，
                 # 真实工具调用的分片参数累积完成后按原样一次性交给转换管线。
-                partial_state = StreamPartialState(synthetic_tool_name) if synthetic_tool_name else None
+                partial_state = StreamPartialState(synthetic_tool_name, allow_synthetic_stop=(
+                    model_to_call.rsplit("/", 1)[-1] == "gemini-4-hydrogen"
+                    and template_fields is None)) if synthetic_tool_name else None
                 input_relay_stripper = (
                     RelayBlockStreamStripper(input_relay_strip_tag)
                     if input_relay_strip_tag else None
@@ -1103,7 +1105,9 @@ async def _execute_gemini_call(
                         # 前缀延迟到有效输出或正常终止再下发，建流成功不代表迭代不会失败。
 
                         if synthetic_tool_name:
-                            partial_state = StreamPartialState(synthetic_tool_name)
+                            partial_state = StreamPartialState(synthetic_tool_name, allow_synthetic_stop=(
+                                model_to_call.rsplit("/", 1)[-1] == "gemini-4-hydrogen"
+                                and template_fields is None))
                             side_buffer = []
                             side_emitted = False
                             selected_text_channel = None
@@ -1345,7 +1349,8 @@ async def _execute_gemini_call(
                                           synthetic_seen=synthetic_seen, stream_done=False)
                             for candidate_index, finish_reason in terminal_finish_reasons.items():
                                 partial_state.validate_terminal(candidate_index, finish_reason,
-                                                                native_finish_reasons.get(candidate_index))
+                                                                native_finish_reasons.get(candidate_index),
+                                                                synthetic_output_committed=selected_text_channel == "synthetic")
                         for finish in pending_finishes.values():
                             if _pf := _pending_prefill():
                                 yield _pf
@@ -1397,7 +1402,8 @@ async def _execute_gemini_call(
 
                         if partial_state is not None:
                             log_integrity(transport="stream", stream_done=True, synthetic_seen=synthetic_seen,
-                                          status="not_called" if not synthetic_seen else
+                                          status="compat_stop" if partial_state.compat_stop_accepted else
+                                          "not_called" if not synthetic_seen else
                                           "partial" if any(reason in ("length", "content_filter") for reason in terminal_finish_reasons.values()) else "restored",
                                           selected_text_channel=selected_text_channel)
                         yield "data: [DONE]\n\n"

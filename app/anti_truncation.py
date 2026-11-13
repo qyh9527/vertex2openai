@@ -471,7 +471,7 @@ def log_integrity(**fields) -> None:
     allowed = {"status", "transport", "synthetic_seen", "restored", "structurally_complete",
                "recovered_partial", "finish_reason", "native_finish_reason", "failure_category",
                "selected_text_channel", "stream_done", "content_closed", "call_closed",
-               "synthetic_complete", "implicit_final_pending"}
+               "synthetic_complete", "implicit_final_pending", "compat_stop_accepted"}
     fields = {key: value for key, value in fields.items() if key in allowed}
     fields.setdefault("transport", "buffered")
     fields.setdefault("status", "integrity_failed" if fields.get("failure_category") else
@@ -501,7 +501,8 @@ def log_integrity(**fields) -> None:
         if ctx is not None:
             summary = " ".join(f"{key}={fields[key]}" for key in (
                 "status", "native_finish_reason", "structurally_complete",
-                "content_closed", "call_closed", "synthetic_complete", "implicit_final_pending") if key in fields)
+                "content_closed", "call_closed", "synthetic_complete", "implicit_final_pending",
+                "compat_stop_accepted") if key in fields)
             ctx.emit("anti_truncation_integrity", "防截断完整性诊断 | " + summary, **fields)
     except Exception:
         pass
@@ -851,6 +852,8 @@ class _CandidatePartialState:
         self.call_closed = False
         self.synthetic_complete = False
         self.synthetic_invalid = False
+        self.real_tool_seen = False
+        self.compat_stop_accepted = False
         self.synthetic_bytes = 0
         self.unicode_pending = ""
         self.real_bytes = 0
@@ -879,9 +882,10 @@ class StreamPartialState:
 
     # 无名 functionCall 分片可能属于合成工具，也可能属于真实调用；两种模式互斥切换。
     def __init__(self, synthetic_tool_name: Optional[str] = None,
-                 allow_real_buffering: bool = True) -> None:
+                 allow_real_buffering: bool = True, *, allow_synthetic_stop: bool = False) -> None:
         self.synthetic_tool_name = synthetic_tool_name
         self.allow_real_buffering = allow_real_buffering
+        self.allow_synthetic_stop = allow_synthetic_stop
         self.partial_args_seen = False        # 本次流是否真的出现了分片参数
         self._non_content_warned = False
         self._candidates: dict = {}
@@ -991,17 +995,37 @@ class StreamPartialState:
         """本次流是否已经解出过合成正文（流末用于"调了工具却空正文"的告警判定）。"""
         return any(c.synthetic_content_seen for c in self._candidates.values())
 
+    @property
+    def compat_stop_accepted(self) -> bool:
+        return any(cs.compat_stop_accepted for cs in self._candidates.values())
+
     def validate_terminal(self, candidate_index: int, finish_reason: Optional[str],
-                          native_finish_reason=None) -> None:
+                          native_finish_reason=None, *, synthetic_output_committed=False) -> None:
         cs = self._cand(candidate_index)
-        # 官方 FunctionCall.willContinue 省略等价于 false。延至正常终态确认，
-        # 兼容部分上游在中间片同样省略此字段；不以 STOP 单独证明完整性。
+        # 单字段合成传输：已确认 content 路径结束时，原生 STOP 可补足上游
+        # 省略的调用关闭帧。仍需路径证明，不能把未闭合参数或真实工具升级为成功。
+        # 调用级 willContinue 省略的官方末片规则同样延至正常终态确认。
         if (native_finish_reason == "STOP" and finish_reason in ("stop", "tool_calls")
-                and cs.synthetic_seen and cs.implicit_final_pending and not cs.call_closed):
+                and cs.synthetic_seen and not cs.real_tool_seen
+                and cs.real_part is None and not cs.call_closed
+                and (cs.content_closed or cs.implicit_final_pending)):
             self._close_synthetic(cs)
         complete = (cs.synthetic_complete or cs.content_closed) and cs.call_closed and not cs.synthetic_invalid
+        # Hydrogen 单字段正文已实测会遗漏全部关闭标记。仅接纳原生正常终态，
+        # 保持结构未验证的事实，不把此策略用于真实工具或其他模型。
+        compat = (self.allow_synthetic_stop and native_finish_reason == "STOP"
+                  and finish_reason in ("stop", "tool_calls") and not complete
+                  and cs.synthetic_seen and cs.synthetic_content_seen and cs.content_path_seen
+                  and synthetic_output_committed
+                  and not cs.synthetic_invalid and not cs.unicode_pending
+                  and not cs.real_tool_seen and cs.real_part is None)
+        if compat and not cs.compat_stop_accepted:
+            print("⚠️ [防截断兼容] Hydrogen 原生 STOP 但缺少工具参数关闭标记；"
+                  "正文已增量输出，按兼容策略结束，结构完整性未经确认。")
+            cs.compat_stop_accepted = True
         log_integrity(transport="stream", synthetic_seen=cs.synthetic_seen,
-                      status="integrity_failed" if cs.real_part is not None or (cs.synthetic_seen and not complete and finish_reason in ("stop", "tool_calls")) else
+                      status="compat_stop" if compat else
+                      "integrity_failed" if cs.real_part is not None or (cs.synthetic_seen and not complete and finish_reason in ("stop", "tool_calls")) else
                       "not_called" if not cs.synthetic_seen else
                       "partial" if not complete or finish_reason in ("length", "content_filter") else "restored",
                       native_finish_reason=native_finish_reason,
@@ -1009,12 +1033,13 @@ class StreamPartialState:
                       content_closed=cs.content_closed, call_closed=cs.call_closed,
                       synthetic_complete=cs.synthetic_complete,
                       implicit_final_pending=cs.implicit_final_pending,
+                      compat_stop_accepted=cs.compat_stop_accepted,
                       recovered_partial=cs.synthetic_content_seen and not complete,
                       finish_reason=finish_reason)
         if cs.real_part is not None:
             raise integrity_error()
         if (cs.synthetic_seen and finish_reason in ("stop", "tool_calls")
-                and not complete):
+                and not complete and not compat):
             raise integrity_error()
 
     def flush_pending_real(self) -> list:
@@ -1060,6 +1085,10 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
         name = getattr(fc, "name", None)
         partials = getattr(fc, "partial_args", None)
         args = getattr(fc, "args", None)
+        if (partials and args is not None
+                and (name == tool_name or (not name and cs.mode == "synthetic"))):
+            # 两种表示同帧并存无法证明同一参数集，不能只验证其中一半。
+            raise integrity_error()
 
         # ① 合成工具（首片带名字；后续无名分片见 ③）
         if tool_name and is_synthetic_part(part, tool_name):
@@ -1098,6 +1127,7 @@ def transform_stream_chunk(chunk: Any, candidate_index: int,
 
         # ② 真实调用的首片（带名字）
         if name:
+            cs.real_tool_seen = True
             if cs.real_part is not None:
                 raise integrity_error()
             done = state._flush_real(cs)
