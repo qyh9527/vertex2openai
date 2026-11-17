@@ -60,6 +60,7 @@ from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 # 引入报错重试统计器
 from logger import stats
 import request_log
+import sa_affinity
 
 # 假流式前缀：请求 fake-<模型名> 时该请求走假流式（标准 SDK 通道通用），其余模型保持真实流式。
 # 定义在公共模块：models_api（列表暴露）、express_sdk（强制假流式）、cookie_proxy（剥前缀）共用。
@@ -766,6 +767,12 @@ async def gemini_fake_stream_generator(
         if not candidates and getattr(raw_gemini_response, "text", None) is not None:
             candidate_ends = [classify_generation_end("STOP", is_final=True)]
 
+        # 与非流式一致的有效性门槛：空 STOP（无正文/工具/图片）不得当作成功写亲和。
+        if not is_gemini_response_valid(raw_gemini_response) and not (
+                any(end.finish_reason == "content_filter" for end in candidate_ends)
+                or (prompt_end and prompt_end.finish_reason)):
+            raise GenerationEndError(classify_generation_end(None, is_final=True))
+
         _record_usage(raw_gemini_response, request_obj.model)
 
         openai_response_dict = convert_to_openai_format(
@@ -789,6 +796,10 @@ async def gemini_fake_stream_generator(
             openai_response_dict = _strip_input_relay_from_openai_dict(
                 openai_response_dict, input_relay_strip_tag)
         _prepend_prefill(openai_response_dict, prefill_text)
+        # 假流式：响应已通过有效性/终止原因检查，此刻才算上游成功，写会话亲和绑定。
+        decision = sa_affinity.take_pending()
+        if decision is not None:
+            await asyncio.to_thread(sa_affinity.write_decision, decision)
         convert_ms = int((request_log.now_mono() - convert_started) * 1000)
         _set_phase("sending_downstream")
         ctx.emit("phase", f"📤 [阶段] {ctx.request_id} 转换完成，开始向下游发送 SSE",

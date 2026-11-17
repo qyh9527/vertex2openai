@@ -775,6 +775,14 @@
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
+            <div class="flex items-center justify-between gap-3"><span class="text-sm">SA 会话亲和<span class="helpq" onclick="hlp(this,'h_sa_aff')">?</span></span><label class="switch"><input type="checkbox" id="sa_session_affinity"><span class="slider"></span></label></div>
+            <div id="h_sa_aff" class="helpbox">隐式缓存按 GCP project 隔离：多个服务账号轮询会让同一会话每轮冷启动。开启后按「全部 system + 首条 user」的内容指纹把会话钉在同一 project，1 小时滑动 TTL、最多 5000 条；只有上游成功且 prompt 达到该模型的缓存门槛（4096 / 6144 / 2048）才建立绑定。瞬时故障保留绑定，账号被删或额度熔断才重绑。只影响服务账号通道。</div>
+            <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-neutral-500">
+              <span id="affinity-stats">绑定 —</span>
+              <button type="button" class="text-xs text-neutral-500 underline" onclick="clearAffinity()">清空全部绑定</button>
+            </div>
+          </div>
+          <div>
             <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
             <div id="h_ss" class="helpbox">在每条回复<b>正文末尾</b>附一个可折叠块，列出该回复各安全分类的概率与严重度评分（Hate Speech / Dangerous Content / Sexually Explicit / Harassment / Jailbreak）。用来判断内容离触发拦截还有多远。<br>前端若不渲染 HTML，会看到一段 <code>&lt;details&gt;</code> 原文，属正常。<br><b>Cookie 通道注意</b>：该通道平时下发 <code>OFF</code>（分类器整个关闭、上游不回传评分）。打开本开关后会改为下发 <code>BLOCK_NONE</code>——仍然<b>永不拦截</b>，只是让上游把评分算出来回传。不需要看评分就关掉，保持 <code>OFF</code>。</div>
           </div>
@@ -1624,7 +1632,8 @@ async function loadParams(){
     $('history_tool_template').value=JSON.stringify(s.history_tool_template,null,2);
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','anti_truncation_side_buffer_bytes','history_tool_mode','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_fake_only','anti_truncation_partial_args'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_fake_only','anti_truncation_partial_args','sa_session_affinity'].forEach(k=>setV(k,s[k]));
+    loadAffinity();
     const legacyTop=['fake_stream_only','non_vertex_only'].includes(s.top_input_injection_mode);
     if(legacyTop) setV('top_input_injection_mode','always');
     const randomValue=String(s.top_input_injection_random??'off').trim().toLowerCase();
@@ -1825,6 +1834,24 @@ function renderCaps(){
           : '该模型支持采样参数；留空即用模型默认。');
 }
 function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
+async function loadAffinity(){
+  const box=$('affinity-stats'); if(!box) return;
+  try{
+    const d=await (await fetch('/api/affinity')).json();
+    if(d.error){ box.textContent='读取失败'; return; }
+    const fmt=t=>t?new Date(t*1000).toLocaleString():'—';
+    box.textContent='绑定 '+(d.count||0)+' 条 / 上限 '+(d.capacity||0)+'；最近命中 '+fmt(d.last_hit_at)+'；最近新建 '+fmt(d.last_created_at);
+  }catch(e){ box.textContent='读取失败'; }
+}
+async function clearAffinity(){
+  if(!confirm('清空全部 SA 会话亲和绑定？清空后会话会重新按轮询/随机选号。')) return;
+  try{
+    const r=await fetch('/api/affinity/clear',{method:'POST'});
+    const d=await r.json();
+    if(r.ok){ toast('✅ 已清空 '+(d.removed||0)+' 条绑定'); loadAffinity(); }
+    else toast('❌ '+(d.error||'清空失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
 function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
 // 说明折叠：点 ⓘ 展开/收起对应的说明块
 function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
@@ -1858,6 +1885,7 @@ async function saveSettings(){
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
+    sa_session_affinity:$('sa_session_affinity').checked,
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,

@@ -32,6 +32,7 @@ from api_helpers import create_openai_error_response
 from http_options import get_http_options, resolve_paygo_bundle
 from runtime_state import app_state
 import request_log
+import sa_affinity
 import config as app_config
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -162,7 +163,12 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
     channel_name = "vertex"   # 每通道独立重试 / 熔断统计用
 
     def _resolve_client(self, fastapi_request: Request, base_model_name: str, settings: dict) -> dict:
-        project_id, location, sa_json = app_state.get_current_sa_account()
+        preferred_project = sa_affinity.preferred_project()
+        if preferred_project:
+            account = app_state.get_current_sa_account(preferred_project=preferred_project)
+        else:
+            account = app_state.get_current_sa_account()
+        project_id, location, sa_json = account
         if not sa_json:
             error_msg = ("未配置服务账号凭证：请在控制台「通道与凭证」→ 服务账号 页粘贴 SA JSON，"
                          "或设置环境变量 VERTEX_SA_JSON / VERTEX_SA_FILE。")
@@ -203,6 +209,9 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
             "priority_paygo": bool(headers),
             "fallback_model": None,              # 无钉定失败回退需求
             "fallback_client_factory": None,
+            # 会话亲和：待写入的绑定决策（上游成功后才由 chat_completions/BudgetModels 落库）。
+            "sa_affinity": sa_affinity.build_decision(
+                _effective_project(sa_json, project_id), base_model_name),
         }
 
     async def chat_completions(self, request_obj, fastapi_request: Request,

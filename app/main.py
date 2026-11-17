@@ -519,6 +519,30 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     return JSONResponse(content=updated)
 
 
+@app.get("/api/affinity")
+def get_affinity_api(_auth: bool = Depends(require_auth)):
+    """SA 会话亲和：当前绑定数、最近命中/新建时间。"""
+    import sa_affinity
+    try:
+        data = sa_affinity.stats()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"读取会话亲和状态失败：{exc}"})
+    data["enabled"] = bool(app_state.get_setting("sa_session_affinity", False))
+    return JSONResponse(content=data)
+
+
+@app.post("/api/affinity/clear")
+def clear_affinity_api(_auth: bool = Depends(require_auth)):
+    """清空全部 SA 会话亲和绑定。"""
+    import sa_affinity
+    try:
+        removed = sa_affinity.clear_all()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"清空会话亲和失败：{exc}"})
+    print(f"🧹 [会话亲和] 已清空 {removed} 条绑定。")
+    return JSONResponse(content={"ok": True, "removed": removed})
+
+
 @app.get("/api/capabilities")
 async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     try:

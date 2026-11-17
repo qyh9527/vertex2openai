@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import google.genai
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google import genai
 
 from models import OpenAIRequest
@@ -36,6 +36,7 @@ import model_capabilities as mc
 import request_log
 from conversion_report import ConversionReport
 from runtime_state import app_state
+import sa_affinity
 from failover import UpstreamUnstartedError
 from anti_truncation import (is_enabled_for_request, inject_request, get_enabled_field,
                             enable_stream_partial_args, partial_args_enabled,
@@ -444,6 +445,8 @@ class ExpressSDKUpstream(BaseUpstream):
             resolved = self._resolve_client(fastapi_request, base_model_name, _inj_settings)
         if "error" in resolved:
             return resolved["error"]
+        # SA 会话亲和：登记待写入决策（上游成功后才落库）；非 SA 通道为空操作。
+        sa_affinity.begin_commit(resolved.get("sa_affinity"))
         client_to_use = resolved["client"]
         model_to_call = resolved["model_to_call"]
         priority_paygo = resolved["priority_paygo"]
@@ -662,7 +665,7 @@ class ExpressSDKUpstream(BaseUpstream):
             _shape.append(f"请求消息数={len(request_obj.messages)}（末条 role={request_obj.messages[-1].role if request_obj.messages else '无'}）")
             print(f"🔎 [出站调试] {channel_display_name(self.channel_name)} 请求形状：{'；'.join(_shape)}")
 
-        return await execute_gemini_call(
+        result = await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text, failover_mode=failover_mode,
             # fake- 前缀请求：强制假流式输出（该请求级别，不影响其它模型）
@@ -677,3 +680,11 @@ class ExpressSDKUpstream(BaseUpstream):
             input_relay_strip_tag=_relay_strip_tag,
             conversion_report=report,
         )
+        # 非流式请求：上游成功且最终响应有效后才写会话亲和绑定。
+        # 流式由 sa_budget（首个 chunk）与假流式生成器（有效性检查后）各自写入。
+        if not isinstance(result, StreamingResponse):
+            if not (isinstance(result, JSONResponse) and result.status_code >= 400):
+                decision = sa_affinity.take_pending()
+                if decision is not None:
+                    await asyncio.to_thread(sa_affinity.write_decision, decision)
+        return result

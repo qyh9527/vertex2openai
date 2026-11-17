@@ -11,6 +11,8 @@ from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from contextlib import contextmanager
 
+import sa_affinity
+
 LIMIT = 295_000_000_000  # 纳美元，避免浮点累计误差
 _pending_cleanup = set()
 
@@ -238,6 +240,8 @@ class BudgetModels:
         prompt = getattr(result, "total_tokens", None)
         if not isinstance(prompt, int) or prompt < 0:
             raise BudgetError("上游未返回可靠输入 token 数，已停止 SA 调用。")
+        # SA 会话亲和：记录 countTokens 的真实输入量（媒体保守预留值只用于预算）。
+        sa_affinity.note_prompt_tokens(prompt)
         output = config.get("max_output_tokens") or 65536
         candidates = config.get("candidate_count") or 1
         # 媒体计数可能低估：预留整个模型上下文，而非把估算视为精确上限。
@@ -348,8 +352,15 @@ class BudgetModels:
             last = None
             received = False
             search_queries = 0
+            affinity_committed = False
             try:
                 async for chunk in stream:
+                    # 首个 chunk 到达才算上游真正接受流式请求；此前迭代器可能尚未发请求。
+                    if not affinity_committed:
+                        affinity_committed = True
+                        decision = sa_affinity.take_pending()
+                        if decision is not None:
+                            await asyncio.to_thread(sa_affinity.write_decision, decision)
                     received = True
                     search_queries = max(search_queries, self._search_queries(chunk))
                     if getattr(chunk, "usage_metadata", None) is not None:

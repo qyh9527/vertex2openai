@@ -56,6 +56,39 @@ def _sa_env_fallback() -> list:
     }]
 
 
+def _sa_account_project(account: dict) -> str:
+    """SA 账号的生效 project（账号配置优先，空则取 SA JSON 自带 project_id）。"""
+    project = str(account.get("project_id") or "").strip()
+    if project:
+        return project
+    try:
+        return str(json.loads(account.get("sa_json") or "{}").get("project_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _sa_budget_available(account: dict, sa_budget_module) -> bool:
+    """该账号额度账本可用（已确认历史花费、未熔断）。"""
+    try:
+        budget = sa_budget_module.status(
+            sa_budget_module.credential_id(account.get("sa_json", "")))
+        return bool(budget["initialized"] and not budget["blocked"])
+    except Exception:
+        return False
+
+
+def _sa_credential_cooling(account: dict) -> bool:
+    """该账号是否处于候选级熔断冷却（瞬时故障，不应重绑亲和）。"""
+    try:
+        import hashlib
+        from failover import breaker
+        credential = hashlib.sha256(
+            str(account.get("sa_json", "")).encode("utf-8")).hexdigest()[:12]
+        return breaker.is_cooling(("vertex", credential))
+    except Exception:
+        return False
+
+
 class AppState:
     """运行态管理器（内存优先 + 写时落盘）。
 
@@ -374,28 +407,45 @@ class AppState:
         print(f"🔧 [状态管理器] 已保存 {len(clean)} 个自定义模型。")
         return clean
 
-    def get_current_sa_account(self) -> tuple:
+    def get_current_sa_account(self, preferred_project=None) -> tuple:
         """取本次请求使用的服务账号（请求级快照，同 Cookie 账号机制）。
 
         返回 (project_id, location, sa_json)。多账号按 roundrobin 设置轮询或随机选择，
         同一请求内（含重试、流式、failover 重发）复用同一账号；无任何账号返回 (None, None, None)。
+
+        preferred_project：SA 会话亲和偏好的 GCP project（默认 None = 行为不变）。
+        绑定 project 内有可用账号时只在该 project 内选；仅当绑定 project 的账号全部
+        额度不可用/已删除时退回全量候选（结构性重绑由路由层判定）。默认参数保证既有
+        调用方零改动。
         """
         account = _current_sa_account.get()
         if account is None:
             accounts = self.get_sa_accounts()
             if accounts:
                 import sa_budget
-                eligible = []
-                for candidate in accounts:
-                    try:
-                        budget = sa_budget.status(sa_budget.credential_id(candidate.get("sa_json", "")))
-                        if budget["initialized"] and not budget["blocked"]:
-                            eligible.append(candidate)
-                    except (ValueError, OSError, sa_budget.BudgetError):
-                        pass
-                # 全部不可用时仍保留候选，让上游明确返回额度错误而非“未配置”。
-                if eligible:
-                    accounts = eligible
+                eligible = [candidate for candidate in accounts
+                            if _sa_budget_available(candidate, sa_budget)]
+                pool = eligible or accounts
+                if preferred_project:
+                    preferred = [candidate for candidate in accounts
+                                 if _sa_account_project(candidate) == preferred_project]
+                    if preferred:
+                        preferred_eligible = [
+                            candidate for candidate in eligible
+                            if _sa_account_project(candidate) == preferred_project
+                            and not _sa_credential_cooling(candidate)]
+                        if preferred_eligible:
+                            pool = preferred_eligible
+                        else:
+                            # 瞬时故障（候选熔断冷却）：本请求改用其它可用 project，绑定保留。
+                            others = [
+                                candidate for candidate in eligible
+                                if _sa_account_project(candidate) != preferred_project
+                                and not _sa_credential_cooling(candidate)]
+                            if others:
+                                pool = others
+                    # 绑定 project 已无账号/全部额度不可用：保持常规候选（结构重绑）。
+                accounts = pool
             if not accounts:
                 return (None, None, None)
             if len(accounts) == 1:
@@ -412,6 +462,18 @@ class AppState:
                 print(f"🔑 [账号选择] 多服务账号轮询/随机选中第 {idx + 1}/{len(accounts)} 份。")
             _current_sa_account.set(account)
         return (account.get("project_id", ""), account.get("location", "global"), account.get("sa_json", ""))
+
+    def sa_project_availability(self, project_id) -> str:
+        """绑定 project 的结构可用性：eligible / blocked / absent（会话亲和分类用）。"""
+        project = str(project_id or "").strip()
+        if not project:
+            return "absent"
+        accounts = [a for a in self.get_sa_accounts()
+                    if _sa_account_project(a) == project]
+        if not accounts:
+            return "absent"
+        import sa_budget
+        return "eligible" if any(_sa_budget_available(a, sa_budget) for a in accounts) else "blocked"
 
     def current_sa_credential_id(self) -> str:
         """本次请求选中的服务账号的脱敏标识（熔断候选粒度用，进阶报告 P0-2）。

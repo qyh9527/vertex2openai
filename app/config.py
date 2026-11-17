@@ -123,6 +123,10 @@ DEFAULT_SETTINGS = {
     "hybrid_channels": ["express", "cookie"],
     "hybrid_dispatch_mode": "priority",
     "channel_retry_overrides": {"express": None, "cookie": None, "vertex": None},
+    # ===== SA 会话亲和（默认关闭）=====
+    # 开启后，同一会话（system + 首条 user 的内容指纹）尽量钉在同一 GCP project，
+    # 保住上游隐式缓存；只影响 SA 账号选择，不涉及 Express Key / Cookie 账号。
+    "sa_session_affinity": False,
     # ===== PayGo 流量等级（ST-Vertex-PayGo 方案融合，作用于标准 Vertex 端点类通道）=====
     # Express 与 服务账号 两通道打同一组官方"按量共享容量"层级头（cookie 通道走 batchGraphql 不适用）：
     #   auto      = 保持现状：钉定到 global 时自动打 priority 头

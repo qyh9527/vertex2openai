@@ -23,6 +23,7 @@ from failover import breaker, UpstreamUnstartedError
 import config as app_config
 import request_log
 import raw_mode as raw_mode_mod
+import sa_affinity
 
 router = APIRouter()
 
@@ -314,6 +315,18 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 "upstream_error"),
         )
 
+    # SA 会话亲和：只在本次可能走服务账号时计算指纹/查绑定（原始请求、提示词改写之前）。
+    # 指纹与 ContextVar 留在请求任务；SQLite 查询放到线程，避免阻塞事件循环。
+    if "vertex" in channels:
+        sa_affinity.reset_request()
+        if sa_affinity.enabled():
+            session_id = await asyncio.to_thread(
+                sa_affinity.session_id_for_messages, list(request.messages or []))
+            sa_affinity.set_session_id(session_id)
+            if session_id:
+                bound, age = await asyncio.to_thread(sa_affinity.lookup_binding, session_id)
+                sa_affinity.apply_lookup(session_id, bound, age)
+
     last_status, last_msg = 500, "上游通道全部不可用"
     attempts: list = []   # [{channel, status, message, category, upstream?}]（全部失败聚合用）
     for idx, channel in enumerate(channels):
@@ -330,10 +343,18 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         # 候选粒度：本次请求在该通道选中的凭证（脱敏 id；express 留空=通道粒度）
         if channel == "vertex":
             # 在请求任务设置快照；线程仅进行数据库访问，避免 ContextVar 写入丢失。
-            account = await asyncio.to_thread(app_state.get_current_sa_account)
+            preferred_project = sa_affinity.preferred_project()
+            if preferred_project:
+                account = await asyncio.to_thread(
+                    app_state.get_current_sa_account, preferred_project)
+            else:
+                account = await asyncio.to_thread(app_state.get_current_sa_account)
             from runtime_state import _current_sa_account
             if account[2]:
                 _current_sa_account.set(dict(zip(("project_id", "location", "sa_json"), account)))
+                selected_project = sa_affinity.effective_project(account[0], account[2])
+                state = await _sa_affinity_state(selected_project)
+                sa_affinity.note_selection(selected_project, state)
             cred = await asyncio.to_thread(_current_credential_id, channel)
         else:
             cred = _current_credential_id(channel)
@@ -460,6 +481,24 @@ async def _dispatch(channels: list, request: OpenAIRequest,
 
     # 全部通道尝试完毕仍失败：聚合每个通道的具体错误（P0-6）
     return _all_failed_response(attempts, last_status, last_msg)
+
+
+async def _sa_affinity_state(selected_project: str) -> str:
+    """本次账号选择相对会话绑定的状态：new / hit / transient / structural。
+
+    绑定 project 仍有额度可用 → 本次只是熔断冷却等瞬时故障（binding 保留）；
+    账号被删或全部额度熔断/赠金到期 → 结构性不可用（成功后重绑）。
+    """
+    selection = sa_affinity.current_selection()
+    if not selection or not selection.get("session_id"):
+        return "new"
+    bound = selection.get("bound_project")
+    if not bound:
+        return "new"
+    if bound == selected_project:
+        return "hit"
+    availability = await asyncio.to_thread(app_state.sa_project_availability, bound)
+    return "transient" if availability == "eligible" else "structural"
 
 
 def _all_failed_response(attempts: list, last_status: int, last_msg: str) -> JSONResponse:
