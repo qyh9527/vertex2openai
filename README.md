@@ -33,6 +33,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   `/<channel>/v1`，其中三个简短渠道名为 `express`（Express API Key）、`cookie`（Cookie 直连）、`vertex`（服务账号 SA）。
   例如 `http://127.0.0.1:8050/vertex/v1`；该前缀下同时提供 `/models` 与 `/chat/completions`。
   不使用前缀时，`/v1` 仍完全按控制台当前通道策略执行。
+- **raw 纯净入口**：`POST /raw/v1/chat/completions` 与 `GET /raw/v1/models`，固定走服务账号（Vertex SA），**只做 OpenAI ↔ Gemini 协议转换**，跳过全部提示词改写。保留 `fake-` 假流式、`-search` 搜索后缀、工具调用签名哨兵、Gemini 3.x 轮次兜底、schema 校验、`BLOCK_NONE` 安全阈值与完整的 SA 额度保护。详见下方「raw 纯净入口」。
 - **管理控制台（浅色风格，静态 HTML/JS，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
   - 标准模式 / Cookie 直连 / 服务账号 / **混合自动（三通道故障转移）** 在线一键切换。
@@ -529,6 +530,29 @@ Express / 服务账号的 `fake-` 假流式会输出生命周期诊断日志，�
 **常见错误**：
 - `403 Permission 'aiplatform.endpoints.predict' denied` → 服务账号缺角色或项目没开计费（见上）。
 - `401 Unauthorized` / token 类错误 → SA Key 无效或已删除，重新生成。
+
+---
+
+## raw 纯净入口（只做协议转换）
+
+`POST /raw/v1/chat/completions`、`GET /raw/v1/models`。基址直接设为 `https://你的域名/raw/v1` 即可，鉴权仍是 `Authorization: Bearer <API_KEY>`。
+
+- **固定服务账号通道**：不读控制台当前策略、不参与 hybrid 故障转移；与 `/vertex/v1` 共享熔断键与 SA 账号轮询序列。未配置 SA 凭证时返回 503，并明确说明 raw 只绑定 SA。
+- **跳过全部提示词改写**：顶部注入、输入搬运（含输出侧已生成块剥离）、历史工具承载/字段模板、控制台 system/prefill 注入、预填充兼容（预填充文本不再拼回输出开头）、防截断合成工具（请求体启用字段一律忽略）、控制台生成参数（默认温度/top_p/max_tokens/思考档位/生图尺寸与比例/生图 system_instruction/采样策略）与模型专属参数。生成参数一律使用代码内置默认。
+- **保留**：`fake-` 假流式、`-search` 搜索后缀、`[PAY]` 旧前缀剥离、工具调用签名哨兵、Gemini 3.x 轮次兜底（末尾 assistant 作为 model 轮次下发时自动补推动语）、schema 校验（非法工具 parameters 仍 400）、硬编码 `BLOCK_NONE` 安全阈值、生图模型的 4 项图像分类 OFF、Client 复用/重试/熔断/日志/PayGo 层级头，以及完整 SA 额度保护（countTokens 精算 + 预留/结算 + 日期熔断 + 未覆盖 SKU 拒派）。
+- **日志**：请求策略标记为 `raw`；`request_start` 结构化字段 `raw_skipped` 列出本次已开启但被忽略的功能键，并逐项打印 `⏭️ [raw 入口] … 未应用于本请求`。
+
+需要预填充回拼或任意提示词改写时，请继续使用 `/vertex/v1` 或主入口。
+
+## SA 会话亲和（保住隐式缓存）
+
+上游隐式缓存**按 GCP project 隔离**（永不跨项目共享）；多个服务账号轮询/随机选号会让同一会话每轮落到不同 project，缓存每轮 cold start。控制台「开关 & 预填充」中的 **SA 会话亲和**（默认关闭）把同一会话钉在同一 project，只影响服务账号账号选择，不涉及 Express Key / Cookie 账号，对所有走 SA 的路径生效（主入口 hybrid 切 SA、`/vertex/v1`、`/raw/v1`）。
+
+- **会话身份**：只用内容指纹——全部 `role=system` 消息 + 直到首条 `role=user` 为止的消息（含首条 user），规范编码（长度前缀、对象键排序、类型标记）后 SHA-256，取前 16 字节（32 hex）。指纹在提示词改写之前的原始请求上计算，因此开启顶部注入等改写后同一会话仍然稳定；无 system 且无 user 时指纹不稳定，不建亲和。
+- **绑定模型**：绑定到 **project**（不绑具体 SA JSON）；独立 SQLite `STATE_DIR/sa_affinity.sqlite3`；TTL **1 小时、命中即续期（滑动）**；最多 **5000 条**，超出按 `last_seen` 淘汰最旧。
+- **选举与写入**：新会话沿用「多 Key 轮询」开关决定轮询或随机；**上游成功后才写绑定**，失败的选择永不被钉住。只有本次真实 prompt token 达到模型缓存门槛才建绑定：6144（`gemini-3.0-flash-preview` / `3.1-pro-preview` / `3.7-flash` / `3.8-flash`）、2048（Gemini 2 家族）、其余 Gemini 3/4 为 4096。token 数直接复用 SA 额度保护里的 countTokens 结果，不额外调用；countTokens 失败则不建亲和，正常派发。
+- **不可用处理**：瞬时故障（熔断冷却、单次失败、临时限流）本请求改用其他可用 project，**绑定保留**；结构性不可用（SA 被删、该 project 全部账号额度熔断/赠金日期到期）成功响应后重绑，且不受缓存门槛限制。
+- **控制台**：显示当前绑定数、最近命中/新建时间，并提供「清空全部绑定」。对应接口 `GET /api/affinity`、`POST /api/affinity/clear`。
 
 ---
 
