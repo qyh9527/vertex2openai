@@ -386,6 +386,14 @@
       <p class="text-xs text-neutral-400 mt-3 leading-relaxed">地址按当前页面访问地址自动生成；本机通过 localhost 访问时会显示为 127.0.0.1。使用三渠道混合负载时，请返回「混合自动」配置参与通道与随机调度。</p>
     </div>
     <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+        <div class="lbl mb-0">raw 纯净入口</div>
+        <span class="pill pill-accent" style="text-transform:none">只做协议转换</span>
+      </div>
+      <p class="text-xs text-neutral-500 leading-relaxed mb-3">固定走服务账号通道，跳过全部提示词改写：顶部注入、输入搬运、历史工具承载、控制台 system/prefill 注入、预填充兼容、防截断合成工具、控制台生成参数与模型专属参数都不应用。保留 <code>fake-</code> 假流式、<code>-search</code> 搜索后缀、工具签名哨兵、轮次兜底、schema 校验与完整的 SA 额度保护。</p>
+      <div id="raw-route-list" class="space-y-2"></div>
+    </div>
+    <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
         <div class="lbl mb-0">上游调用通道</div>
         <span class="pill pill-accent" id="chan-status" style="text-transform:none">—</span>
@@ -923,6 +931,25 @@ function renderChannelRoutes(){
     btn.addEventListener('click',()=>copyChannelRoute(url,btn));
     row.append(info,btn); box.appendChild(row);
   });
+  renderRawRoute(origin);
+}
+function renderRawRoute(origin){
+  const box=$('raw-route-list'); if(!box) return;
+  origin=origin||channelRouteOrigin(); box.innerHTML='';
+  const url=origin+'/raw/v1';
+  const row=document.createElement('div');
+  row.className='flex flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 p-2.5';
+  const info=document.createElement('div');
+  info.className='flex min-w-0 flex-1 items-center gap-2';
+  const name=document.createElement('span');
+  name.className='shrink-0 text-xs font-semibold text-neutral-700'; name.textContent='raw 入口';
+  const code=document.createElement('code');
+  code.className='log min-w-0 break-all text-xs text-neutral-600'; code.textContent=url;
+  info.append(name,code);
+  const btn=document.createElement('button');
+  btn.className='btn-ghost shrink-0 px-3 py-1.5 text-xs'; btn.type='button'; btn.textContent='复制地址';
+  btn.addEventListener('click',()=>copyChannelRoute(url,btn));
+  row.append(info,btn); box.appendChild(row);
 }
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};

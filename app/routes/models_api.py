@@ -68,6 +68,12 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     return await _list_models()
 
 
+@router.get("/raw/v1/models")
+async def list_models_for_raw(fastapi_request: Request, api_key: str = Depends(get_api_key)):
+    """raw 纯净入口的模型列表：与主入口同一份列表（含 fake- 变体）。"""
+    return await _list_models()
+
+
 @router.get("/{channel}/v1/models")
 async def list_models_for_channel(channel: str, fastapi_request: Request,
                                   api_key: str = Depends(get_api_key)):

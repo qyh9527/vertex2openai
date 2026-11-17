@@ -206,7 +206,7 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         }
 
     async def chat_completions(self, request_obj, fastapi_request: Request,
-                               failover_mode: bool = False):
+                               failover_mode: bool = False, raw_mode: bool = False):
         # [PAY] 旧前缀兼容：剥掉后走本通道（旧配置模型名不改即用上服务账号通道）
         model = request_obj.model
         if isinstance(model, str) and model.startswith("[PAY]"):
@@ -214,4 +214,7 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
             if stripped.startswith(" "):
                 stripped = stripped[1:]
             request_obj = request_obj.model_copy(update={"model": stripped})
-        return await super().chat_completions(request_obj, fastapi_request, failover_mode=failover_mode)
+        parent_kwargs = {"failover_mode": failover_mode}
+        if raw_mode:
+            parent_kwargs["raw_mode"] = True
+        return await super().chat_completions(request_obj, fastapi_request, **parent_kwargs)

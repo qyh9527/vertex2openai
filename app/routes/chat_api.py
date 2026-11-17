@@ -22,6 +22,7 @@ import outcome as outcome_mod
 from failover import breaker, UpstreamUnstartedError
 import config as app_config
 import request_log
+import raw_mode as raw_mode_mod
 
 router = APIRouter()
 
@@ -298,7 +299,8 @@ def _chunk_has_effective_output(chunk: str) -> bool:
 
 
 async def _dispatch(channels: list, request: OpenAIRequest,
-                    fastapi_request: Request, failover_mode: bool):
+                    fastapi_request: Request, failover_mode: bool,
+                    raw_mode: bool = False):
     """按通道顺序尝试，第一个成功即返回；失败且可切换则依次兜底。
 
     P0-6：每个已尝试通道的名称/状态/错误摘要都记进 attempts；全部失败时聚合进
@@ -336,8 +338,10 @@ async def _dispatch(channels: list, request: OpenAIRequest,
         else:
             cred = _current_credential_id(channel)
         try:
-            resp = await upstream.chat_completions(
-                request, fastapi_request, failover_mode=failover_mode)
+            upstream_kwargs = {"failover_mode": failover_mode}
+            if raw_mode:
+                upstream_kwargs["raw_mode"] = True
+            resp = await upstream.chat_completions(request, fastapi_request, **upstream_kwargs)
 
             if isinstance(resp, StreamingResponse):
                 if failover_mode:
@@ -627,12 +631,30 @@ def _request_mode(request: OpenAIRequest) -> str:
 
 
 async def _chat_completions_with_strategy(fastapi_request: Request, request: OpenAIRequest,
-                                          strategy: str):
+                                          strategy: str, raw_mode: bool = False):
     """按指定策略执行一次聊天请求；显式渠道路径传入单渠道策略。"""
+    # raw 纯净入口：先统计「已开启但被忽略」的提示词功能，写进 request_start 结构化字段。
+    raw_skipped = raw_mode_mod.detect_skipped_features(request) if raw_mode else []
     # 一个客户端请求 = 一个 request_id（贯穿重试与故障转移）；早于通道预检，预检日志也能归组
-    ctx = request_log.begin_request(request.model, _request_mode(request), strategy)
+    ctx = request_log.begin_request(request.model, _request_mode(request), strategy,
+                                    raw_skipped=raw_skipped or None)
+    if raw_mode:
+        # 必须在 begin_request 之后：logger 从 REQUEST_CTX 取 request_id 归组。
+        raw_mode_mod.log_skipped_features(raw_skipped)
     try:
-        order = _available_channels(_channel_order(strategy))
+        if raw_mode:
+            # raw 固定服务账号通道，不读控制台策略、不进 hybrid 故障转移。
+            order = ["vertex"] if app_state.get_sa_accounts() else []
+            if not order:
+                return request_log.track_response(ctx, JSONResponse(
+                    status_code=503,
+                    content=create_openai_error_response(
+                        503, "raw 入口只绑定服务账号（Vertex SA）通道：请先在控制台「通道与凭证」→"
+                             " 服务账号页配置 SA JSON 凭证。",
+                        "upstream_error"),
+                ))
+        else:
+            order = _available_channels(_channel_order(strategy))
         if not order:
             return request_log.track_response(ctx, JSONResponse(
                 status_code=503,
@@ -644,7 +666,8 @@ async def _chat_completions_with_strategy(fastapi_request: Request, request: Ope
             ))
         try:
             return request_log.track_response(ctx, await _dispatch(
-                order, request, fastapi_request, failover_mode=(strategy == "hybrid")))
+                order, request, fastapi_request, failover_mode=(strategy == "hybrid"),
+                raw_mode=raw_mode))
         except Exception as e:
             explicit_category = _explicit_exception_category(e)
             if explicit_category is not None:
@@ -682,6 +705,19 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     """
     return await _chat_completions_with_strategy(
         fastapi_request, request, app_state.get_channel_strategy())
+
+
+@router.post("/raw/v1/chat/completions")
+async def raw_chat_completions(fastapi_request: Request, request: OpenAIRequest,
+                               api_key: str = Depends(get_api_key)):
+    """raw 纯净入口：只做 OpenAI ↔ Gemini 协议转换，跳过全部提示词改写。
+
+    固定走服务账号（Vertex SA）通道，不读控制台当前策略、不触发 hybrid 故障转移；
+    保留 fake- 假流式、-search 搜索后缀、工具签名哨兵、轮次兜底、schema 校验、
+    BLOCK_NONE 安全阈值与完整的 SA 额度保护。路由必须注册在 `/{channel}` 之前。
+    """
+    return await _chat_completions_with_strategy(
+        fastapi_request, request, raw_mode_mod.RAW_STRATEGY, raw_mode=True)
 
 
 @router.post("/{channel}/v1/chat/completions")

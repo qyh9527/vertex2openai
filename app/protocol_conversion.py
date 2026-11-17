@@ -178,8 +178,19 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
         else:
             code = 500
     return code, msg
-def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str, Any]:
+def create_generation_config(request: OpenAIRequest, reporter=None,
+                             settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """构建 generationConfig。
+
+    settings：调用方显式传入的生效设置（raw 入口传内置默认副本，跳过全局与模型覆盖）；
+    缺省 None = 读取控制台的生效设置。
+    """
     config: Dict[str, Any] = {}
+    # 普通入口保持旧行为：设置由本函数按 request.model 读取（含 -search 等公开模型名，
+    # 兼容按公开模型名保存的覆盖）；raw 入口显式传入内置默认设置。
+    settings_provided = settings is not None
+    if settings is None:
+        settings = app_state.get_effective_settings(request.model)
     
     system_texts = []
     for msg in request.messages:
@@ -199,8 +210,13 @@ def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str,
     if system_texts:
         # 生图判定统一走能力档案（"nano-banana" 家族名字里不带 image，裸 "image" in 会漏判）
         _is_image_name = mc.get_profile(request.model)["is_image"]
-        _allow_sys = (not _is_image_name) or bool(
-            app_state.get_setting("image_system_instruction", False))
+        if settings_provided:
+            _image_system_instruction = bool(settings.get("image_system_instruction", False))
+        else:
+            # 旧行为：该键只读全局值，不叠加模型覆盖。
+            _image_system_instruction = bool(
+                app_state.get_setting("image_system_instruction", False))
+        _allow_sys = (not _is_image_name) or _image_system_instruction
         if _allow_sys:
             config["system_instruction"] = "\n".join(system_texts)
     
@@ -285,8 +301,7 @@ def create_generation_config(request: OpenAIRequest, reporter=None) -> Dict[str,
         if function_declarations:
             tools_list.append({"function_declarations": function_declarations})
 
-    # 读取控制台设置与模型能力档案（优先级：单次请求 > 模型专属 > 全局 > 内置默认）
-    settings = app_state.get_effective_settings(request.model)
+    # 模型能力档案按版本自动判定；settings 已在函数入口确定（raw 入口为内置默认副本）。
     # 控制台的「采样参数处理」可覆盖版本自动判定（新模型版本号更小却已废弃采样时用）
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     is_image_model = profile["is_image"]

@@ -158,16 +158,23 @@ def current() -> Optional[RequestLogContext]:
 
 
 def begin_request(client_model: Optional[str], mode: Optional[str],
-                  strategy: Optional[str] = None) -> RequestLogContext:
-    """路由入口调用：分配 request_id、设置 ContextVar 并发 request_start。"""
+                  strategy: Optional[str] = None,
+                  raw_skipped: Optional[list] = None) -> RequestLogContext:
+    """路由入口调用：分配 request_id、设置 ContextVar 并发 request_start。
+
+    raw_skipped：raw 纯净入口专用，列出本次已开启但被忽略的提示词功能键。
+    """
     ctx = RequestLogContext(client_model, mode, strategy)
     REQUEST_CTX.set(ctx)
     parts = [f"📥 [请求开始] {ctx.request_id}", f"模型 {client_model}",
              _MODE_LABELS.get(mode, str(mode))]
     if strategy:
         parts.append(f"策略 {strategy}")
+    fields = {}
+    if raw_skipped:
+        fields["raw_skipped"] = list(raw_skipped)
     ctx.emit("request_start", " | ".join(parts), "INFO", client_model=client_model, mode=mode,
-             strategy=strategy, phase="received", status="in_progress")
+             strategy=strategy, phase="received", status="in_progress", **fields)
     return ctx
 
 

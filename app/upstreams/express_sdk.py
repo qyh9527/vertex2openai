@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import re
 import threading
 from functools import partial
@@ -217,10 +218,13 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
                            prefill_active: bool = False,
-                           channel_name: Optional[str] = None, reporter=None) -> dict | None:
+                           channel_name: Optional[str] = None, reporter=None,
+                           settings: dict | None = None) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。
-    生图模型同样下发 thinking_level（默认 HIGH，跟随上游 2026-10-13 决策）。"""
-    settings = app_state.get_effective_settings(base_model_name)
+    生图模型同样下发 thinking_level（默认 HIGH，跟随上游 2026-10-13 决策）。
+    settings：调用方显式传入的生效设置（raw 入口传内置默认副本）；None = 读取控制台设置。"""
+    if settings is None:
+        settings = app_state.get_effective_settings(base_model_name)
     t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active,
                             reporter=reporter)
     if t.get("mode") is None:
@@ -397,7 +401,7 @@ class ExpressSDKUpstream(BaseUpstream):
         }
 
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request,
-                               failover_mode: bool = False):
+                               failover_mode: bool = False, raw_mode: bool = False):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
@@ -415,7 +419,11 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        _history_active = history_tool_active(_inj_settings, is_fake)
+        # raw 入口：生成参数一律用内置默认（不读全局值/模型覆盖）；普通入口传 None，
+        # 保持原行为（create_generation_config/_build_thinking_config 各自按原模型名读取）。
+        _protocol_settings = copy.deepcopy(app_config.DEFAULT_SETTINGS) if raw_mode else None
+        # raw 入口跳过全部提示词层的跳写功能；历史工具/模板承载也不参与。
+        _history_active = False if raw_mode else history_tool_active(_inj_settings, is_fake)
         _template_active = _history_active and is_fake
         _template_fields = None
         if _history_active:
@@ -455,31 +463,35 @@ class ExpressSDKUpstream(BaseUpstream):
         is_image_model = profile["is_image"]
 
         _is_fake_stream = bool(request_obj.stream and (is_fake or is_image_model))
-        _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
-        _top_input_active = bool(
-            _top_input_config and top_input_injection_active_for_channel(
-                _top_input_config, self.channel_name, is_fake=is_fake))
-        if _top_input_config_note:
-            print(_top_input_config_note)
-        elif _top_input_config and not _top_input_active:
-            print("ℹ️ [顶部注入] 已设为仅对 fake- 请求注入，本次非 fake- 请求，未改写。")
+        _top_input_config, _top_input_active = None, False
+        _relay_config, _relay_is_active, _relay_strip_tag = None, False, None
+        if not raw_mode:
+            _top_input_config, _top_input_config_note = get_top_input_injection_config(_inj_settings)
+            _top_input_active = bool(
+                _top_input_config and top_input_injection_active_for_channel(
+                    _top_input_config, self.channel_name, is_fake=is_fake))
+            if _top_input_config_note:
+                print(_top_input_config_note)
+            elif _top_input_config and not _top_input_active:
+                print("ℹ️ [顶部注入] 已设为仅对 fake- 请求注入，本次非 fake- 请求，未改写。")
 
-        _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
-        _relay_is_active = bool(
-            not _template_active and _relay_config and input_relay_active_for_stream(
-                _relay_config, _is_fake_stream))
-        if _template_active and _relay_config:
-            print("⏭️ [输入搬运] 已跳过：字段模板承载接管本次请求（模板自带最新输入交接），"
-                  "原搬运配置保留，非 fake 或关闭历史承载后恢复生效。")
-        if _relay_config_note:
-            print(_relay_config_note)
-        if _relay_is_active:
-            _relayed_messages, _relay_notes = apply_input_relay(request_obj.messages, _relay_config)
-            for _relay_note in _relay_notes:
-                print(_relay_note)
-            if _relayed_messages is not request_obj.messages:
-                request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
-        _relay_strip_tag = (_relay_config.tag if _relay_is_active and _relay_config.strip_generated else None)
+            _relay_config, _relay_config_note = get_input_relay_config(_inj_settings)
+            _relay_is_active = bool(
+                not _template_active and _relay_config and input_relay_active_for_stream(
+                    _relay_config, _is_fake_stream))
+            if _template_active and _relay_config:
+                print("⏭️ [输入搬运] 已跳过：字段模板承载接管本次请求（模板自带最新输入交接），"
+                      "原搬运配置保留，非 fake 或关闭历史承载后恢复生效。")
+            if _relay_config_note:
+                print(_relay_config_note)
+            if _relay_is_active:
+                _relayed_messages, _relay_notes = apply_input_relay(request_obj.messages, _relay_config)
+                for _relay_note in _relay_notes:
+                    print(_relay_note)
+                if _relayed_messages is not request_obj.messages:
+                    request_obj = request_obj.model_copy(update={"messages": _relayed_messages})
+            _relay_strip_tag = (_relay_config.tag
+                                if _relay_is_active and _relay_config.strip_generated else None)
         if _history_active and not _template_active:
             try:
                 request_obj = carry_history(request_obj)
@@ -493,22 +505,25 @@ class ExpressSDKUpstream(BaseUpstream):
         # - 两者都会把预填充文本拼回输出开头（带去重）。
         prefill_text = ""
         prefill_active = False
-        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
-        # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
-        _injected, _inj_notes = apply_console_injection(
-            request_obj.messages,
-            system_text=_inj_settings.get("inject_system_instruction", ""),
-            prefill_text="" if _template_active else _inj_settings.get("inject_prefill", ""),
-            has_tools=bool(getattr(request_obj, "tools", None)),
-            is_image_model=is_image_model,
-            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
-        )
-        for _n in _inj_notes:
-            print(_n)
-        if _injected is not request_obj.messages:
-            request_obj = request_obj.model_copy(update={"messages": _injected})
+        if not raw_mode:
+            # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
+            # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
+            _injected, _inj_notes = apply_console_injection(
+                request_obj.messages,
+                system_text=_inj_settings.get("inject_system_instruction", ""),
+                prefill_text="" if _template_active else _inj_settings.get("inject_prefill", ""),
+                has_tools=bool(getattr(request_obj, "tools", None)),
+                is_image_model=is_image_model,
+                allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
+            )
+            for _n in _inj_notes:
+                print(_n)
+            if _injected is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": _injected})
 
-        _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
+        _prefill_mode = ("off" if raw_mode else
+                         app_state.get_setting("prefill_mode",
+                                               app_config.DEFAULT_SETTINGS["prefill_mode"]))
         if _template_active and _prefill_mode != "off":
             print("⏭️ [预填充兼容] 已跳过：字段模板承载接管本次请求（尾部 assistant 原文保留在上下文中），"
                   "原预填充模式保留，非 fake 或关闭历史承载后恢复生效。")
@@ -541,7 +556,7 @@ class ExpressSDKUpstream(BaseUpstream):
         synthetic_tool_name = None
         at_transport = "fake_stream" if request_obj.stream and is_fake else "stream" if request_obj.stream else "buffered"
         at_field = get_enabled_field()
-        if _template_active:
+        if not raw_mode and _template_active:
             if is_enabled_for_request(request_obj, {"value": at_field}):
                 log_integrity(status="skipped", transport=at_transport,
                               synthetic_seen=False)
@@ -555,7 +570,7 @@ class ExpressSDKUpstream(BaseUpstream):
             except ValueError as exc:
                 return JSONResponse(status_code=400, content=create_openai_error_response(
                     400, str(exc), "invalid_request_error"))
-        elif _history_active or is_enabled_for_request(request_obj, {"value": at_field}):
+        elif not raw_mode and (_history_active or is_enabled_for_request(request_obj, {"value": at_field})):
             if is_image_model:
                 log_integrity(status="skipped", transport=at_transport, synthetic_seen=False)
                 print(f"⛔ [防截断] 本次调用下游已启用（字段「{at_field}」=true），"
@@ -564,7 +579,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 request_obj, synthetic_tool_name = inject_request(request_obj)
                 print(f"✅ [防截断] 本次调用下游已启用（字段「{at_field}」=true）→ "
                       f"已注入合成传输工具 {synthetic_tool_name}，回答改走工具参数输出绕开截断。")
-        else:
+        elif not raw_mode:
             log_integrity(status="disabled", transport=at_transport, synthetic_seen=False)
             print(f"⛔ [防截断] 本次调用下游未启用（请求体无「{at_field}」字段或值非 true）→ "
                   "走普通文本生成，重提示词场景存在 max_output_tokens 截断风险。")
@@ -579,10 +594,12 @@ class ExpressSDKUpstream(BaseUpstream):
 
         report = ConversionReport(self.channel_name)
         report.inspect_request(request_obj)
-        gen_config_dict = create_generation_config(request_obj, reporter=report)
+        gen_config_dict = create_generation_config(request_obj, reporter=report,
+                                                   settings=_protocol_settings)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
                                                  prefill_active=prefill_active,
-                                                 channel_name=self.channel_name, reporter=report)
+                                                 channel_name=self.channel_name, reporter=report,
+                                                 settings=_protocol_settings)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
