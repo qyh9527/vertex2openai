@@ -684,10 +684,8 @@ class ExpressSDKUpstream(BaseUpstream):
             conversion_report=report,
         )
         # 非流式请求：上游成功且最终响应有效后才写会话亲和绑定。
-        # 流式由 sa_budget（首个 chunk）与假流式生成器（有效性检查后）各自写入。
+        # 真流式和假流式由对应生成器在校验终态后提交。
         if not isinstance(result, StreamingResponse):
             if not (isinstance(result, JSONResponse) and result.status_code >= 400):
-                decision = sa_affinity.take_pending()
-                if decision is not None:
-                    await asyncio.to_thread(sa_affinity.write_decision, decision)
+                await sa_affinity.commit_success()
         return result

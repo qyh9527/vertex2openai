@@ -446,15 +446,8 @@ class BudgetModels:
             last = None
             received = False
             search_queries = 0
-            affinity_committed = False
             try:
                 async for chunk in stream:
-                    # 首个 chunk 到达才算上游真正接受流式请求；此前迭代器可能尚未发请求。
-                    if not affinity_committed:
-                        affinity_committed = True
-                        decision = sa_affinity.take_pending()
-                        if decision is not None:
-                            await asyncio.to_thread(sa_affinity.write_decision, decision)
                     received = True
                     search_queries = max(search_queries, self._search_queries(chunk))
                     if getattr(chunk, "usage_metadata", None) is not None:

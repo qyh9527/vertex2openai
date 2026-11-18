@@ -1,4 +1,8 @@
 """SA 会话亲和测试：指纹稳定性 / TTL 滑动 / 容量淘汰 / 门槛 / 成功后才写 / 故障语义。"""
+import asyncio
+from contextlib import closing
+import sqlite3
+
 import pytest
 
 import sa_affinity
@@ -13,17 +17,24 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(sa_affinity, "_db_path",
                         lambda: tmp_path / "sa_affinity.sqlite3")
     monkeypatch.setattr(sa_affinity, "enabled", lambda: True)
-    sa_affinity._session_id.set(None)
-    sa_affinity._selection.set(None)
-    sa_affinity._pending.set(None)
+    sa_affinity.reset_request()
     yield
-    sa_affinity._session_id.set(None)
-    sa_affinity._selection.set(None)
-    sa_affinity._pending.set(None)
+    sa_affinity.reset_request()
 
 
 def _msgs(*roles, content="hi"):
     return [{"role": role, "content": content} for role in roles]
+
+
+def _seed(sid, project, credential="key"):
+    assert sa_affinity._write_decision({"session_id": sid, "project_id": project,
+                                        "credential_id": credential})
+    return sa_affinity._lookup(sid)[0]
+
+
+def _project(sid):
+    binding, _ = sa_affinity._lookup(sid)
+    return binding.project_id if binding else None
 
 
 class TestFingerprint:
@@ -59,36 +70,36 @@ class TestStorage:
     def test_ttl_expiry(self, monkeypatch):
         now = [1_000_000.0]
         monkeypatch.setattr(sa_affinity.time, "time", lambda: now[0])
-        sa_affinity._write("sid", "proj")
-        assert sa_affinity._lookup("sid")[0] == "proj"
+        _seed("sid", "proj")
+        assert _project("sid") == "proj"
         now[0] += sa_affinity.TTL_SECONDS + 1
-        assert sa_affinity._lookup("sid")[0] is None
+        assert _project("sid") is None
 
     def test_sliding_renewal(self, monkeypatch):
         now = [1_000_000.0]
         monkeypatch.setattr(sa_affinity.time, "time", lambda: now[0])
-        sa_affinity._write("sid", "proj")
+        _seed("sid", "proj")
         now[0] += sa_affinity.TTL_SECONDS - 10
-        assert sa_affinity._lookup("sid")[0] == "proj"
+        assert _project("sid") == "proj"
         now[0] += sa_affinity.TTL_SECONDS - 10   # 距上次访问 < TTL（距创建已 > TTL）
-        assert sa_affinity._lookup("sid")[0] == "proj"
+        assert _project("sid") == "proj"
 
     def test_capacity_evicts_oldest(self, monkeypatch):
         now = [1_000_000.0]
         monkeypatch.setattr(sa_affinity.time, "time", lambda: now[0])
         monkeypatch.setattr(sa_affinity, "MAX_BINDINGS", 2)
         for sid in ("a", "b", "c"):
-            sa_affinity._write(sid, "proj")
+            _seed(sid, "proj")
             now[0] += 1
-        assert sa_affinity._lookup("a")[0] is None
-        assert sa_affinity._lookup("b")[0] == "proj"
-        assert sa_affinity._lookup("c")[0] == "proj"
+        assert _project("a") is None
+        assert _project("b") == "proj"
+        assert _project("c") == "proj"
         assert sa_affinity.stats()["count"] == 2
 
     def test_clear_all(self, monkeypatch):
         monkeypatch.setattr(sa_affinity.time, "time", lambda: 1_000_000.0)
-        sa_affinity._write("a", "p1")
-        sa_affinity._write("b", "p2")
+        _seed("a", "p1")
+        _seed("b", "p2")
         assert sa_affinity.clear_all() == 2
         assert sa_affinity.stats()["count"] == 0
 
@@ -108,66 +119,49 @@ class TestThreshold:
             "projects/p/locations/global/publishers/google/models/gemini-3.8-flash") == 6144
 
 
-def _begin(state="new", project="proj", model="gemini-3.8-flash"):
-    sa_affinity.begin_commit({
-        "session_id": "sid", "project_id": project, "state": state, "model": model})
-    sa_affinity._selection.set({"session_id": "sid", "bound_project": None, "state": state})
+def _begin(project="proj", credential="key", previous=None):
+    sa_affinity.apply_lookup("sid", previous, 0)
+    sa_affinity.begin_commit(sa_affinity.build_decision(project, credential, "gemini-3.8-flash"))
 
 
 class TestCommit:
-    def test_new_below_threshold_not_written(self):
-        _begin("new")
-        sa_affinity.note_prompt_tokens(4095)
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] is None
+    @pytest.mark.parametrize("tokens,expected", [(4095, None), (6144, "proj"), (None, None)])
+    def test_only_new_bindings_require_count_tokens_threshold(self, tokens, expected):
+        _begin()
+        sa_affinity.note_prompt_tokens(tokens)
+        asyncio.run(sa_affinity.commit_success())
+        assert _project("sid") == expected
 
-    def test_new_at_threshold_written(self):
-        _begin("new")
-        sa_affinity.note_prompt_tokens(6144)
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] == "proj"
-
-    def test_count_tokens_failure_never_writes(self):
-        _begin("new")
-        sa_affinity.commit_success()      # 没有 prompt token 数
-        assert sa_affinity._lookup("sid")[0] is None
-
-    def test_structural_rebind_ignores_threshold(self):
-        _begin("structural")
+    def test_switch_ignores_threshold(self):
+        original = _seed("sid", "proj", "first")
+        _begin(credential="second", previous=original)
         sa_affinity.note_prompt_tokens(10)
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] == "proj"
+        asyncio.run(sa_affinity.commit_success())
+        assert sa_affinity._lookup("sid")[0].credential_id == "second"
 
-    def test_transient_fallback_never_writes(self):
-        _begin("transient", project="other")
-        sa_affinity.note_prompt_tokens(999999)
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] is None
+    def test_hit_does_not_rewrite(self):
+        original = _seed("sid", "proj")
+        _begin(previous=original)
+        assert sa_affinity.take_pending() is None
 
-    def test_hit_does_not_rewrite(self, monkeypatch):
-        monkeypatch.setattr(sa_affinity.time, "time", lambda: 1_000_000.0)
-        sa_affinity._write("sid", "old")
-        _begin("hit", project="new")
-        sa_affinity.note_prompt_tokens(999999)
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] == "old"
-
-    def test_note_request_then_commit_roundtrip(self, monkeypatch):
-        now = [1_000_000.0]
-        monkeypatch.setattr(sa_affinity.time, "time", lambda: now[0])
-        request = OpenAIRequest(model="gemini-3.8-flash",
-                                messages=[{"role": "system", "content": "sys"},
-                                          {"role": "user", "content": "hi"}])
-        assert sa_affinity.note_request(request) is None
-        sa_affinity.note_selection("proj", "new")
-        decision = sa_affinity.build_decision("proj", "gemini-3.8-flash")
-        sa_affinity.begin_commit(decision)
-        sa_affinity.note_prompt_tokens(7000)
-        sa_affinity.commit_success()
-        now[0] += 60
-        again = sa_affinity.note_request(request)
-        assert again == "proj"
-        assert sa_affinity._selection.get()["state"] == "hit"
+    def test_legacy_project_binding_is_preserved_and_upgraded(self):
+        with closing(sqlite3.connect(sa_affinity._db_path())) as db, db:
+            db.execute("CREATE TABLE affinity (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                       "created_at REAL NOT NULL, last_seen REAL NOT NULL)")
+            now = sa_affinity.time.time()
+            db.execute("INSERT INTO affinity VALUES (?, ?, ?, ?)", ("sid", "proj", now, now))
+        binding, age = sa_affinity.lookup_binding("sid")
+        assert binding == sa_affinity.Binding("proj", "", now)
+        sa_affinity.apply_lookup("sid", binding, age)
+        assert sa_affinity.selection_preferences() == {"preferred_project": "proj"}
+        _begin(previous=binding)
+        asyncio.run(sa_affinity.commit_success())
+        assert sa_affinity.lookup_binding("sid")[0].credential_id == "key"
+        # Older versions only read/write their original columns; the schema remains usable.
+        with closing(sqlite3.connect(sa_affinity._db_path())) as db, db:
+            db.execute("INSERT INTO affinity(session_id,project_id,created_at,last_seen) "
+                       "VALUES (?, ?, ?, ?)", ("old-worker", "proj", now, now))
+        assert sa_affinity.lookup_binding("old-worker")[0].credential_id == ""
 
 
 class TestRuntimeSelection:
@@ -201,97 +195,53 @@ class TestRuntimeSelection:
                             lambda account: account["project_id"] == "p2")
         assert app_state.get_current_sa_account(preferred_project="p2")[0] == "p1"
 
-    def test_project_availability(self, monkeypatch):
-        accounts = self._accounts("p1", "p2")
-        monkeypatch.setattr(app_state, "get_sa_accounts", lambda: accounts)
-        monkeypatch.setattr("runtime_state._sa_budget_available",
-                            lambda account, module: account["project_id"] == "p1")
-        assert app_state.sa_project_availability("p1") == "eligible"
-        assert app_state.sa_project_availability("p2") == "blocked"
-        assert app_state.sa_project_availability("gone") == "absent"
-
 class TestDispatchWiring:
-    def _request(self):
-        return OpenAIRequest(model="gemini-3.8-flash",
-                             messages=[{"role": "system", "content": "sys"},
-                                       {"role": "user", "content": "hi"}])
-
-    def _fake_sa(self, status=200):
+    @pytest.mark.parametrize("bound_credential", ["", "account-1"], ids=["legacy", "credential"])
+    def test_passes_affinity_preferences(self, monkeypatch, bound_credential):
         from fastapi.responses import JSONResponse
+        from failover import ChannelBreaker
+        from routes import chat_api
 
         class FakeSA:
-            async def chat_completions(self, request, fastapi_request, failover_mode=False,
-                                       raw_mode=False):
-                return JSONResponse(status_code=status, content={"ok": True})
-        return FakeSA()
+            async def chat_completions(self, request, fastapi_request, **kwargs):
+                return JSONResponse({"ok": True})
 
-    def _install(self, monkeypatch, bound, availability="eligible"):
-        from routes import chat_api
-        from failover import ChannelBreaker
+        request = OpenAIRequest(model="gemini-3.8-flash", messages=_msgs("system", "user"))
+        sid = sa_affinity.session_id_for_messages(request.messages)
+        _seed(sid, "p1", bound_credential)
         seen = {}
-        monkeypatch.setattr(chat_api, "CHANNELS", {"vertex": self._fake_sa()})
+
+        def fake_account(**kwargs):
+            seen.update(kwargs)
+            return "p1", "global", '{"project_id":"p1"}'
+
+        monkeypatch.setattr(chat_api, "CHANNELS", {"vertex": FakeSA()})
         monkeypatch.setattr(chat_api, "breaker", ChannelBreaker())
-        monkeypatch.setattr(sa_affinity, "lookup_binding", lambda session_id: (bound, 0.0))
-        monkeypatch.setattr(sa_affinity, "apply_lookup", lambda sid, project, age=0.0: None)
-        monkeypatch.setattr(sa_affinity, "preferred_project", lambda: bound)
-        monkeypatch.setattr(sa_affinity, "current_selection",
-                            lambda: {"session_id": "sid", "bound_project": bound})
-        monkeypatch.setattr(sa_affinity, "effective_project", lambda pid, sj: "p1")
-        monkeypatch.setattr(sa_affinity, "note_selection",
-                            lambda project, state: seen.update(project=project, state=state))
-
-        def fake_account(preferred_project=None):
-            from runtime_state import _current_sa_account
-            if preferred_project is not None:
-                seen["preferred"] = preferred_project
-            snapshot = _current_sa_account.get()
-            if snapshot:
-                return (snapshot["project_id"], snapshot["location"], snapshot["sa_json"])
-            return ("p1", "global", '{"project_id":"p1"}')
-
         monkeypatch.setattr(app_state, "get_current_sa_account", fake_account)
-        monkeypatch.setattr(app_state, "sa_project_availability", lambda project: availability)
-        return chat_api, seen
-
-    def test_preferred_project_passed_and_hit(self, monkeypatch):
-        import asyncio
-        chat_api, seen = self._install(monkeypatch, bound="p1")
-        asyncio.run(chat_api._dispatch(["vertex"], self._request(), None, False))
-        assert seen["preferred"] == "p1"
-        assert seen["project"] == "p1" and seen["state"] == "hit"
-
-    def test_new_session_state(self, monkeypatch):
-        import asyncio
-        chat_api, seen = self._install(monkeypatch, bound=None)
-        asyncio.run(chat_api._dispatch(["vertex"], self._request(), None, False))
-        assert seen.get("preferred") is None
-        assert seen["state"] == "new"
-
-    def test_structural_rebind_state(self, monkeypatch):
-        import asyncio
-        chat_api, seen = self._install(monkeypatch, bound="p9", availability="blocked")
-        asyncio.run(chat_api._dispatch(["vertex"], self._request(), None, False))
-        assert seen["preferred"] == "p9"
-        assert seen["state"] == "structural"
-
-    def test_transient_fallback_state(self, monkeypatch):
-        import asyncio
-        chat_api, seen = self._install(monkeypatch, bound="p9", availability="eligible")
-        asyncio.run(chat_api._dispatch(["vertex"], self._request(), None, False))
-        assert seen["state"] == "transient"
+        response = asyncio.run(chat_api._dispatch(["vertex"], request, None, False))
+        expected = {"preferred_project": "p1"}
+        if bound_credential:
+            expected["preferred_credential"] = bound_credential
+        assert response.status_code == 200
+        assert seen == expected
 
     def test_express_only_does_not_touch_affinity(self, monkeypatch):
-        import asyncio
+        from fastapi.responses import JSONResponse
         from routes import chat_api
         from failover import ChannelBreaker
         called = {"note": 0}
-        monkeypatch.setattr(sa_affinity, "prepare_request",
-                            lambda request: called.__setitem__("note", called["note"] + 1))
+        monkeypatch.setattr(sa_affinity, "lookup_binding",
+                            lambda sid: called.__setitem__("note", called["note"] + 1))
         monkeypatch.setattr(chat_api, "breaker", ChannelBreaker())
-        monkeypatch.setattr(chat_api, "CHANNELS", {"express": self._fake_sa()})
+        class FakeExpress:
+            async def chat_completions(self, request, fastapi_request, **kwargs):
+                return JSONResponse({"ok": True})
+
+        monkeypatch.setattr(chat_api, "CHANNELS", {"express": FakeExpress()})
         monkeypatch.setattr(app_config, "VERTEX_EXPRESS_API_KEY_VAL", ["k"])
         monkeypatch.setattr(app_state, "get_express_keys", lambda: ["k"])
-        asyncio.run(chat_api._dispatch(["express"], self._request(), None, False))
+        request = OpenAIRequest(model="gemini-3.8-flash", messages=_msgs("user"))
+        asyncio.run(chat_api._dispatch(["express"], request, None, False))
         assert called["note"] == 0
 
 
@@ -307,7 +257,7 @@ class TestUpstreamCommit:
                                 "fallback_client_factory": None,
                                 "sa_affinity": {
                                     "session_id": "sid", "project_id": "p1",
-                                    "state": "new", "model": "gemini-3.8-flash"},
+                                    "credential_id": "key", "model": "gemini-3.8-flash"},
                             })
         monkeypatch.setattr("upstreams.express_sdk.validate_request_schemas", lambda request: None)
 
@@ -319,22 +269,20 @@ class TestUpstreamCommit:
         return upstream
 
     def test_success_writes_binding(self, monkeypatch):
-        import asyncio
         upstream = self._upstream(monkeypatch, 200)
         request = OpenAIRequest(model="gemini-3.8-flash",
                                 messages=[{"role": "system", "content": "sys"},
                                           {"role": "user", "content": "hi"}])
         asyncio.run(upstream.chat_completions(request, None))
-        assert sa_affinity._lookup("sid")[0] == "p1"
+        assert _project("sid") == "p1"
 
     def test_failure_does_not_write(self, monkeypatch):
-        import asyncio
         upstream = self._upstream(monkeypatch, 400)
         request = OpenAIRequest(model="gemini-3.8-flash",
                                 messages=[{"role": "system", "content": "sys"},
                                           {"role": "user", "content": "hi"}])
         asyncio.run(upstream.chat_completions(request, None))
-        assert sa_affinity._lookup("sid")[0] is None
+        assert _project("sid") is None
 
 
 class TestStreamCommit:
@@ -361,25 +309,22 @@ class TestStreamCommit:
 
         return sa_budget.BudgetModels(FakeModels(), "key", "global", "standard")
 
-    def test_stream_commit_after_first_chunk(self, monkeypatch):
-        import asyncio
+    def test_budget_stream_does_not_commit_unvalidated_chunks(self, monkeypatch):
         models = self._budget_models(monkeypatch)
-        _begin("new", project="p1")
+        _begin(project="p1")
 
         async def run():
-            stream = await models.generate_content_stream(
-                model="gemini-3.8-flash", contents=[])
-            assert sa_affinity._lookup("sid")[0] is None   # 尚未取到首个 chunk
+            stream = await models.generate_content_stream(model="gemini-3.8-flash", contents=[])
             async for _ in stream:
-                pass
+                assert _project("sid") is None
+            assert _project("sid") is None
+            assert sa_affinity._pending.get()["prompt_tokens"] == 7000
 
         asyncio.run(run())
-        assert sa_affinity._lookup("sid")[0] == "p1"
 
     def test_stream_first_iteration_failure_does_not_write(self, monkeypatch):
-        import asyncio
         models = self._budget_models(monkeypatch, fail_on_iter=True)
-        _begin("new", project="p1")
+        _begin(project="p1")
 
         async def run():
             stream = await models.generate_content_stream(
@@ -389,19 +334,17 @@ class TestStreamCommit:
 
         with pytest.raises(RuntimeError):
             asyncio.run(run())
-        assert sa_affinity._lookup("sid")[0] is None
+        assert _project("sid") is None
 
     def test_stream_failure_does_not_write(self, monkeypatch):
-        import asyncio
         models = self._budget_models(monkeypatch, fail=True)
-        _begin("new")
+        _begin()
         with pytest.raises(RuntimeError):
             asyncio.run(models.generate_content_stream(model="gemini-3.8-flash", contents=[]))
-        assert sa_affinity._lookup("sid")[0] is None
+        assert _project("sid") is None
 
     def test_fake_stream_empty_stop_does_not_write(self, monkeypatch):
         """假流式空 STOP（无正文/工具）与非流式一样判为无效，不得写亲和。"""
-        import asyncio
         from google.genai import types
         from api_helpers import gemini_fake_stream_generator
 
@@ -418,7 +361,7 @@ class TestStreamCommit:
             class aio:
                 models = FakeModels()
 
-        _begin("new", project="p1")
+        _begin(project="p1")
         request = OpenAIRequest(model="gemini-3.8-flash", stream=True,
                                 messages=[{"role": "user", "content": "hi"}])
 
@@ -432,7 +375,7 @@ class TestStreamCommit:
 
         chunks = asyncio.run(run())
         assert any('"error"' in chunk for chunk in chunks)
-        assert sa_affinity._lookup("sid")[0] is None
+        assert _project("sid") is None
 
 
 class TestOcrRegressions:
@@ -452,25 +395,35 @@ class TestOcrRegressions:
         sa_affinity.write_decision({"session_id": "sid", "project_id": "p1", "state": "new"})
 
     def test_new_binding_never_overwrites_existing(self):
-        sa_affinity._write("sid", "first")
-        sa_affinity._write_decision({
-            "session_id": "sid", "project_id": "second", "state": "new",
-            "bound_project": None})
-        assert sa_affinity._lookup("sid")[0] == "first"
+        _seed("sid", "first")
+        assert not sa_affinity._write_decision({"session_id": "sid", "project_id": "second",
+                                               "credential_id": "second"})
+        assert _project("sid") == "first"
 
-    def test_structural_rebind_only_replaces_observed_binding(self):
-        sa_affinity._write("sid", "current")
-        sa_affinity._write_decision({
-            "session_id": "sid", "project_id": "new", "state": "structural",
-            "bound_project": "stale"})
-        assert sa_affinity._lookup("sid")[0] == "current"
-        sa_affinity._write_decision({
-            "session_id": "sid", "project_id": "new", "state": "structural",
-            "bound_project": "current"})
-        assert sa_affinity._lookup("sid")[0] == "new"
+    def test_stale_switch_cannot_overwrite_same_project_rebinding(self, monkeypatch):
+        monkeypatch.setattr(sa_affinity.time, "time", lambda: 1_000_000.0)
+        original = _seed("sid", "p1", "A")
+        _begin(project="p1", credential="C", previous=original)
+        stale = sa_affinity.take_pending()
+        _begin(project="p1", credential="B", previous=original)
+        asyncio.run(sa_affinity.commit_success())
+        assert not sa_affinity._write_decision(stale)
+        rebound = sa_affinity._lookup("sid")[0]
+        assert rebound.credential_id == "B"
+        # A→B→A doesn't make the old A snapshot valid again.
+        _begin(project="p1", credential="A", previous=rebound)
+        asyncio.run(sa_affinity.commit_success())
+        assert not sa_affinity._write_decision(stale)
+        assert sa_affinity._lookup("sid")[0].credential_id == "A"
+
+    def test_inflight_rebind_does_not_restore_a_cleared_binding(self):
+        original = _seed("sid", "p1", "A")
+        _begin(project="p1", credential="B", previous=original)
+        sa_affinity.clear_all()
+        asyncio.run(sa_affinity.commit_success())
+        assert _project("sid") is None
 
     def test_media_prompt_uses_real_count_tokens(self, monkeypatch):
-        import asyncio
         import sa_budget
         monkeypatch.setattr(sa_budget, "reserve", lambda key, amount: "tok")
         monkeypatch.setattr(sa_budget, "price", lambda *a, **k: 1)
@@ -482,9 +435,9 @@ class TestOcrRegressions:
                 return R()
 
         models = sa_budget.BudgetModels(FakeModels(), "key", "global", "standard")
-        _begin("new")
+        _begin()
         contents = [{"role": "user", "parts": [{"inline_data": {"mime_type": "image/png", "data": "x"}}]}]
         asyncio.run(models._reserve({"model": "gemini-3.8-flash", "contents": contents, "config": {}}))
         assert sa_affinity._pending.get()["prompt_tokens"] == 321
-        sa_affinity.commit_success()
-        assert sa_affinity._lookup("sid")[0] is None      # 321 < 6144，不建绑
+        asyncio.run(sa_affinity.commit_success())
+        assert _project("sid") is None      # 321 < 6144，不建绑

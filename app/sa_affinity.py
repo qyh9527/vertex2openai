@@ -1,4 +1,4 @@
-"""SA 会话亲和：把同一会话钉在同一个 GCP project（保住上游隐式缓存）。
+"""SA 会话亲和：把同一会话绑定到一个 SA 凭证和 GCP project（保住上游隐式缓存）。
 
 隐式缓存按 project 隔离、永不跨项目共享；多个 SA 账号按轮询/随机选号会让同一
 会话每轮 cold start。本模块用**内容指纹**识别会话：
@@ -8,22 +8,24 @@
 
 绑定存独立 SQLite（STATE_DIR/sa_affinity.sqlite3，与 sa_budget 分开）：
 
-  affinity(session_id PK, project_id, created_at, last_seen)
+  affinity(session_id PK, project_id, created_at, last_seen, credential_id)
 
   - TTL 1 小时，命中即续期（滑动）；
   - 容量 5000 条，超出按 last_seen 淘汰最旧；
-  - 上游成功后才写绑定；瞬时故障（熔断冷却/单次失败/临时限流）保留原绑定；
-  - 结构性不可用（SA 被删、该 project 全部账号额度熔断/赠金到期）重绑，且不受
-    缓存门槛限制；
+  - 改用不同凭证或 project 时，只在上游成功后更新，不受缓存门槛限制；
+  - 旧 project 绑定保留，首次成功后补齐凭证标识；
   - 新会话只有本次请求真实 prompt token 达到模型门槛才建绑定。
 """
 
+import asyncio
 import hashlib
+import math
 import os
 import sqlite3
 import threading
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,9 +45,17 @@ GEMINI2_MIN_TOKENS = 2048
 
 _lock = threading.Lock()
 
+@dataclass(frozen=True)
+class Binding:
+    project_id: str
+    credential_id: str
+    # 每次重绑换版本；滑动续期只更新 last_seen。
+    created_at: float
+
+
 # 请求级 ContextVar：会话指纹、绑定查询结果、待写入的绑定决策。
 _session_id: ContextVar[Optional[str]] = ContextVar("sa_affinity_session", default=None)
-_selection: ContextVar[Optional[dict]] = ContextVar("sa_affinity_selection", default=None)
+_binding: ContextVar[Optional[Binding]] = ContextVar("sa_affinity_binding", default=None)
 _pending: ContextVar[Optional[dict]] = ContextVar("sa_affinity_pending", default=None)
 
 
@@ -70,13 +80,23 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=10)
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS affinity ("
-        "session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
-        "created_at REAL NOT NULL, last_seen REAL NOT NULL)")
-    db.execute("CREATE INDEX IF NOT EXISTS affinity_last_seen ON affinity(last_seen)")
-    db.commit()
-    return db
+    try:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS affinity ("
+            "session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+            "created_at REAL NOT NULL, last_seen REAL NOT NULL, "
+            "credential_id TEXT NOT NULL DEFAULT '')")
+        if "credential_id" not in {row[1] for row in db.execute("PRAGMA table_info(affinity)")}:
+            # 多个进程可能同时打开旧表；取得写锁后再检查一次。
+            db.execute("BEGIN IMMEDIATE")
+            if "credential_id" not in {row[1] for row in db.execute("PRAGMA table_info(affinity)")}:
+                db.execute("ALTER TABLE affinity ADD COLUMN credential_id TEXT NOT NULL DEFAULT ''")
+        db.execute("CREATE INDEX IF NOT EXISTS affinity_last_seen ON affinity(last_seen)")
+        db.commit()
+        return db
+    except BaseException:
+        db.close()
+        raise
 
 
 def _mask(project: str) -> str:
@@ -155,18 +175,6 @@ def session_id_for_messages(messages: list) -> str:
     return hashlib.sha256(_encode(payload)).hexdigest()[:32]
 
 
-def effective_project(project_id: Any, sa_json: Any) -> str:
-    """SA 账号的生效 project：账号配置优先，空则取 SA JSON 自带 project_id。"""
-    project = str(project_id or "").strip()
-    if project:
-        return project
-    try:
-        import json
-        return str(json.loads(sa_json or "{}").get("project_id") or "").strip()
-    except Exception:
-        return ""
-
-
 def min_tokens_for_model(model: Any) -> int:
     """该模型的隐式缓存最小前缀门槛（token）。"""
     name = str(model or "").rsplit("/", 1)[-1].strip().lower()
@@ -179,26 +187,27 @@ def min_tokens_for_model(model: Any) -> int:
 
 # ---------------------------------------------------------------- 绑定读写
 
-def _lookup(session_id: str) -> tuple[Optional[str], float]:
-    """返回 (project_id, 距上次访问秒数)；过期/不存在返回 (None, 0)。命中即续期。"""
-    now = time.time()
+def _lookup(session_id: str) -> tuple[Optional[Binding], float]:
+    """读取并续期绑定；过期/不存在返回 (None, 0)。"""
     with _lock:
         db = _connect()
         try:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
             row = db.execute(
-                "SELECT project_id, last_seen FROM affinity WHERE session_id=?",
+                "SELECT project_id, credential_id, created_at, last_seen FROM affinity WHERE session_id=?",
                 (session_id,)).fetchone()
             if row is None:
                 return None, 0.0
-            project, last_seen = str(row[0]), float(row[1])
+            project, credential, created_at, last_seen = row
             age = max(0.0, now - last_seen)
             if age > TTL_SECONDS:
                 db.execute("DELETE FROM affinity WHERE session_id=?", (session_id,))
                 db.commit()
                 return None, 0.0
-            db.execute("UPDATE affinity SET last_seen=? WHERE session_id=?", (now, session_id))
+            db.execute("UPDATE affinity SET last_seen=MAX(last_seen, ?) WHERE session_id=?", (now, session_id))
             db.commit()
-            return project, age
+            return Binding(project, credential, created_at), age
         finally:
             db.close()
 
@@ -212,54 +221,32 @@ def _evict_overflow(db) -> None:
             (count - MAX_BINDINGS,))
 
 
-def _write(session_id: str, project_id: str) -> None:
-    """无条件写入（测试/显式覆盖用）。"""
-    now = time.time()
-    with _lock:
-        db = _connect()
-        try:
-            db.execute(
-                "INSERT INTO affinity(session_id, project_id, created_at, last_seen) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
-                "project_id=excluded.project_id, last_seen=excluded.last_seen",
-                (session_id, project_id, now, now))
-            _evict_overflow(db)
-            db.commit()
-        finally:
-            db.close()
-
-
-def _write_decision(decision: dict) -> None:
-    """按决策写绑定：首次建绑只补空位；结构重绑只替换自己看到的旧绑定。
-
-    并发首请求可能都查到“无绑定”，先成功者写下绑定后，后到者不得覆盖；
-    结构重绑以决策里的 bound_project 做条件更新，避免覆盖其他请求刚修复的绑定。
-    """
+def _write_decision(decision: dict) -> bool:
+    """只在绑定未被其他请求替换时更新；首次建绑只补空位。"""
     session_id = decision["session_id"]
     project_id = decision["project_id"]
-    state = decision.get("state")
-    bound_project = decision.get("bound_project")
-    now = time.time()
+    credential_id = decision["credential_id"]
+    previous = decision.get("previous")
     with _lock:
         db = _connect()
         try:
-            if state == "structural" and bound_project:
+            now = time.time()
+            if previous is None:
                 cursor = db.execute(
-                    "UPDATE affinity SET project_id=?, last_seen=? "
-                    "WHERE session_id=? AND project_id=?",
-                    (project_id, now, session_id, bound_project))
-                if cursor.rowcount == 0:
-                    db.execute(
-                        "INSERT INTO affinity(session_id, project_id, created_at, last_seen) "
-                        "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO NOTHING",
-                        (session_id, project_id, now, now))
+                    "INSERT INTO affinity(session_id, project_id, credential_id, created_at, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO NOTHING",
+                    (session_id, project_id, credential_id, now, now))
+                if cursor.rowcount:
+                    _evict_overflow(db)
             else:
-                db.execute(
-                    "INSERT INTO affinity(session_id, project_id, created_at, last_seen) "
-                    "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO NOTHING",
-                    (session_id, project_id, now, now))
-            _evict_overflow(db)
+                version = max(now, math.nextafter(previous.created_at, math.inf))
+                cursor = db.execute(
+                    "UPDATE affinity SET project_id=?, credential_id=?, created_at=?, last_seen=MAX(last_seen, ?) "
+                    "WHERE session_id=? AND project_id=? AND credential_id=? AND created_at=? AND last_seen>=?",
+                    (project_id, credential_id, version, now, session_id, previous.project_id,
+                     previous.credential_id, previous.created_at, now - TTL_SECONDS))
             db.commit()
+            return cursor.rowcount > 0
         finally:
             db.close()
 
@@ -299,36 +286,12 @@ def clear_all() -> int:
 def reset_request() -> None:
     """请求任务内调用：重置本请求的亲和状态（不碰数据库）。"""
     _pending.set(None)
-    _selection.set(None)
+    _binding.set(None)
     _session_id.set(None)
 
 
-def set_session_id(session_id: Optional[str]) -> None:
-    """请求任务内写回指纹（纯计算可在线程里完成）。"""
-    _session_id.set(session_id or None)
-
-
-def prepare_request(request_obj: Any) -> Optional[str]:
-    """同步便捷入口（测试/直接调用）：reset + 计算指纹 + 写回 ContextVar。
-
-    生产异步热路径请用 reset_request() + to_thread(session_id_for_messages) +
-    set_session_id()，避免大提示词/媒体指纹阻塞事件循环。
-    """
-    reset_request()
-    if not enabled():
-        return None
-    try:
-        session_id = session_id_for_messages(getattr(request_obj, "messages", []) or [])
-    except Exception:
-        return None
-    set_session_id(session_id)
-    return session_id or None
-
-
-def lookup_binding(session_id: str) -> tuple[Optional[str], float]:
-    """线程内查询绑定（命中即滑动续期）；存储异常只放弃本次亲和，不影响聊天。"""
-    if not session_id:
-        return None, 0.0
+def lookup_binding(session_id: str) -> tuple[Optional[Binding], float]:
+    """在线程中读取；存储异常不影响聊天。"""
     try:
         return _lookup(session_id)
     except Exception as exc:
@@ -336,70 +299,35 @@ def lookup_binding(session_id: str) -> tuple[Optional[str], float]:
         return None, 0.0
 
 
-def apply_lookup(session_id: str, bound: Optional[str], age: float = 0.0) -> None:
-    """请求任务内应用绑定查询结果（ContextVar 写回主任务）。"""
-    _selection.set({
-        "session_id": session_id,
-        "bound_project": bound,
-        "selected_project": None,
-        "state": "new" if bound is None else "hit",
-    })
+def apply_lookup(session_id: str, bound: Optional[Binding], age: float) -> None:
+    """在请求任务中应用绑定查询结果。"""
+    _session_id.set(session_id)
+    _binding.set(bound)
     if bound:
-        print(f"↔️ [会话亲和] 命中绑定 project={_mask(bound)}"
+        print(f"↔️ [会话亲和] 找到绑定 project={_mask(bound.project_id)}"
               f"（距上次访问 {age:.0f}s，TTL {TTL_SECONDS}s）。")
 
 
-def note_request(request_obj: Any) -> Optional[str]:
-    """同步便捷入口（测试/直接调用）：prepare + lookup + apply。"""
-    session_id = prepare_request(request_obj)
-    if not session_id:
+def selection_preferences() -> dict:
+    """绑定凭证优先；旧记录只有 project 信息。"""
+    bound = _binding.get()
+    if not bound:
+        return {}
+    prefs = {"preferred_project": bound.project_id}
+    if bound.credential_id:
+        prefs["preferred_credential"] = bound.credential_id
+    return prefs
+
+
+def build_decision(project_id: str, credential_id: str, model: str) -> Optional[dict]:
+    session_id = _session_id.get()
+    previous = _binding.get()
+    if not session_id or not project_id or not credential_id:
         return None
-    bound, age = lookup_binding(session_id)
-    apply_lookup(session_id, bound, age)
-    return bound
-
-
-def current_session_id() -> Optional[str]:
-    return _session_id.get()
-
-
-def preferred_project() -> Optional[str]:
-    selection = _selection.get() or {}
-    return selection.get("bound_project")
-
-
-def current_selection() -> Optional[dict]:
-    return _selection.get()
-
-
-def note_selection(selected_project: str, state: str) -> None:
-    """记录账号选择结果（state: new / hit / transient / structural）。"""
-    selection = dict(_selection.get() or {})
-    if not selection.get("session_id"):
-        return
-    bound = selection.get("bound_project")
-    selection.update({"selected_project": selected_project, "state": state})
-    _selection.set(selection)
-    if state == "transient":
-        print(f"⚠️ [会话亲和] 绑定 project={_mask(bound)} 暂不可用，本次改用 "
-              f"project={_mask(selected_project)}，绑定保留。")
-    elif state == "structural":
-        print(f"🔁 [会话亲和] 原绑定 project={_mask(bound)} 已不可用，"
-              f"成功后将重绑至 project={_mask(selected_project)}。")
-
-
-def build_decision(project_id: str, model: str) -> Optional[dict]:
-    """在 `_resolve_client` 里组装「待写入的绑定决策」，随 resolved dict 返回。"""
-    selection = _selection.get() or {}
-    if not selection.get("session_id") or not project_id:
+    if previous and (project_id, credential_id) == (previous.project_id, previous.credential_id):
         return None
-    return {
-        "session_id": selection["session_id"],
-        "project_id": str(project_id),
-        "state": selection.get("state") or "new",
-        "bound_project": selection.get("bound_project"),
-        "model": str(model or ""),
-    }
+    return dict(session_id=session_id, project_id=project_id, credential_id=credential_id,
+                previous=previous, model=model)
 
 
 def begin_commit(decision: Optional[dict]) -> None:
@@ -419,47 +347,38 @@ def note_prompt_tokens(tokens: Any) -> None:
 
 
 def take_pending() -> Optional[dict]:
-    """请求任务内取出并校验待写入决策；返回可直接交给写库线程的决策。
-
-    命中/瞬时故障/未达门槛都返回 None，并清空本请求的待写入状态。
-    """
+    """取出待提交的决策；只有初次建绑需要达到缓存门槛。"""
     pending = _pending.get()
     _pending.set(None)
-    if pending is None:
-        return None
-    state = str(pending.get("state") or "")
-    if state in ("hit", "transient"):
-        return None
-    tokens = pending.get("prompt_tokens")
-    threshold = min_tokens_for_model(pending.get("model", ""))
-    if state != "structural":
+    if pending is not None and pending.get("previous") is None:
+        tokens = pending.get("prompt_tokens")
+        threshold = min_tokens_for_model(pending.get("model", ""))
         if tokens is None or tokens < threshold:
             if tokens is not None:
                 print(f"ℹ️ [会话亲和] 未建立绑定：prompt {tokens} 低于缓存门槛 {threshold}。")
             return None
-    if not pending.get("session_id") or not pending.get("project_id"):
-        return None
-    pending["threshold"] = threshold
+        pending["threshold"] = threshold
     return pending
 
 
 def write_decision(decision: dict) -> None:
     """写库线程内执行；存储异常只放弃亲和，不改变聊天结果。"""
     try:
-        _write_decision(decision)
+        if not _write_decision(decision):
+            return
     except Exception as exc:
         print(f"⚠️ [会话亲和] 写入绑定失败，已忽略本次亲和：{exc}")
         return
     project = decision.get("project_id")
-    if decision.get("state") == "structural":
-        print(f"🔁 [会话亲和] 已重绑至 project={_mask(project)}（不受缓存门槛限制）。")
+    if decision.get("previous") is not None:
+        print(f"🔁 [会话亲和] 已刷新凭证绑定 project={_mask(project)}。")
     else:
         print(f"🆕 [会话亲和] 新建绑定 project={_mask(project)}"
               f"（prompt {decision.get('prompt_tokens')} ≥ 门槛 {decision.get('threshold')}）。")
 
 
-def commit_success() -> None:
-    """同步便捷入口：取决策并写库（生产路径应把写库放到线程里）。"""
+async def commit_success() -> None:
+    """上游响应通过验证后，在请求任务取决策并交给写库线程。"""
     decision = take_pending()
     if decision is not None:
-        write_decision(decision)
+        await asyncio.to_thread(write_decision, decision)

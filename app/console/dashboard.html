@@ -798,7 +798,7 @@
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">SA 会话亲和<span class="helpq" onclick="hlp(this,'h_sa_aff')">?</span></span><label class="switch"><input type="checkbox" id="sa_session_affinity"><span class="slider"></span></label></div>
-            <div id="h_sa_aff" class="helpbox">隐式缓存按 GCP project 隔离：多个服务账号轮询会让同一会话每轮冷启动。开启后按「全部 system + 首条 user」的内容指纹把会话钉在同一 project，1 小时滑动 TTL、最多 5000 条；只有上游成功且 prompt 达到该模型的缓存门槛（4096 / 6144 / 2048）才建立绑定。瞬时故障保留绑定，账号被删或额度熔断才重绑。只影响服务账号通道。</div>
+            <div id="h_sa_aff" class="helpbox">隐式缓存按 GCP project 隔离：多个服务账号轮询会让同一会话每轮冷启动。开启后按「全部 system + 首条 user」的内容指纹优先使用已绑定的服务账号凭证，1 小时滑动 TTL、最多 5000 条。首次绑定要求上游成功且输入达到缓存门槛（4096 / 6144 / 2048）。换凭证成功后更新绑定（包括同项目换号）；备用凭证失败或流中断则不更新。只影响服务账号通道。</div>
             <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-neutral-500">
               <span id="affinity-stats">绑定 —</span>
               <button type="button" class="text-xs text-neutral-500 underline" onclick="clearAffinity()">清空全部绑定</button>

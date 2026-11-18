@@ -167,11 +167,7 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
     channel_name = "vertex"   # 每通道独立重试 / 熔断统计用
 
     def _resolve_client(self, fastapi_request: Request, base_model_name: str, settings: dict) -> dict:
-        preferred_project = sa_affinity.preferred_project()
-        if preferred_project:
-            account = app_state.get_current_sa_account(preferred_project=preferred_project)
-        else:
-            account = app_state.get_current_sa_account()
+        account = app_state.get_current_sa_account(**sa_affinity.selection_preferences())
         project_id, location, sa_json = account
         if not sa_json:
             error_msg = ("未配置服务账号凭证：请在控制台「通道与凭证」→ 服务账号 页粘贴 SA JSON，"
@@ -212,9 +208,9 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
             "priority_paygo": bool(headers),
             "fallback_model": None,              # 无钉定失败回退需求
             "fallback_client_factory": None,
-            # 会话亲和：待写入的绑定决策（上游成功后才由 chat_completions/BudgetModels 落库）。
+            # 会话亲和：待写入的绑定决策（上游响应通过验证后提交）。
             "sa_affinity": sa_affinity.build_decision(
-                _effective_project(sa_json, project_id), base_model_name),
+                _effective_project(sa_json, project_id), key, base_model_name),
             # 重试换号：可重试故障（429/503/配额）时换下一个未被本次请求试过的账号。
             "retry_client_factory": self.make_retry_client_factory(
                 settings, base_model_name, sa_json),
@@ -244,23 +240,15 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
                 except Exception as exc:
                     print(f"⚠️ [账号切换] 跳过无法构造的备用凭证（{type(exc).__name__}）。")
                     continue
-                return client, {"project_id": project_id, "location": location, "sa_json": sa_json}, headers, timeout
+                return client, {"project_id": project_id, "location": location, "sa_json": sa_json}, key, headers, timeout
 
         async def switch(error: Exception):
             nonlocal current_id
             prepared = await asyncio.to_thread(prepare)
             if prepared is None:
                 return None
-            client, account, headers, timeout = prepared
+            client, account, key, headers, timeout = prepared
             project = _effective_project(account["sa_json"], account["project_id"])
-            bound = sa_affinity.preferred_project()
-            if bound == project:
-                state = "hit"
-            elif bound:
-                availability = await asyncio.to_thread(app_state.sa_project_availability, bound)
-                state = "transient" if availability == "eligible" else "structural"
-            else:
-                state = "new"
             # The local reservation gate is not a Google credential failure.
             if not isinstance(error, sa_budget.BudgetError):
                 if outcome.classify_exception(error) == outcome.RATE_LIMITED:
@@ -269,8 +257,7 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
                     breaker.report_failure(("vertex", current_id))
             current_id = sa_breaker_id(account["sa_json"])
             _current_sa_account.set(account)
-            sa_affinity.note_selection(project, state)
-            sa_affinity.begin_commit(sa_affinity.build_decision(project, base_model_name))
+            sa_affinity.begin_commit(sa_affinity.build_decision(project, key, base_model_name))
             request_log.note_transport(headers, timeout)
             print(f"🔁 [账号切换] 本次请求改用另一份服务账号凭证（…{current_id[-4:]}）。")
             return client

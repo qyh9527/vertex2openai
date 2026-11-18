@@ -83,7 +83,7 @@ def sa_breaker_id(sa_json: str) -> str:
 
 
 def _sa_credential_cooling(account: dict) -> bool:
-    """该账号是否处于候选级熔断冷却（瞬时故障，不应重绑亲和）。"""
+    """该账号是否处于候选级熔断冷却。"""
     from failover import breaker
     return breaker.is_cooling(("vertex", sa_breaker_id(account.get("sa_json", ""))))
 
@@ -413,16 +413,14 @@ class AppState:
         print(f"🔧 [状态管理器] 已保存 {len(clean)} 个自定义模型。")
         return clean
 
-    def get_current_sa_account(self, preferred_project=None) -> tuple:
+    def get_current_sa_account(self, preferred_project=None, preferred_credential=None) -> tuple:
         """取本次请求使用的服务账号（请求级快照，同 Cookie 账号机制）。
 
         返回 (project_id, location, sa_json)。多账号按 roundrobin 设置轮询或随机选择，
         同一请求内（含重试、流式、failover 重发）复用同一账号；无任何账号返回 (None, None, None)。
 
-        preferred_project：SA 会话亲和偏好的 GCP project（默认 None = 行为不变）。
-        绑定 project 内有可用账号时只在该 project 内选；仅当绑定 project 的账号全部
-        额度不可用/已删除时退回全量候选（结构性重绑由路由层判定）。默认参数保证既有
-        调用方零改动。
+        亲和：优先选预算可用且未冷却的绑定凭证，其次选同 project 的健康凭证，
+        再回到全量候选。没有健康凭证时沿用原有兜底。
         """
         account = _current_sa_account.get()
         if account is None:
@@ -434,22 +432,19 @@ class AppState:
                 healthy = [candidate for candidate in eligible if not _sa_credential_cooling(candidate)]
                 pool = healthy or eligible or accounts
                 if preferred_project:
-                    preferred = [candidate for candidate in accounts
-                                 if _sa_account_project(candidate) == preferred_project]
-                    if preferred:
-                        preferred_eligible = [
-                            candidate for candidate in healthy
-                            if _sa_account_project(candidate) == preferred_project]
-                        if preferred_eligible:
-                            pool = preferred_eligible
-                        else:
-                            # 瞬时故障（候选熔断冷却）：本请求改用其它可用 project，绑定保留。
-                            others = [
-                                candidate for candidate in healthy
-                                if _sa_account_project(candidate) != preferred_project]
-                            if others:
-                                pool = others
-                    # 绑定 project 已无账号/全部额度不可用：保持常规候选（结构重绑）。
+                    same_project = [candidate for candidate in healthy
+                                    if _sa_account_project(candidate) == preferred_project]
+                    if same_project:
+                        pool = same_project
+                        if preferred_credential:
+                            for candidate in same_project:
+                                try:
+                                    identity = sa_budget.credential_id(candidate["sa_json"])
+                                except (ValueError, sa_budget.BudgetError):
+                                    continue
+                                if identity == preferred_credential:
+                                    pool = [candidate]
+                                    break
                 accounts = pool
             if not accounts:
                 return (None, None, None)
@@ -498,18 +493,6 @@ class AppState:
         return (account.get("project_id", ""),
                 account.get("location", "global"),
                 account.get("sa_json", ""))
-
-    def sa_project_availability(self, project_id) -> str:
-        """绑定 project 的结构可用性：eligible / blocked / absent（会话亲和分类用）。"""
-        project = str(project_id or "").strip()
-        if not project:
-            return "absent"
-        accounts = [a for a in self.get_sa_accounts()
-                    if _sa_account_project(a) == project]
-        if not accounts:
-            return "absent"
-        import sa_budget
-        return "eligible" if any(_sa_budget_available(a, sa_budget) for a in accounts) else "blocked"
 
     def current_sa_credential_id(self) -> str:
         """本次请求选中的服务账号的脱敏标识（熔断候选粒度用，进阶报告 P0-2）。

@@ -358,3 +358,104 @@ async def test_explicit_403_with_quota_message_does_not_retry(monkeypatch, mode)
         errors = [item["error"] for item in _sse_payloads([line async for line in response.body_iterator]) if "error" in item]
         assert len(errors) == 1 and errors[0]["code"] == 403
     assert primary.aio.models.calls == 1 and not seen
+
+
+@pytest.mark.parametrize("project_b,mode,scenario", [
+    pytest.param(project, mode, "success", id=f"{mode}-{'same' if project == 'proj-a' else 'other'}-project")
+    for project in ("proj-a", "proj-b") for mode in ("nonstream", "stream", "fake-stream")
+] + [
+    pytest.param("proj-a", "stream", "partial", id="stream-breaks-after-content"),
+    pytest.param("proj-a", "stream", "bad-terminal", id="stream-invalid-terminal"),
+    pytest.param("proj-a", "nonstream", "failed", id="both-credentials-fail"),
+    pytest.param("proj-a", "nonstream", "cooling", id="fallback-before-first-attempt"),
+    pytest.param("proj-b", "nonstream", "disabled", id="affinity-disabled"),
+])
+async def test_sa_affinity_follows_only_successful_credentials(fresh, monkeypatch, project_b, mode, scenario):
+    import sa_affinity
+    from failover import ChannelBreaker
+    from routes import chat_api
+    from upstreams import express_sdk, service_account
+
+    _retry_env(monkeypatch)
+    accounts = [{"project_id": "proj-a", "location": "global", "sa_json": _SA_A},
+                {"project_id": project_b, "location": "global", "sa_json": _SA_B}]
+    monkeypatch.setattr(fresh, "get_sa_accounts", lambda: accounts)
+    fresh.update_settings({"roundrobin": True})
+    for module in (chat_api, express_sdk, service_account):
+        monkeypatch.setattr(module, "app_state", fresh)
+    circuit = ChannelBreaker()
+    monkeypatch.setattr(chat_api, "breaker", circuit)
+    monkeypatch.setattr(service_account, "breaker", circuit)
+    monkeypatch.setattr(sa_affinity, "enabled", lambda: scenario != "disabled")
+    monkeypatch.setattr(sa_budget, "status", lambda key: {"initialized": True, "blocked": False})
+    monkeypatch.setattr(sa_budget, "reserve", lambda *a: "tok")
+    monkeypatch.setattr(sa_budget, "settle", lambda *a: None)
+    if mode == "stream":
+        a = _stream_client([[_stream_chunk("first", "STOP")], _RetryableError(429)])
+        events = [_stream_chunk("from B", "STOP")]
+        if scenario == "partial":
+            events = [_stream_chunk("partial from B"), _RetryableError(503)]
+        elif scenario == "bad-terminal":
+            events = [_stream_chunk("partial from B"), _stream_chunk(finish_reason="MALFORMED_FUNCTION_CALL")]
+        b = _stream_client([events])
+    else:
+        a = _call_client([_text_response("first"), _RetryableError(429)])
+        b = _call_client([_RetryableError(503) if scenario == "failed" else _text_response("from B")])
+
+    async def count_a(**kwargs):
+        return SimpleNamespace(total_tokens=7000)
+
+    async def count_b(**kwargs):
+        return SimpleNamespace(total_tokens=10)
+
+    a.aio.models.count_tokens = count_a
+    b.aio.models.count_tokens = count_b
+    monkeypatch.setattr(service_account, "_get_cached_sa_client",
+                        lambda sa_json, *args: {_SA_A: a, _SA_B: b}[sa_json])
+    monkeypatch.setattr(chat_api, "CHANNELS", {"vertex": service_account.ServiceAccountUpstream()})
+
+    session_id = sa_affinity.session_id_for_messages(_request(False).messages)
+    key_a, key_b = map(sa_budget.credential_id, (_SA_A, _SA_B))
+
+    async def ask(expect_failure=False):
+        runtime_state._current_sa_account.set(None)
+        request = _request(mode != "nonstream")
+        if mode == "fake-stream":
+            request.model = "fake-" + request.model
+        response = await chat_api._dispatch(["vertex"], request, None, False, raw_mode=True)
+        if request.stream:
+            lines = [line async for line in response.body_iterator]
+            assert any("error" in payload for payload in _sse_payloads(lines)) == expect_failure
+            return _sse_text(lines)
+        if expect_failure:
+            assert response.status_code >= 400
+            return None
+        assert response.status_code == 200
+        return json.loads(response.body)["choices"][0]["message"]["content"]
+
+    assert await ask() == "first"
+    if scenario != "disabled":
+        assert sa_affinity.lookup_binding(session_id)[0].credential_id == key_a
+    if scenario == "cooling":
+        monkeypatch.setattr(runtime_state, "_sa_credential_cooling", lambda candidate: candidate["sa_json"] == _SA_A)
+    fresh._sa_rr_index = 0
+    if scenario in ("partial", "bad-terminal", "failed"):
+        text = await ask(expect_failure=True)
+        if mode == "stream":
+            assert text == "partial from B"
+        assert (a.aio.models.calls, b.aio.models.calls) == (2, 1)
+        assert sa_affinity.lookup_binding(session_id)[0].credential_id == key_a
+        return
+    assert await ask() == "from B"
+    calls_a = 1 if scenario == "cooling" else 2
+    assert (a.aio.models.calls, b.aio.models.calls) == (calls_a, 1)
+    if scenario == "disabled":
+        assert sa_affinity.lookup_binding(session_id)[0] is None
+        return
+    binding, _ = sa_affinity.lookup_binding(session_id)
+    assert (binding.project_id, binding.credential_id) == (project_b, key_b)
+    # With A healthy and first in the round-robin pool, only affinity keeps this on B.
+    monkeypatch.setattr(runtime_state, "_sa_credential_cooling", lambda candidate: False)
+    fresh._sa_rr_index = 0
+    assert await ask() == "from B"
+    assert (a.aio.models.calls, b.aio.models.calls) == (calls_a, 2)

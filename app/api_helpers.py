@@ -843,9 +843,7 @@ async def gemini_fake_stream_generator(
                 openai_response_dict, input_relay_strip_tag)
         _prepend_prefill(openai_response_dict, prefill_text)
         # 假流式：响应已通过有效性/终止原因检查，此刻才算上游成功，写会话亲和绑定。
-        decision = sa_affinity.take_pending()
-        if decision is not None:
-            await asyncio.to_thread(sa_affinity.write_decision, decision)
+        await sa_affinity.commit_success()
         convert_ms = int((request_log.now_mono() - convert_started) * 1000)
         _set_phase("sending_downstream")
         ctx.emit("phase", f"📤 [阶段] {ctx.request_id} 转换完成，开始向下游发送 SSE",
@@ -1469,6 +1467,8 @@ async def _execute_gemini_call(
                                           "not_called" if not synthetic_seen else
                                           "partial" if any(reason in ("length", "content_filter") for reason in terminal_finish_reasons.values()) else "restored",
                                           selected_text_channel=selected_text_channel)
+                        # 仅在流完整性和终态检查通过后刷新绑定。
+                        await sa_affinity.commit_success()
                         yield "data: [DONE]\n\n"
                         return
 
