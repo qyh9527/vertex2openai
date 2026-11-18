@@ -1,4 +1,4 @@
-"""SA 独立预算：SQLite 原子预留、逐尝试结算；未知费用保留预留金额。"""
+"""SA 额度账本：SQLite 原子预留、逐尝试结算；未知费用保留预留金额。"""
 import asyncio
 import datetime
 import calendar
@@ -21,12 +21,16 @@ class BudgetError(RuntimeError):
     code = 429
 
 
+class BudgetConflict(ValueError):
+    """A confirmed account or preview no longer matches the ledger."""
+
+
 def credential_id(sa_json):
     data = json.loads(sa_json)
-    identity = data.get("client_email")
-    if not identity:
+    identity = data.get("client_email") if isinstance(data, dict) else None
+    if not isinstance(identity, str) or not identity.strip():
         raise BudgetError("SA 缺少稳定身份，无法建立额度账本。")
-    return hashlib.sha256(str(identity).strip().lower().encode()).hexdigest()
+    return hashlib.sha256(identity.strip().lower().encode()).hexdigest()
 
 
 @contextmanager
@@ -38,12 +42,89 @@ def _connect():
     db.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, baseline INTEGER NOT NULL, spent INTEGER NOT NULL DEFAULT 0)")
     db.execute("CREATE TABLE IF NOT EXISTS holds (id TEXT PRIMARY KEY, account TEXT NOT NULL, amount INTEGER NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS trial_dates (id TEXT PRIMARY KEY, start_date TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS budget_members (id TEXT PRIMARY KEY, owner TEXT NOT NULL)")
     db.commit()
     try:
         with db:
             yield db
     finally:
         db.close()
+
+
+def _owner(db, key, expected=None):
+    row = db.execute("SELECT owner FROM budget_members WHERE id=?", (key,)).fetchone()
+    owner = row[0] if row else key
+    if expected is not None and owner != expected:
+        raise BudgetConflict("额度账号已变化，请刷新后重新确认。")
+    return owner
+
+
+def _budget_row(db, key):
+    return db.execute("SELECT baseline, spent, (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
+
+
+def _merge_snapshot(db, source, target):
+    source, target = _owner(db, source), _owner(db, target)
+    if source == target:
+        raise BudgetConflict("这两份凭证已共用同一本账。")
+    snapshots = []
+    for key in (source, target):
+        row = _budget_row(db, key)
+        date = db.execute("SELECT start_date FROM trial_dates WHERE id=?", (key,)).fetchone()
+        if row is not None and date is None:
+            raise ValueError("有已记账账号缺少赠金初始日期，请先核对并设置日期。")
+        members = tuple(r[0] for r in db.execute(
+            "SELECT id FROM budget_members WHERE owner=? ORDER BY id", (key,)))
+        snapshots.append((key, row, date[0] if date else None, members))
+    return snapshots
+
+
+def merge_accounts(source, target, *, confirmation=None, historical_usd=None):
+    """Preview or confirm an entire account merge, preserving live reservations."""
+    requested_baseline = money(historical_usd) if historical_usd is not None else None
+    with _connect() as db:
+        db.execute("BEGIN" if confirmation is None else "BEGIN IMMEDIATE")
+        snapshots = _merge_snapshot(db, source, target)
+        (source, src_row, src_date, _), (target, dst_row, dst_date, _) = snapshots
+        a, b = src_row or (0, 0, 0), dst_row or (0, 0, 0)
+        baseline = a[0] + b[0] if requested_baseline is None else requested_baseline
+        spent, reserved = a[1] + b[1], a[2] + b[2]
+        initialized = src_row is not None or dst_row is not None
+        # A fresh credential's default date must not change an existing ledger's expiry.
+        dates = [day for row, day in ((src_row, src_date), (dst_row, dst_date))
+                 if day is not None and (not initialized or row is not None)]
+        start = min(dates) if dates else None
+        stamp = hashlib.sha256(json.dumps((snapshots, baseline)).encode()).hexdigest()
+        if confirmation is not None and confirmation != stamp:
+            raise BudgetConflict("账本或分组已变化，请重新预览并确认。")
+        if not max(a[0], b[0]) <= baseline <= a[0] + b[0]:
+            raise ValueError("合并历史花费须在两份基线的较大值与合计值之间，只能扣除重复部分。")
+        if confirmation is None:
+            return {"confirmation": stamp,
+                    "source": _merge_summary(snapshots[0]), "target": _merge_summary(snapshots[1]),
+                    "merged": _merge_summary((target, (baseline, spent, reserved) if initialized else None,
+                                             start, (*snapshots[0][3], source, *snapshots[1][3])))}
+        if initialized:
+            db.execute("INSERT INTO accounts VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE "
+                       "SET baseline=excluded.baseline, spent=excluded.spent", (target, baseline, spent))
+        db.execute("UPDATE holds SET account=? WHERE account=?", (target, source))
+        db.execute("UPDATE budget_members SET owner=? WHERE owner=?", (target, source))
+        db.execute("INSERT INTO budget_members VALUES (?, ?)", (source, target))
+        if start is not None:
+            db.execute("INSERT INTO trial_dates VALUES (?, ?) ON CONFLICT(id) DO UPDATE "
+                       "SET start_date=excluded.start_date", (target, start))
+        db.execute("DELETE FROM accounts WHERE id=?", (source,))
+        db.execute("DELETE FROM trial_dates WHERE id=?", (source,))
+    return {"account_id": target}
+
+
+def _merge_summary(snapshot):
+    key, row, date, members = snapshot
+    baseline, spent, reserved = row or (0, 0, 0)
+    remaining = max(0, LIMIT - baseline - spent - reserved) / 1e9 if row is not None else None
+    return {"account_id": key, "baseline": baseline / 1e9, "spent": spent / 1e9,
+            "reserved": reserved / 1e9, "remaining": remaining, "start_date": date,
+            "member_ids": (key, *members)}
 
 
 def money(value):
@@ -73,12 +154,17 @@ def _parse_start_date(value):
 def ensure_trial_date(key, start_date=None):
     day = _parse_start_date(start_date) if start_date is not None else _today()
     with _connect() as db:
-        db.execute("INSERT OR IGNORE INTO trial_dates VALUES (?, ?)", (key, day.isoformat()))
+        db.execute("""INSERT OR IGNORE INTO trial_dates
+                    SELECT ?, ? WHERE NOT EXISTS (
+                        SELECT 1 FROM budget_members WHERE id=? OR owner=?)""",
+                   (key, day.isoformat(), key, key))
 
 
-def set_trial_date(key, start_date):
+def set_trial_date(key, start_date, *, expected_owner=None):
     day = _parse_start_date(start_date)
     with _connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        key = _owner(db, key, expected_owner)
         db.execute("INSERT INTO trial_dates VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET start_date=excluded.start_date",
                    (key, day.isoformat()))
 
@@ -98,10 +184,11 @@ def _trial_status(db, key):
             "days_remaining": max(0, (end - today).days), "expired": today >= end}
 
 
-def initialize(key, amount):
+def initialize(key, amount, *, expected_owner=None):
     amount = money(amount)
     with _connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        key = _owner(db, key, expected_owner)
         if db.execute("SELECT 1 FROM accounts WHERE id=?", (key,)).fetchone():
             raise ValueError("历史花费已确认，不能重复初始化或清零。")
         db.execute("INSERT INTO accounts(id, baseline) VALUES (?, ?)", (key, amount))
@@ -110,12 +197,14 @@ def initialize(key, amount):
 
 def status(key):
     with _connect() as db:
-        row = db.execute("SELECT baseline, spent, (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
+        db.execute("BEGIN")
+        key = _owner(db, key)
+        row = _budget_row(db, key)
         trial = _trial_status(db, key)
     if row is None:
-        return {"initialized": False, "limit": 295, "blocked": True, **trial}
+        return {"initialized": False, "limit": 295, "account_id": key, "blocked": True, **trial}
     baseline, spent, reserved = row
-    return {"initialized": True, "limit": 295, "baseline": baseline / 1e9,
+    return {"initialized": True, "limit": 295, "account_id": key, "baseline": baseline / 1e9,
             "spent": spent / 1e9, "reserved": reserved / 1e9,
             "remaining": max(0, LIMIT - baseline - spent - reserved) / 1e9,
             "blocked": trial["expired"] or baseline + spent + reserved >= LIMIT, **trial}
@@ -125,6 +214,7 @@ def reserve(key, amount):
     token = uuid.uuid4().hex
     with _connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        key = _owner(db, key)
         row = db.execute("SELECT baseline + spent + (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
         if row is None:
             raise BudgetError("SA 尚未确认历史花费，请在控制台初始化额度账本。")
@@ -133,7 +223,7 @@ def reserve(key, amount):
         if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
             raise ValueError("预留金额必须是非负纳美元整数。")
         if row[0] >= LIMIT or row[0] + amount > LIMIT:
-            raise BudgetError("SA 剩余额度不足以预留本次请求费用（独立限额 $295）。")
+            raise BudgetError("SA 剩余额度不足以预留本次请求费用（账本限额 $295）。")
         db.execute("INSERT INTO holds VALUES (?, ?, ?)", (token, key, amount))
     return token
 

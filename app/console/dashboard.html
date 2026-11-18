@@ -34,6 +34,7 @@
   ::-webkit-scrollbar-thumb:hover{background:#c0c0ca}
   .toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--fg); color:#fff; padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:.25s; pointer-events:none; z-index:50; }
   .modal-mask{position:fixed;inset:0;background:rgba(15,15,20,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
+  #sa-merge-dialog[open]{display:flex;flex-direction:column}
   .modal-card{background:#fff;border-radius:14px;width:min(560px,94vw);max-height:82vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.2)}
   .toast.show { opacity:1; }
   .switch { position:relative; width:40px; height:22px; }
@@ -442,13 +443,34 @@
           <button class="btn px-4 py-2 text-sm" onclick="setStrategy('vertex')">设为当前策略</button>
         </div>
         <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
-          <div class="lbl">服务账号（可配多个，按轮询/随机选择使用）</div>
-          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addSaAccount()">+ 添加账号</button>
+          <div class="lbl">SA 额度账号</div>
+          <button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addSaAccount()">+ 添加凭证</button>
         </div>
-        <div id="sa-accounts"></div>
-        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">每行一个服务账号：粘贴完整 <b>SA JSON</b>（含 <code>client_email</code> / <code>private_key</code> / <code>project_id</code>）+ 可选 Project ID 覆盖 + 区域。SA JSON 输入框留空 = 保持该账号原值不变。<b>凭证只回显掩码</b>（client_email + project + location），永不回填 JSON。</p>
+        <div id="sa-new-account" class="empty:hidden mb-3"></div>
+        <div id="sa-accounts" class="grid gap-3"></div>
+        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">同一份赠金可手动挂载多份凭证，共享 $295 保护线和截止日。请按实际账单校正起算日。预留不等于实扣，搜索结算可能超额。每份凭证填入完整 <b>SA JSON</b>（含 <code>client_email</code> / <code>private_key</code> / <code>project_id</code>）+ 可选 Project ID 覆盖 + 区域。SA JSON 输入框留空 = 保持该账号原值不变。<b>凭证只回显掩码</b>（client_email + project + location），永不回填 JSON。</p>
         <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限：请妥善保管、只用于本项目、必要时轮换。区域默认 <code>global</code>（多数 Gemini 模型只在 global 提供）。</p>
       </div>
+
+      <dialog id="sa-merge-dialog" aria-labelledby="sa-merge-title" class="rounded-xl border border-neutral-200 text-sm overflow-hidden backdrop:bg-black/40" style="width:min(680px,calc(100% - 24px));max-height:88vh" oncancel="if(saMergeBusy)event.preventDefault()">
+        <div class="overflow-auto min-h-0 p-4">
+          <h3 id="sa-merge-title" class="font-semibold text-base mb-1">挂载到同一额度账号</h3>
+          <p class="text-xs text-neutral-500 mb-3">凭证和项目不变。确认会合并整个来源组，不能在控制台拆回。取消不会删除刚添加的凭证。</p>
+          <div class="grid gap-2 mb-3">
+            <p class="font-medium">来源：<span id="sa-merge-from"></span></p>
+            <label class="text-xs">目标额度账号<select id="sa-merge-target" class="inp" onchange="resetSaMerge()"></select></label>
+            <label class="text-xs">核对后的历史花费（美元；可选）<input id="sa-merge-history" class="inp" type="number" min="0" step="any" placeholder="留空则两份历史花费相加" oninput="resetSaMerge()"></label>
+            <p class="text-xs text-neutral-500">仅在两份历史费用重叠时填写核对后的总额。新增费用和预留始终相加；两份已记账账本取较早的赠金起算日。</p>
+          </div>
+          <div id="sa-merge-summary" class="grid gap-2 sm:grid-cols-3 text-xs" aria-live="polite"></div>
+          <p id="sa-merge-notice" class="text-xs text-red-700 mt-2" role="alert"></p>
+        </div>
+        <div class="flex flex-wrap gap-2 justify-end p-3 border-t border-neutral-200 shrink-0 bg-white">
+          <button id="sa-merge-cancel" class="btn-ghost px-3 py-2 text-xs" onclick="this.closest('dialog').close()">取消</button>
+          <button id="sa-merge-preview" class="btn-ghost px-3 py-2 text-xs" onclick="submitSaMerge(false)">预览合并</button>
+          <button id="sa-merge-apply" class="btn px-3 py-2 text-xs" onclick="submitSaMerge(true)" disabled>确认共享额度</button>
+        </div>
+      </dialog>
 
       <!-- 混合自动标签页 -->
       <div id="ctab-hybrid" class="ctab-pane hidden">
@@ -1374,7 +1396,7 @@ async function loadRuntime(){
     $('express-keys-summary').textContent='当前生效 '+(keys.length||0)+' 个：'+(keys.join('、')||'（未配置）')+
       (ctrl?'　[控制台管理]':(envN?'　[来自环境变量]':''));
     renderCookieAccounts(s.cookie_accounts||[]);
-    renderSaAccounts(s.sa_accounts||[]);
+    renderSaAccounts(s.sa_accounts||[],s.sa_accounts_controlled);
     renderHybridConfig(s.hybrid_channels||[], s.channel_retry_overrides||{}, s.hybrid_dispatch_mode||'priority');
     if($('paygo_tier')) $('paygo_tier').value=s.paygo_tier||'auto';
     if($('paygo_only')) $('paygo_only').checked=!!s.paygo_only;
@@ -1384,60 +1406,150 @@ async function loadRuntime(){
 /* ---- 服务账号（第三通道）---- */
 const SA_LOCATIONS=['global','us-central1','us-east1','us-east4','us-west1','us-west4','northamerica-northeast1','southamerica-east1','europe-west1','europe-west4','europe-west8','europe-west9','asia-east1','asia-east2','asia-northeast1','asia-northeast3','asia-southeast1','australia-southeast1'];
 function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function saRowHtml(acc, isNew){
+function saRowHtml(acc){
   const idx=acc?acc.index:-1;
   const row=document.createElement('div');
   row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
   if(acc)row.dataset.credentialId=acc.credential_id||'';
   const head=acc
-    ? `<div class="text-xs text-neutral-500 mb-2">账号 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
+    ? `<div class="text-xs text-neutral-500 mb-2 break-all">凭证 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
     : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
-  const budget=acc?.budget;
-  const budgetHtml=!acc?'':budget?.initialized
-    ? `<section class="sa-budget mb-3" data-budget-index="${idx}" aria-label="账号额度明细"><div class="flex flex-wrap justify-between gap-2 mb-2"><strong class="text-sm">独立额度 $295</strong><span class="text-xs sa-budget-status"></span></div><div style="height:56px;position:relative"><canvas class="sa-budget-chart" role="img" aria-label="历史花费、新增费用与预留额度分布"></canvas></div><dl class="sa-budget-values" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px;font-variant-numeric:tabular-nums"></dl><p class="text-xs text-neutral-500 mt-2">保护账本含未返还促销金额；预留不等于实扣。搜索结算后熔断，可能超额。</p><p class="text-xs sa-budget-refresh text-neutral-500 mt-1" aria-live="polite"></p></section>`
-    : `<div class="flex flex-wrap gap-2 mb-2"><label class="text-xs">历史已用美元（未确认前禁止调用）<input class="inp acc-sa-baseline" type="number" min="0" step="0.000001" placeholder="请输入已用金额，零也需确认"></label><button class="px-3 py-1 text-xs rounded-lg border border-neutral-300" onclick="initSaBudget(this,${idx})">确认历史花费</button></div>`;
-  row.innerHTML=head+budgetHtml+
-    (acc?`<div class="flex flex-wrap items-end gap-2 mb-3"><label class="text-xs text-neutral-500">赠金初始日期（UTC）<input class="inp acc-sa-start-date" type="date" value="${escapeHtml(budget?.start_date||'')}"></label><button class="px-3 py-1 text-xs rounded-lg border border-neutral-300" onclick="saveSaTrialDate(this,${idx})">保存日期</button><span class="text-xs text-neutral-500 sa-trial-summary">${budget?.expires_on?'本地截止 '+escapeHtml(budget.expires_on)+' 00:00 UTC，剩余 '+budget.days_remaining+' 天':'日期待确认'}</span><p class="text-xs text-neutral-500" style="flex-basis:100%">默认按首次录入日计算，不等于 Google 实际赠金起算日；请按结算控制台校正。日期缺失或到期即停止新请求，修改日期不重置费用。</p></div>`:'')+
-    `<textarea class="inp log mb-2 acc-sa-json" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
+  let destination='';
+  if(!acc&&saControlled&&saGroups.size){
+    destination=`<label class="text-xs block mb-2">额度归属<select class="inp acc-sa-target"><option value="">保留原归属；首次添加则独立记账</option>${saOptions()}</select></label>`;
+  }
+  if(acc&&!saControlled){
+    row.innerHTML=head+`<p class="text-xs text-neutral-500 break-all">${escapeHtml(acc.project_id)} · 来自环境变量。添加控制台凭证后，环境凭证不再作为回退。</p>`;
+    return row;
+  }
+  row.innerHTML=head+destination+
+    `<textarea class="inp log mb-2 acc-sa-json" aria-label="服务账号 JSON" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
     `<div class="flex flex-wrap gap-2 mb-2">`+
-      `<input class="inp acc-sa-project" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:180px">`+
-      `<select class="inp acc-sa-location">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${acc&&acc.location===l?'selected':''}>${l}</option>`).join('')+`</select>`+
+      `<input class="inp acc-sa-project" aria-label="Project ID" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:min(180px,100%)">`+
+      `<select class="inp acc-sa-location" aria-label="区域">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${acc&&acc.location===l?'selected':''}>${l}</option>`).join('')+`</select>`+
     `</div>`+
     `<div class="flex justify-end gap-2">`+
-    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delSaAccount(${idx})">删除</button>`:'')+
-    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveSaRow(this,${idx})">${acc?'保存此账号':'添加'}</button>`+
+    (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delSaAccount(this,${idx})">删除</button>`:'')+
+    `<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="saveSaRow(this,${idx})">${acc?'保存凭证':'添加凭证'}</button>`+
     `</div>`;
   return row;
 }
+let saGroups=new Map();
+let saControlled=false;
+function saOptions(except){
+  return [...saGroups].filter(([id])=>id!==except).map(([id,g])=>
+    `<option value="${escapeHtml(id)}">${escapeHtml(g.label+' · '+(g.rows[0].project_id||g.rows[0].client_email||'未设置项目'))}</option>`).join('');
+}
+function saTrialText(b){
+  return b.expires_on?`本地截止 ${b.expires_on} 00:00 UTC，剩余 ${b.days_remaining} 天`:'日期待确认';
+}
+function saGroupCard(group){
+  const {rows,label}=group;
+  const a=rows[0], b=a.budget, idx=a.index;
+  const card=document.createElement('section');
+  card.className='card sa-group p-3 min-w-0';
+  card.dataset.accountId=a.account_id||'';
+  card.dataset.credentialId=a.credential_id||'';
+  const canMerge=a.account_id&&saGroups.size>1;
+  let budget='<p class="text-xs text-neutral-500">账本暂不可用，请刷新后重试。</p>';
+  if(a.account_id){
+    budget=b.initialized?
+      `<section class="sa-budget mb-3" data-budget-index="${idx}" aria-label="额度明细"><p class="text-xs font-medium sa-budget-status"></p><div style="height:56px;position:relative"><canvas class="sa-budget-chart" role="img" aria-label="历史花费、新增费用与预留额度分布"></canvas></div><dl class="sa-budget-values" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;font-variant-numeric:tabular-nums"></dl><p class="text-xs sa-budget-refresh text-neutral-500 mt-1"></p></section>`:
+      `<div class="flex flex-wrap items-end gap-2 mb-3"><label class="text-xs">历史已用美元（确认前禁止调用）<input class="inp acc-sa-baseline" type="number" min="0" step="any" placeholder="零也需确认"></label><button class="btn-ghost px-3 py-1 text-xs" onclick="initSaBudget(this,${idx})">确认历史花费</button></div>`;
+    budget+=`<div class="flex flex-wrap items-end gap-2 mb-3"><label class="text-xs">赠金初始日期（UTC）<input class="inp acc-sa-start-date" type="date" value="${escapeHtml(b.start_date||'')}"></label><button class="btn-ghost px-3 py-1 text-xs" onclick="saveSaTrialDate(this,${idx})">保存日期</button><span class="text-xs text-neutral-500 sa-trial-summary">${escapeHtml(saTrialText(b))}</span></div>`;
+  }
+  card.innerHTML=`<div class="flex justify-between items-center flex-wrap gap-2 mb-3"><div><h3 class="text-sm font-semibold">${label} · $295</h3><p class="text-xs text-neutral-500 mt-1">${rows.length} 份已配置凭证 · ${rows.length>1?'共享费用与截止日':'单组记账'}</p></div>${canMerge?'<button class="btn-ghost px-3 py-1 text-xs" onclick="openSaMerge(this.closest(\'.sa-group\').dataset.accountId)">挂到其他额度账号</button>':''}</div>`+budget;
+  rows.forEach(a=>card.appendChild(saRowHtml(a)));
+  return card;
+}
+let saMergeSource='';
+let saMergePreview=null;
+let saMergeBusy=false;
+function openSaMerge(source,target=''){
+  const group=saGroups.get(source);
+  if(!group||$('sa-merge-dialog').open)return;
+  saMergeSource=source;
+  $('sa-merge-from').textContent=group.label;
+  $('sa-merge-target').innerHTML='<option value="">请选择额度账号</option>'+saOptions(source);
+  $('sa-merge-target').value=target;
+  $('sa-merge-history').value='';
+  resetSaMerge();
+  $('sa-merge-dialog').showModal();
+  if(target)submitSaMerge(false);
+}
+function resetSaMerge(){
+  saMergePreview=null;
+  $('sa-merge-summary').replaceChildren();
+  $('sa-merge-notice').textContent='';
+  $('sa-merge-apply').disabled=true;
+}
+async function submitSaMerge(apply){
+  if(saMergeBusy)return;
+  const source=saGroups.get(saMergeSource),target=saGroups.get($('sa-merge-target').value);
+  if(!source||!target){$('sa-merge-notice').textContent='请选择有效的目标额度账号。';return;}
+  if(apply&&!saMergePreview)return;
+  const payload={source_credential_id:source.rows[0].credential_id,target_credential_id:target.rows[0].credential_id};
+  const historical=$('sa-merge-history');
+  if(!historical.validity.valid){$('sa-merge-notice').textContent='请输入有效的非负美元金额。';return;}
+  const history=historical.value.trim();
+  if(history)payload.historical_usd=history;
+  if(apply)payload.confirmation=saMergePreview.confirmation;
+  resetSaMerge();
+  saMergeBusy=true;
+  const fields=['sa-merge-target','sa-merge-history','sa-merge-preview','sa-merge-cancel'];
+  fields.forEach(id=>$(id).disabled=true);
+  try{
+    const r=await fetch('/api/sa-budget/merge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok){$('sa-merge-notice').textContent=d.error||'请求失败，请重试。';return;}
+    if(apply){$('sa-merge-dialog').close();toast('已挂载，共用同一个额度账本');await loadRuntime();return;}
+    const exactMoney=new Intl.NumberFormat('zh-CN',{style:'currency',currency:'USD',maximumFractionDigits:9});
+    const memberLabels=new Map([...saGroups.values()].flatMap(g=>g.rows.map(a=>[a.credential_id,a.project_id||a.client_email])));
+    $('sa-merge-summary').innerHTML=[['来源',d.source],['目标',d.target],['合并后',d.merged]].map(([name,b])=>{
+      const members=b.member_ids.map(id=>memberLabels.get(id)||'未配置凭证 '+id.slice(0,8)).join('、');
+      const values=[['历史已用',exactMoney.format(b.baseline)],['本代理新增',exactMoney.format(b.spent)],['在途预留',exactMoney.format(b.reserved)],['可用额度',b.remaining==null?'未初始化':exactMoney.format(b.remaining)],['赠金起算',b.start_date||'待确认']];
+      return `<section class="border border-neutral-200 rounded-lg p-2 min-w-0"><h4 class="font-semibold">${name} · ${b.member_ids.length} 份凭证</h4><p class="text-neutral-500 break-all mb-1">${escapeHtml(members)}</p><dl class="grid grid-cols-2 gap-1">${values.map(([k,v])=>`<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl></section>`;
+    }).join('');
+    saMergePreview=d;
+    $('sa-merge-apply').disabled=false;
+  }catch(e){$('sa-merge-notice').textContent='请求失败。请刷新核对是否已合并，再重试。';}
+  finally{saMergeBusy=false;fields.forEach(id=>$(id).disabled=false);}
+}
 async function saveSaTrialDate(btn,idx){
-  const row=btn.closest('.account-row'),day=row.querySelector('.acc-sa-start-date').value;
+  const row=btn.closest('.sa-group'),day=row.querySelector('.acc-sa-start-date').value;
   if(!day){toast('请选择赠金初始日期');return;}
   if(!confirm('将赠金初始日期设为 '+day+'？这可能改变日期熔断状态，但不会清零费用。'))return;
   btn.disabled=true;
   try{
-    const r=await fetch('/api/sa-trial-date',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:row.dataset.credentialId,start_date:day})});
+    const r=await fetch('/api/sa-trial-date',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:row.dataset.credentialId,account_id:row.dataset.accountId,start_date:day})});
     const d=await r.json();if(r.ok){toast('赠金日期已保存');loadRuntime();}else toast(d.error||'保存失败');
   }catch(e){toast('网络请求失败');}finally{btn.disabled=false;}
 }
 async function initSaBudget(btn,idx){
-  const amount=btn.closest('.account-row').querySelector('.acc-sa-baseline').value.trim();
+  const card=btn.closest('.sa-group');
+  const amount=card.querySelector('.acc-sa-baseline').value.trim();
   if(amount===''||!Number.isFinite(Number(amount))||Number(amount)<0){toast('请输入有效的非负美元金额');return;}
   if(!confirm('确认该账号历史已用 $'+amount+'？只能初始化一次，不能清零。'))return;
   btn.disabled=true;
   try{
-    const r=await fetch('/api/sa-budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:btn.closest('.account-row').dataset.credentialId,historical_usd:amount})});
+    const r=await fetch('/api/sa-budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:card.dataset.credentialId,account_id:card.dataset.accountId,historical_usd:amount})});
     const d=await r.json();
     if(r.ok){toast('额度账本已初始化');loadRuntime();}else toast(d.error||'初始化失败');
   }catch(e){toast('网络请求失败');}finally{btn.disabled=false;}
 }
-function addSaAccount(){ $('sa-accounts').appendChild(saRowHtml(null,true)); }
+function addSaAccount(){
+  const box=$('sa-new-account');
+  if(!box.firstElementChild)box.appendChild(saRowHtml(null));
+  box.querySelector('textarea').focus();
+}
 const saBudgetCharts=new Map();
 const saBudgetMoney=new Intl.NumberFormat('zh-CN',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:6});
 function updateSaBudget(acc){
   const section=document.querySelector(`[data-budget-index="${acc.index}"]`);
   const b=acc.budget;
   if(!section)return;
-  if(section.closest('.account-row').dataset.credentialId!==acc.credential_id||!b?.initialized){
+  const card=section.closest('.sa-group');
+  if(card.dataset.credentialId!==acc.credential_id||card.dataset.accountId!==acc.account_id||!b?.initialized){
     section.querySelector('.sa-budget-status').textContent='账号状态已变化，请刷新页面';
     section.querySelector('.sa-budget-values').replaceChildren();
     const chart=saBudgetCharts.get(acc.index);if(chart){chart.destroy();saBudgetCharts.delete(acc.index);}
@@ -1445,7 +1557,7 @@ function updateSaBudget(acc){
   }
   const used=b.baseline+b.spent, occupied=used+b.reserved;
   section.querySelector('.sa-budget-status').textContent=b.expired?'已熔断：赠金日期缺失或已到期':b.blocked?(used>=b.limit?'已熔断：累计费用达限':'暂停派发：额度被预留占满'):(occupied>=b.limit*0.9?'额度接近上限':'额度保护中');
-  const summary=section.closest('.account-row').querySelector('.sa-trial-summary');
+  const summary=card.querySelector('.sa-trial-summary');
   if(summary)summary.textContent=b.expires_on?'本地截止 '+b.expires_on+' 00:00 UTC，剩余 '+b.days_remaining+' 天':'日期待确认';
   const entries=[['历史已用',b.baseline],['本代理新增',b.spent],['待结算预留',b.reserved],['可用额度',b.remaining],['累计已用',used],['占用比例',Math.min(100,occupied/b.limit*100).toFixed(2)+'%']];
   section.querySelector('.sa-budget-values').innerHTML=entries.map(([label,value])=>`<div><dt class="text-xs text-neutral-500">${label}</dt><dd class="text-sm font-medium" style="white-space:nowrap">${typeof value==='number'?saBudgetMoney.format(value):value}</dd></div>`).join('');
@@ -1458,11 +1570,28 @@ function updateSaBudget(acc){
   if(chart){chart.data.datasets.forEach((d,i)=>{d.data=datasets[i].data;});chart.options.animation=reduced?false:{duration:400,easing:'easeOutQuart'};chart.options.scales.x.max=Math.max(b.limit,occupied);chart.update(reduced?'none':undefined);}
   else{chart=new Chart(section.querySelector('canvas'),{type:'bar',data:{labels:['额度占用'],datasets},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:500,easing:'easeOutQuart'},scales:{x:{stacked:true,min:0,max:Math.max(b.limit,occupied),display:false},y:{stacked:true,display:false}},plugins:{legend:{position:'bottom',labels:{boxWidth:9,boxHeight:9,font:{size:11},color:'#525252'},onClick:()=>{}},tooltip:{callbacks:{label:c=>c.dataset.label+'：'+saBudgetMoney.format(c.raw)}}}}});saBudgetCharts.set(acc.index,chart);}
 }
-function renderSaAccounts(accounts){
+function renderSaAccounts(accounts,controlled){
   saBudgetCharts.forEach(chart=>chart.destroy());saBudgetCharts.clear();
-  const box=$('sa-accounts'); box.innerHTML='';
-  (accounts||[]).forEach(a=>box.appendChild(saRowHtml(a,false)));
-  (accounts||[]).forEach(updateSaBudget);
+  const box=$('sa-accounts');box.replaceChildren();
+  saControlled=controlled;
+  saGroups=new Map();
+  const cards=new Map();
+  for(const a of accounts){
+    const id=a.account_id||`unavailable-${a.index}`;
+    if(!cards.has(id))cards.set(id,{rows:[],label:`额度账号 #${cards.size+1}`});
+    cards.get(id).rows.push(a);
+  }
+  for(const [id,g] of cards)if(g.rows[0].account_id)saGroups.set(id,g);
+  for(const g of cards.values()){
+    box.appendChild(saGroupCard(g));
+    updateSaBudget(g.rows[0]);
+  }
+  const select=$('sa-new-account').querySelector('.acc-sa-target');
+  if(select){
+    const selected=select.value;
+    select.innerHTML='<option value="">保留原归属；首次添加则独立记账</option>'+saOptions();
+    if(saGroups.has(selected))select.value=selected;
+  }
 }
 let saBudgetRefreshing=false;
 async function refreshSaBudgets(){
@@ -1485,23 +1614,34 @@ async function refreshSaBudgets(){
   finally{saBudgetRefreshing=false;}
 }
 setInterval(refreshSaBudgets,5000);
-async function saveSaRow(btn, idx){
+async function saveSaRow(btn,idx){
   const row=btn.closest('.account-row');
   const sa=row.querySelector('.acc-sa-json').value.trim();
   const pid=extractProject(row.querySelector('.acc-sa-project').value);
   const loc=row.querySelector('.acc-sa-location').value;
-  if(!sa && !pid && idx<0){ toast('新增账号必须粘贴服务账号 JSON'); return; }
+  const target=row.querySelector('.acc-sa-target')?.value;
+  if(!sa&&idx<0){toast('新增凭证必须粘贴服务账号 JSON');return;}
+  btn.disabled=true;
   try{
-    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,sa_json:sa,project_id:pid,location:loc,delete:false})});
+    const payload={index:idx,credential_id:row.dataset.credentialId,sa_json:sa,project_id:pid,location:loc};
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d=await r.json();
-    if(r.ok){ toast('✅ 已保存服务账号（当前共 '+d.count+' 个）'); loadRuntime(); }
-    else toast('❌ '+(d.error||'保存失败'));
-  }catch(e){ toast('❌ 网络请求失败'); }
+    if(!r.ok){toast(d.error||'保存失败');return;}
+    if(idx<0)row.remove();
+    await loadRuntime();
+    if(!target){toast('已保存服务账号凭证');return;}
+    const source=[...saGroups].find(([,g])=>g.rows.some(a=>a.credential_id===d.credential_id))?.[0];
+    if(!source||!saGroups.has(target)){toast('凭证已保存；请重新选择挂载目标');return;}
+    if(source===target){toast('凭证已保存，已属于所选额度账号');return;}
+    openSaMerge(source,target);
+  }catch(e){toast('网络请求失败');}
+  finally{btn.disabled=false;}
 }
-async function delSaAccount(idx){
-  if(!confirm('确认删除该服务账号？')) return;
+async function delSaAccount(btn,idx){
+  const key=btn.closest('.account-row').dataset.credentialId;
+  if(!confirm('确认删除该凭证？不会清除费用或额度归属。')) return;
   try{
-    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,delete:true})});
+    const r=await fetch('/api/sa-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,credential_id:key,delete:true})});
     const d=await r.json();
     if(r.ok){ toast('✅ 已删除（当前共 '+d.count+' 个）'); loadRuntime(); }
     else toast('❌ '+(d.error||'删除失败'));

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from fastapi import FastAPI, Depends, Request, HTTPException
@@ -22,6 +23,7 @@ from model_loader import get_express_models
 
 from cookie_auth import validate_cookie
 from upstreams.service_account import validate_sa_credentials
+import sa_budget
 
 express_key_manager = ExpressKeyManager()
 
@@ -177,16 +179,17 @@ def mask_sa_account(a: dict, index: int) -> dict:
         email = str(json.loads(a.get("sa_json", "")).get("client_email") or "")
     except Exception:
         pass
-    import sa_budget
+    key = ""
     try:
         key = sa_budget.credential_id(a.get("sa_json", ""))
         sa_budget.ensure_trial_date(key)
         budget = sa_budget.status(key)
-    except (ValueError, OSError, sa_budget.BudgetError):
+    except (ValueError, OSError, sqlite3.Error, sa_budget.BudgetError):
         budget = {"initialized": False, "blocked": True, "limit": 295}
     return {
         "budget": budget,
-        "credential_id": sa_budget.credential_id(a.get("sa_json", "")) if email else "",
+        "credential_id": key,
+        "account_id": budget.get("account_id", ""),
         "index": index,
         "client_email": email,
         "project_id": a.get("project_id", ""),
@@ -364,6 +367,7 @@ async def save_cookie_account(item: CookieAccountItem, _auth: bool = Depends(req
 class SABudgetInitialization(BaseModel):
     index: int
     credential_id: str
+    account_id: str | None = None
     historical_usd: str
 
 
@@ -374,7 +378,6 @@ def get_sa_budgets(_auth: bool = Depends(require_auth)):
 
 @app.post("/api/sa-budget")
 def initialize_sa_budget(item: SABudgetInitialization, _auth: bool = Depends(require_auth)):
-    import sa_budget
     accounts = app_state.get_sa_accounts()
     if not 0 <= item.index < len(accounts):
         return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
@@ -382,7 +385,9 @@ def initialize_sa_budget(item: SABudgetInitialization, _auth: bool = Depends(req
         key = sa_budget.credential_id(accounts[item.index]["sa_json"])
         if key != item.credential_id:
             return JSONResponse(status_code=409, content={"error": "账号列表已变化，请刷新后重新确认。"})
-        sa_budget.initialize(key, item.historical_usd)
+        sa_budget.initialize(key, item.historical_usd, expected_owner=item.account_id or key)
+    except sa_budget.BudgetConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
     except (ValueError, ArithmeticError, sa_budget.BudgetError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return JSONResponse(content={"status": "success", "budget": sa_budget.status(key)})
@@ -391,23 +396,53 @@ def initialize_sa_budget(item: SABudgetInitialization, _auth: bool = Depends(req
 class SATrialDate(BaseModel):
     index: int
     credential_id: str
+    account_id: str | None = None
     start_date: str
 
 
 @app.post("/api/sa-trial-date")
 def save_sa_trial_date(item: SATrialDate, _auth: bool = Depends(require_auth)):
-    import sa_budget
     accounts = app_state.get_sa_accounts()
     if not 0 <= item.index < len(accounts):
         return JSONResponse(status_code=400, content={"error": "账号索引无效。"})
-    key = sa_budget.credential_id(accounts[item.index]["sa_json"])
-    if key != item.credential_id:
-        return JSONResponse(status_code=409, content={"error": "账号列表已变化，请刷新后重新确认。"})
     try:
-        sa_budget.set_trial_date(key, item.start_date)
-    except ValueError as exc:
+        key = sa_budget.credential_id(accounts[item.index]["sa_json"])
+        if key != item.credential_id:
+            return JSONResponse(status_code=409, content={"error": "账号列表已变化，请刷新后重新确认。"})
+        sa_budget.set_trial_date(key, item.start_date, expected_owner=item.account_id or key)
+    except sa_budget.BudgetConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except (ValueError, sa_budget.BudgetError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return {"status": "success", "budget": sa_budget.status(key)}
+
+
+class SABudgetMerge(BaseModel):
+    source_credential_id: str
+    target_credential_id: str
+    confirmation: str | None = None
+    historical_usd: str | None = None
+
+
+@app.post("/api/sa-budget/merge")
+def merge_sa_budgets(item: SABudgetMerge, _auth: bool = Depends(require_auth)):
+    configured = set()
+    for account in app_state.get_sa_accounts():
+        try:
+            configured.add(sa_budget.credential_id(account.get("sa_json", "")))
+        except (ValueError, sa_budget.BudgetError):
+            continue
+    if not {item.source_credential_id, item.target_credential_id} <= configured:
+        return JSONResponse(status_code=409, content={"error": "凭证列表已变化，请刷新后重选。"})
+    try:
+        return sa_budget.merge_accounts(item.source_credential_id, item.target_credential_id,
+                                        confirmation=item.confirmation, historical_usd=item.historical_usd)
+    except sa_budget.BudgetConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except (ValueError, ArithmeticError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except (OSError, sqlite3.Error):
+        return JSONResponse(status_code=503, content={"error": "账本暂不可用，未完成挂载。"})
 
 
 class ServiceAccountItem(BaseModel):
@@ -416,6 +451,7 @@ class ServiceAccountItem(BaseModel):
     project_id: str = ""     # 留空 = 取 SA JSON 自身 project_id
     location: str = "global"
     delete: bool = False
+    credential_id: str | None = None
 
 
 @app.post("/api/sa-account")
@@ -426,9 +462,17 @@ async def save_sa_account(item: ServiceAccountItem, _auth: bool = Depends(requir
     new_sa = (item.sa_json or "").strip()
     pid = (item.project_id or "").strip()
 
+    if item.credential_id is not None:
+        try:
+            key = sa_budget.credential_id(accounts[item.index]["sa_json"]) if 0 <= item.index < len(accounts) else None
+        except (ValueError, sa_budget.BudgetError):
+            key = None
+        if key != item.credential_id:
+            return JSONResponse(status_code=409, content={"error": "凭证列表已变化，请刷新后重试。"})
+
     if item.delete:
         if 0 <= item.index < len(accounts):
-            removed = accounts.pop(item.index)
+            accounts.pop(item.index)
             app_state.set_sa_accounts(accounts)
             print(f"🔑 [账号管理] 已删除服务账号 #{item.index + 1}。")
             return JSONResponse(content={"status": "success", "count": len(accounts)})
@@ -455,10 +499,17 @@ async def save_sa_account(item: ServiceAccountItem, _auth: bool = Depends(requir
     v = validate_sa_credentials(new_sa)
     if not v["valid"]:
         return JSONResponse(status_code=400, content={"error": v["message"]})
-    accounts.append({"project_id": pid or v["project_id"], "location": loc, "sa_json": new_sa})
-    app_state.set_sa_accounts(accounts)
-    print(f"🔑 [账号管理] 已新增服务账号（当前共 {len(accounts)} 个，location={loc}）。")
-    return JSONResponse(content={"status": "success", "count": len(accounts)})
+    try:
+        key = sa_budget.credential_id(new_sa)
+        if not any(a["sa_json"] == new_sa for a in accounts):
+            accounts.append({"project_id": pid or v["project_id"], "location": loc, "sa_json": new_sa})
+            accounts = app_state.set_sa_accounts(accounts, strict=True)
+    except sa_budget.BudgetError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except (OSError, sqlite3.Error):
+        return JSONResponse(status_code=503, content={"error": "无法保存凭证，未执行挂载。"})
+    print(f"🔑 [账号管理] 已保存服务账号（当前共 {len(accounts)} 个，location={loc}）。")
+    return JSONResponse(content={"status": "success", "count": len(accounts), "credential_id": key})
 
 
 @app.post("/api/settings/mode")

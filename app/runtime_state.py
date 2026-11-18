@@ -130,7 +130,7 @@ class AppState:
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
 
-    def _save(self) -> None:
+    def _save(self, *, strict: bool = False) -> None:
         """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。"""
         try:
             target_dir = os.path.dirname(STATE_FILE) or "."
@@ -153,6 +153,8 @@ class AppState:
             except OSError:
                 pass
         except Exception as e:
+            if strict:
+                raise
             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {e}")
 
     def reload(self) -> None:
@@ -352,7 +354,7 @@ class AppState:
                 return [a for a in accounts if isinstance(a, dict) and a.get("sa_json")]
         return []
 
-    def set_sa_accounts(self, accounts: list) -> list:
+    def set_sa_accounts(self, accounts: list, *, strict: bool = False) -> list:
         """整表覆盖保存服务账号列表；空列表 = 清空控制台列表，回落环境变量。
 
         每项必须含非空 sa_json（project_id/location 可空，为空时用默认值）。
@@ -374,10 +376,15 @@ class AppState:
                 "sa_json": sa_json,
             })
         with self._lock:
+            previous = self._state.get("sa_accounts")
             self._state["sa_accounts"] = clean
+            try:
+                self._save(strict=strict)
+            except Exception:
+                self._state["sa_accounts"] = previous
+                raise
             self._sa_rr_index = 0
             _current_sa_account.set(None)
-            self._save()
         print(f"🔑 [状态管理器] 已保存 {len(clean)} 个服务账号。")
         return clean
 
