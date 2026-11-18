@@ -452,6 +452,8 @@ class ExpressSDKUpstream(BaseUpstream):
         priority_paygo = resolved["priority_paygo"]
         fallback_model = resolved.get("fallback_model")
         fallback_client_factory = resolved.get("fallback_client_factory")
+        # 重试换号（服务账号通道提供；其余通道为 None = 行为不变）
+        retry_client_factory = resolved.get("retry_client_factory")
 
         _log_resolved_endpoint(client_to_use, channel_name=self.channel_name)
         print(f"🌐 [上游端点] 使用官方 Gemini SDK 通过 {channel_call_text(self.channel_name)} 调用模型 {base_model_name}。")
@@ -674,6 +676,7 @@ class ExpressSDKUpstream(BaseUpstream):
             # 自动退回裸模型名重试一次，并改用不带 PayGo 层级头的普通客户端。
             fallback_model=fallback_model,
             fallback_client_factory=fallback_client_factory,
+            retry_client_factory=retry_client_factory,
             channel_name=self.channel_name,
             synthetic_tool_name=synthetic_tool_name,
             template_fields=_template_fields,

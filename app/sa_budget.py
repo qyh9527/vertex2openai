@@ -21,6 +21,10 @@ class BudgetError(RuntimeError):
     code = 429
 
 
+class BudgetUnavailable(BudgetError):
+    """This credential's ledger cannot reserve a new charge."""
+
+
 class BudgetConflict(ValueError):
     """A confirmed account or preview no longer matches the ledger."""
 
@@ -217,13 +221,13 @@ def reserve(key, amount):
         key = _owner(db, key)
         row = db.execute("SELECT baseline + spent + (SELECT COALESCE(SUM(amount),0) FROM holds WHERE account=?) FROM accounts WHERE id=?", (key, key)).fetchone()
         if row is None:
-            raise BudgetError("SA 尚未确认历史花费，请在控制台初始化额度账本。")
+            raise BudgetUnavailable("SA 尚未确认历史花费，请在控制台初始化额度账本。")
         if _trial_status(db, key)["expired"]:
-            raise BudgetError("SA 赠金日期未确认或已到期，已触发日期熔断。")
+            raise BudgetUnavailable("SA 赠金日期未确认或已到期，已触发日期熔断。")
         if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
             raise ValueError("预留金额必须是非负纳美元整数。")
         if row[0] >= LIMIT or row[0] + amount > LIMIT:
-            raise BudgetError("SA 剩余额度不足以预留本次请求费用（账本限额 $295）。")
+            raise BudgetUnavailable("SA 剩余额度不足以预留本次请求费用（账本限额 $295）。")
         db.execute("INSERT INTO holds VALUES (?, ?, ?)", (token, key, amount))
     return token
 

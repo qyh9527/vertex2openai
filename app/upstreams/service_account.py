@@ -18,6 +18,7 @@
 请求管线（预填充/思考/工具/生图/重试/failover）全部继承 ExpressSDKUpstream。
 """
 
+import asyncio
 import json
 from functools import partial
 from typing import Any, Optional
@@ -30,8 +31,11 @@ from google.oauth2 import service_account
 from upstreams.express_sdk import ExpressSDKUpstream
 from api_helpers import create_openai_error_response
 from http_options import get_http_options, resolve_paygo_bundle
-from runtime_state import app_state
+from runtime_state import _current_sa_account, app_state, sa_breaker_id
 import request_log
+import outcome
+import sa_budget
+from failover import breaker
 import sa_affinity
 import config as app_config
 
@@ -177,7 +181,6 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"))}
 
-        import sa_budget
         try:
             key = sa_budget.credential_id(sa_json)
             budget = sa_budget.status(key)
@@ -212,7 +215,67 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
             # 会话亲和：待写入的绑定决策（上游成功后才由 chat_completions/BudgetModels 落库）。
             "sa_affinity": sa_affinity.build_decision(
                 _effective_project(sa_json, project_id), base_model_name),
+            # 重试换号：可重试故障（429/503/配额）时换下一个未被本次请求试过的账号。
+            "retry_client_factory": self.make_retry_client_factory(
+                settings, base_model_name, sa_json),
         }
+
+    def make_retry_client_factory(self, settings: dict, base_model_name: str,
+                                  current_sa_json: str):
+        """Prepare the next eligible credential off-loop; adopt it in the request task."""
+        tried = {sa_budget.credential_id(current_sa_json)}
+        current_id = sa_breaker_id(current_sa_json)
+
+        def prepare():
+            while True:
+                project_id, location, sa_json = app_state.next_sa_account_excluding(tried)
+                if not sa_json:
+                    return None
+                key = sa_budget.credential_id(sa_json)
+                tried.add(key)
+                location = location or "global"
+                try:
+                    headers, timeout, _warnings = resolve_paygo_bundle(
+                        location == "global", settings, model_name=base_model_name)
+                    client = _get_cached_sa_client(sa_json, project_id, location, headers, timeout)
+                    client = sa_budget.BudgetClient(
+                        client, key, location,
+                        headers.get("X-Vertex-AI-LLM-Shared-Request-Type", "standard"))
+                except Exception as exc:
+                    print(f"⚠️ [账号切换] 跳过无法构造的备用凭证（{type(exc).__name__}）。")
+                    continue
+                return client, {"project_id": project_id, "location": location, "sa_json": sa_json}, headers, timeout
+
+        async def switch(error: Exception):
+            nonlocal current_id
+            prepared = await asyncio.to_thread(prepare)
+            if prepared is None:
+                return None
+            client, account, headers, timeout = prepared
+            project = _effective_project(account["sa_json"], account["project_id"])
+            bound = sa_affinity.preferred_project()
+            if bound == project:
+                state = "hit"
+            elif bound:
+                availability = await asyncio.to_thread(app_state.sa_project_availability, bound)
+                state = "transient" if availability == "eligible" else "structural"
+            else:
+                state = "new"
+            # The local reservation gate is not a Google credential failure.
+            if not isinstance(error, sa_budget.BudgetError):
+                if outcome.classify_exception(error) == outcome.RATE_LIMITED:
+                    breaker.report_candidate_rate_limited("vertex", current_id, str(error))
+                else:
+                    breaker.report_failure(("vertex", current_id))
+            current_id = sa_breaker_id(account["sa_json"])
+            _current_sa_account.set(account)
+            sa_affinity.note_selection(project, state)
+            sa_affinity.begin_commit(sa_affinity.build_decision(project, base_model_name))
+            request_log.note_transport(headers, timeout)
+            print(f"🔁 [账号切换] 本次请求改用另一份服务账号凭证（…{current_id[-4:]}）。")
+            return client
+
+        return switch
 
     async def chat_completions(self, request_obj, fastapi_request: Request,
                                failover_mode: bool = False, raw_mode: bool = False):

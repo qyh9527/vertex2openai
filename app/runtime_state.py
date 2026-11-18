@@ -1,5 +1,6 @@
 import contextvars
 import copy
+import hashlib
 import json
 import os
 import random
@@ -77,16 +78,14 @@ def _sa_budget_available(account: dict, sa_budget_module) -> bool:
         return False
 
 
+def sa_breaker_id(sa_json: str) -> str:
+    return hashlib.sha256(sa_json.encode("utf-8")).hexdigest()[:12] if sa_json else ""
+
+
 def _sa_credential_cooling(account: dict) -> bool:
     """该账号是否处于候选级熔断冷却（瞬时故障，不应重绑亲和）。"""
-    try:
-        import hashlib
-        from failover import breaker
-        credential = hashlib.sha256(
-            str(account.get("sa_json", "")).encode("utf-8")).hexdigest()[:12]
-        return breaker.is_cooling(("vertex", credential))
-    except Exception:
-        return False
+    from failover import breaker
+    return breaker.is_cooling(("vertex", sa_breaker_id(account.get("sa_json", ""))))
 
 
 class AppState:
@@ -432,23 +431,22 @@ class AppState:
                 import sa_budget
                 eligible = [candidate for candidate in accounts
                             if _sa_budget_available(candidate, sa_budget)]
-                pool = eligible or accounts
+                healthy = [candidate for candidate in eligible if not _sa_credential_cooling(candidate)]
+                pool = healthy or eligible or accounts
                 if preferred_project:
                     preferred = [candidate for candidate in accounts
                                  if _sa_account_project(candidate) == preferred_project]
                     if preferred:
                         preferred_eligible = [
-                            candidate for candidate in eligible
-                            if _sa_account_project(candidate) == preferred_project
-                            and not _sa_credential_cooling(candidate)]
+                            candidate for candidate in healthy
+                            if _sa_account_project(candidate) == preferred_project]
                         if preferred_eligible:
                             pool = preferred_eligible
                         else:
                             # 瞬时故障（候选熔断冷却）：本请求改用其它可用 project，绑定保留。
                             others = [
-                                candidate for candidate in eligible
-                                if _sa_account_project(candidate) != preferred_project
-                                and not _sa_credential_cooling(candidate)]
+                                candidate for candidate in healthy
+                                if _sa_account_project(candidate) != preferred_project]
                             if others:
                                 pool = others
                     # 绑定 project 已无账号/全部额度不可用：保持常规候选（结构重绑）。
@@ -470,6 +468,37 @@ class AppState:
             _current_sa_account.set(account)
         return (account.get("project_id", ""), account.get("location", "global"), account.get("sa_json", ""))
 
+    def next_sa_account_excluding(self, tried: set[str]) -> tuple:
+        """Pick a budget-eligible, non-cooling SA not tried by this request.
+
+        `tried` contains stable credential IDs (same email across key rotation),
+        not shared ledger IDs. Does not mutate the request's credential snapshot.
+        """
+        import sa_budget
+        pool = []
+        for candidate in self.get_sa_accounts():
+            try:
+                identity = sa_budget.credential_id(candidate["sa_json"])
+            except (ValueError, sa_budget.BudgetError):
+                continue
+            if (identity not in tried and not _sa_credential_cooling(candidate)
+                    and _sa_budget_available(candidate, sa_budget)):
+                pool.append(candidate)
+        if not pool:
+            return (None, None, None)
+        use_roundrobin = bool(self.get_setting("roundrobin", app_config.ROUNDROBIN))
+        with self._lock:
+            if use_roundrobin:
+                idx = self._sa_rr_index % len(pool)
+                self._sa_rr_index = (self._sa_rr_index + 1) % len(pool)
+            else:
+                idx = random.randrange(len(pool))
+            account = pool[idx]
+        print(f"🔑 [账号选择] 重试换号：未尝试的可用账号 {len(pool)} 个，选中第 {idx + 1} 个。")
+        return (account.get("project_id", ""),
+                account.get("location", "global"),
+                account.get("sa_json", ""))
+
     def sa_project_availability(self, project_id) -> str:
         """绑定 project 的结构可用性：eligible / blocked / absent（会话亲和分类用）。"""
         project = str(project_id or "").strip()
@@ -489,11 +518,9 @@ class AppState:
         SHA-256 前 12 位——熔断 key/日志绝不落原始凭证。
         无账号返回空串（调用方退回通道粒度）。
         """
-        _, _, sa_json = self.get_current_sa_account()
-        if not sa_json:
-            return ""
-        import hashlib
-        return hashlib.sha256(str(sa_json).encode("utf-8")).hexdigest()[:12]
+        account = _current_sa_account.get()
+        return sa_breaker_id(account.get("sa_json", "")) if account else ""
+
 
     # ---------- 混合自动的可配置行为（hybrid 策略下生效）----------
 

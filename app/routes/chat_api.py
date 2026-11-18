@@ -15,7 +15,7 @@ from upstreams.cookie_proxy import CookieProxyUpstream
 from upstreams.service_account import ServiceAccountUpstream
 from api_helpers import (
     extract_upstream_error, create_openai_error_response, is_retryable_exception,
-    channel_display_name, make_usage_chunk, wants_usage,
+    channel_display_name, make_usage_chunk, upstream_exception_status, wants_usage,
 )
 from usage_mapping import map_usage
 import outcome as outcome_mod
@@ -24,6 +24,7 @@ import config as app_config
 import request_log
 import raw_mode as raw_mode_mod
 import sa_affinity
+from sa_budget import BudgetError
 
 router = APIRouter()
 
@@ -193,6 +194,33 @@ def _current_credential_id(channel: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _report_failure(channel, credential, category, message, *, error=None):
+    if channel == "vertex":
+        if isinstance(error, BudgetError) or category in (
+                outcome_mod.CLIENT_CLOSED, outcome_mod.REQUEST_PERMANENT, outcome_mod.POLICY_BLOCKED):
+            return
+        credential = _current_credential_id(channel) or credential
+        if not credential:
+            return
+        if category == outcome_mod.RATE_LIMITED:
+            breaker.report_candidate_rate_limited(channel, credential, message)
+        else:
+            breaker.report_failure((channel, credential))
+    elif category == outcome_mod.RATE_LIMITED:
+        breaker.report_rate_limited(channel, credential_id=credential or None, message=message)
+    else:
+        breaker.report_failure(channel, credential_id=credential or None)
+
+
+def _report_success(channel, credential=""):
+    if channel == "vertex":
+        credential = _current_credential_id(channel) or credential
+        if credential:
+            breaker.report_success((channel, credential))
+    else:
+        breaker.report_success(channel)
 
 
 def _summarize_json_error(resp: JSONResponse) -> str:
@@ -370,7 +398,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                     # （UpstreamUnstartedError）才允许切换，已出流后原样透传收尾。
                     return StreamingResponse(
                         _stream_with_failover(resp, channels[idx + 1:], request, fastapi_request,
-                                              failover_mode, channel),
+                                              failover_mode, channel, primary_cred=cred),
                         media_type="text/event-stream",
                     )
                 # 非 hybrid：原样透传，行为与改造前完全一致（零包装开销）
@@ -390,12 +418,10 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                     _summary = _summarize_json_error(resp)
                     _cat = _explicit_category or outcome_mod.classify_failure(
                         resp.status_code, _summary)
-                    # P0-2：429 类带 Retry-After 语义的按精确窗口冷却候选（解析不出走通用计数）
-                    if _cat == outcome_mod.RATE_LIMITED:
-                        breaker.report_rate_limited(channel, credential_id=cred or None,
-                                                    message=_summary)
-                    else:
-                        breaker.report_failure(channel, credential_id=cred or None)
+                    error_body = _json_body(resp).get("error")
+                    local_budget = channel == "vertex" and isinstance(error_body, dict) and error_body.get("type") == "insufficient_quota"
+                    if not local_budget:
+                        _report_failure(channel, cred, _cat, _summary)
                     attempts.append({"channel": channel, "status": resp.status_code,
                                      "message": _summary, "category": _cat,
                                      "upstream": True})
@@ -421,9 +447,8 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 if _explicit_category is not None:
                     return resp   # 显式终止/过滤结果不清除连接健康计数
 
-            breaker.report_success(channel)
-            if cred:
-                breaker.report_success((channel, cred))
+            if channel != "vertex" or not isinstance(resp, JSONResponse) or resp.status_code < 400:
+                _report_success(channel, cred)
             return resp
 
         except UpstreamUnstartedError as e:
@@ -434,11 +459,9 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 return _explicit_exception_response(e, _explicit_category)
             if not failover_mode:
                 raise  # 非 hybrid：upstream 不应抛此异常；透传给外层兜底
-            _cat = outcome_mod.classify_exception(e)
-            if _cat == outcome_mod.RATE_LIMITED:
-                breaker.report_rate_limited(channel, credential_id=cred or None, message=str(e))
-            else:
-                breaker.report_failure(channel, credential_id=cred or None)
+            error = e.__cause__ if channel == "vertex" and e.__cause__ is not None else e
+            _cat = outcome_mod.classify_exception(error)
+            _report_failure(channel, cred, _cat, str(error), error=error)
             attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
                              "category": _cat})
             if remaining_channels(channels, idx):
@@ -457,12 +480,16 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                     explicit_category):
                 # 显式永久 generation 失败既不尝试其它通道，也不记作连接故障。
                 return _explicit_exception_response(e, explicit_category)
+            # SDK errors with an explicit 4xx take precedence over quota keywords.
+            if channel == "vertex":
+                status = upstream_exception_status(e)
+                if isinstance(status, int) and 400 <= status < 500 and status != 429:
+                    return _attach_exception_report(JSONResponse(
+                        status_code=status, content=create_openai_error_response(
+                            status, extract_upstream_error(e)[1], "upstream_error")), e)
             # 非流式/其他异常：只对"可切换"类错误继续兜底（429/503/配额等）
             _cat = outcome_mod.classify_exception(e)
-            if _cat == outcome_mod.RATE_LIMITED:
-                breaker.report_rate_limited(channel, credential_id=cred or None, message=str(e))
-            else:
-                breaker.report_failure(channel, credential_id=cred or None)
+            _report_failure(channel, cred, _cat, str(e), error=e)
             if remaining_channels(channels, idx) and _exception_switchable(e):
                 attempts.append({"channel": channel, "status": 503, "message": str(e)[:200],
                                  "category": _cat})
@@ -551,7 +578,8 @@ def _error_usage_tail(request: OpenAIRequest) -> str:
 
 async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list,
                                 request: OpenAIRequest, fastapi_request: Request,
-                                failover_mode: bool, primary_channel: str):
+                                failover_mode: bool, primary_channel: str,
+                                primary_cred: str = ""):
     """包装主通道的流式响应：
 
     - 正常：逐 chunk 透传（含 SSE 心跳），结束后给主通道记成功；
@@ -585,10 +613,11 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
         if has_output:
             if done_seen:
                 yield "data: [DONE]\n\n"
-            breaker.report_success(primary_channel)
+            _report_success(primary_channel, primary_cred)
             return
         # 空流（只有心跳/空 delta/[DONE]）：按未出流失败处理
-        breaker.report_failure(primary_channel)
+        # 带上凭证标识 → 只冷却这个候选，不把整条通道（含其它健康账号）一起停用。
+        _report_failure(primary_channel, primary_cred, outcome_mod.EMPTY_OR_PROTOCOL, "")
         if remaining:
             request_log.channel_switch(
                 primary_channel, remaining[0],
@@ -627,7 +656,8 @@ async def _stream_with_failover(primary_resp: StreamingResponse, remaining: list
                 yield tail
             yield "data: [DONE]\n\n"
             return
-        breaker.report_failure(primary_channel)
+        error = e.__cause__ if primary_channel == "vertex" and e.__cause__ is not None else e
+        _report_failure(primary_channel, primary_cred, outcome_mod.classify_exception(error), str(error), error=error)
         if not remaining:
             print(f"❌ [故障转移] {channel_display_name(primary_channel)} 通道未出流失败且无兜底通道（{str(e)[:120]}）。")
             payload = _attach_exception_report(

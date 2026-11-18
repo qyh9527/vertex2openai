@@ -97,6 +97,15 @@ class ChannelBreaker:
         print(f"⚠️ [熔断器] {_chan(channel)}{_cred(credential_id or '')} "
               f"收到限流且带精确冷却窗口（{seconds:.0f}s），已按 Retry-After 冷却。")
 
+    def report_candidate_rate_limited(self, channel: str, credential_id: str, message: str) -> None:
+        """Apply Retry-After to this candidate only, including the threshold fallback."""
+        key = self._candidate_key(channel, credential_id)
+        seconds = outcome.parse_retry_after(message)
+        if seconds is None or seconds <= 0:
+            self.report_failure(key)
+        else:
+            self.set_cooldown(key, seconds, reason="429 Retry-After")
+
     # ---------- 既有接口（通道级，行为与改造前一致）----------
 
     def is_cooling(self, key) -> bool:
@@ -141,11 +150,7 @@ class ChannelBreaker:
                 self._state.pop(k, None)
 
     def report_failure(self, key, credential_id=None) -> None:
-        """失败：连续失败计数 +1，达到阈值即进入冷却。
-
-        credential_id 非空时同时给候选 key 计数（候选粒度）；
-        通道 key 始终计数（保持既有通道级熔断行为）。
-        """
+        """记录失败；传候选元组只影响该候选，旧通道调用仍保留通道计数。"""
         now = time.time()
         targets = [key]
         if credential_id:

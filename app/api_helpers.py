@@ -4,7 +4,7 @@ import math
 import asyncio
 import httpx
 import re
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Awaitable, Callable, Optional
 
 # 进阶报告 P1-⑦：纯转换函数/类已机械搬移到 protocol_conversion.py（零手写重排），
 # 此处显式再导出，既有 from api_helpers import X 的引用与测试零改动。
@@ -42,6 +42,7 @@ from outcome import (
     GenerationEndError,
     category_switchable,
     classify_generation_end,
+    classify_exception,
     normalize_finish_reason,
 )
 from anti_truncation import (
@@ -171,6 +172,48 @@ def is_retryable_exception(e):
     if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str:
         return True
     return False
+
+
+# Keep the retry policy for other channels unchanged. SA checks an explicit
+# upstream status first: a 400/403 mentioning quota is not a capacity error.
+RetryClientFactory = Callable[[Exception], Awaitable[Any]]
+
+
+def upstream_exception_status(error: Exception):
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code
+    return getattr(error, "code", None) or getattr(error, "status_code", None)
+
+
+def _sa_retryable(error: Exception) -> bool:
+    from sa_budget import BudgetError, BudgetUnavailable
+    if isinstance(error, BudgetError):
+        return isinstance(error, BudgetUnavailable)
+    status = upstream_exception_status(error)
+    if isinstance(status, int):
+        return status in (429, 502, 503)
+    detail = str(error).lower()
+    return is_retryable_exception(error) or "resource_exhausted" in detail or "resource exhausted" in detail
+
+
+def _sa_error_payload(error: Exception) -> dict:
+    status, message = extract_upstream_error(error)
+    status = upstream_exception_status(error) or status
+    payload = create_openai_error_response(status, message[:1024], "upstream_error")
+    payload["error"]["category"] = classify_exception(error)
+    return payload
+
+
+async def _retry_client(client, factory: Optional[RetryClientFactory], error: Exception):
+    if factory is None:
+        return client
+    try:
+        replacement = await factory(error)
+    except Exception as exc:
+        # A credential construction error can contain sensitive configuration.
+        print(f"⚠️ [账号切换] 无法准备备用凭证（{type(exc).__name__}），保持当前凭证重试。")
+        return client
+    return client if replacement is None else replacement
 
 
 def report_client_failure(client, kind: str = "conn", reason: str = "") -> None:
@@ -558,6 +601,7 @@ async def gemini_fake_stream_generator(
     input_relay_strip_tag: Optional[str] = None,
     template_fields=None,
     conversion_report=None,
+    retry_client_factory: Optional[RetryClientFactory] = None,
 ):
     # 请求日志上下文：正常由路由入口创建；测试直接调用生成器时没有（或只剩已结束的），
     # 这里自建一个并由本生成器负责 finish。
@@ -693,8 +737,10 @@ async def gemini_fake_stream_generator(
                 last_error = e_call
                 if isinstance(e_call, httpx.TransportError):
                     report_client_failure(gemini_client_instance, kind="conn")
-                retryable = is_retryable_exception(e_call)
+                retryable = _sa_retryable(e_call) if retry_client_factory else is_retryable_exception(e_call)
                 if retryable and attempt < max_retries:
+                    gemini_client_instance = await _retry_client(
+                        gemini_client_instance, retry_client_factory, e_call)
                     stats.add_retry()
                     ctx.retries += 1
                     _set_phase("backoff")
@@ -859,8 +905,10 @@ async def gemini_fake_stream_generator(
         json_payload_error = json.dumps(err_resp_sse)
         # hybrid 故障转移：失败前只发过 keep-alive 空 chunk（无内容），
         # 抛给路由层切换到兜底通道；未出流承诺由"从未 yield 过内容 chunk"保证。
-        if failover_mode:
-            raise UpstreamUnstartedError(str(e_outer_gemini))
+        if failover_mode and (retry_client_factory is None or _sa_retryable(e_outer_gemini)):
+            raise UpstreamUnstartedError(str(e_outer_gemini)) from e_outer_gemini
+        if retry_client_factory is not None:
+            json_payload_error = json.dumps(_sa_error_payload(e_outer_gemini))
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
             if (tail := _failure_usage_tail()):
@@ -919,6 +967,7 @@ async def execute_gemini_call(
     failover_mode: bool = False, force_fake_streaming: bool = False,
     channel_name: Optional[str] = None, synthetic_tool_name: Optional[str] = None,
     input_relay_strip_tag: Optional[str] = None, conversion_report=None, template_fields=None,
+    retry_client_factory: Optional[RetryClientFactory] = None,
 ):
     from conversion_report import ConversionReport
 
@@ -933,7 +982,8 @@ async def execute_gemini_call(
             force_fake_streaming=force_fake_streaming, channel_name=channel_name,
             synthetic_tool_name=synthetic_tool_name, input_relay_strip_tag=input_relay_strip_tag,
             template_fields=template_fields,
-            conversion_report=report)
+            conversion_report=report,
+            retry_client_factory=retry_client_factory)
     except BaseException as error:
         if request_obj.compatibility_report and isinstance(error, Exception):
             error.conversion_report = report.to_list()
@@ -1000,6 +1050,7 @@ async def _execute_gemini_call(
     input_relay_strip_tag: Optional[str] = None,
     template_fields=None,
     conversion_report=None,
+    retry_client_factory: Optional[RetryClientFactory] = None,
 ):
     fallback_client = None
 
@@ -1045,6 +1096,7 @@ async def _execute_gemini_call(
                     input_relay_strip_tag=input_relay_strip_tag,
                     template_fields=template_fields,
                     conversion_report=conversion_report,
+                    retry_client_factory=retry_client_factory,
                 ), wants_usage(request_obj)), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -1443,6 +1495,8 @@ async def _execute_gemini_call(
                             "429" in error_str or "503" in error_str or "too many requests" in error_str
                             or "quota" in error_str or "resource exhausted" in error_str
                         )
+                        if retry_client_factory is not None:
+                            is_retryable = _sa_retryable(e_stream_call)
 
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
@@ -1458,7 +1512,8 @@ async def _execute_gemini_call(
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
-                        if is_retryable and not has_yielded and attempt < max_retries:
+                        if is_retryable and not has_yielded and not prefill_sent and attempt < max_retries:
+                            current_client = await _retry_client(current_client, retry_client_factory, e_stream_call)
                             # F-5：退避时长改读控制台的 retry_backoff_seconds，
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
                             wait_time = backoff_sec
@@ -1489,7 +1544,7 @@ async def _execute_gemini_call(
                         # 只有正文/工具调用 chunk 才置位）。
                         # 预填充已发出时不触发 failover：切换后新通道会重发预填充，客户端会看到重复开头。
                         if failover_mode and not has_yielded and not prefill_sent and is_retryable:
-                            raise UpstreamUnstartedError(str(e_stream_call))
+                            raise UpstreamUnstartedError(str(e_stream_call)) from e_stream_call
                         # 已出流异常必须明确报失败，不能只发 DONE 伪装正常收尾。
                         if has_yielded or prefill_sent:
                             yield _generation_end_error_sse(GenerationEndError(
@@ -1500,7 +1555,8 @@ async def _execute_gemini_call(
                         # 修正：只有未出流才抛；出流后必须走上面的 SSE 收尾，防止整段答案重发。
                         if is_auto_attempt:
                             raise e_stream_call
-                        err_resp = create_openai_error_response(500, s_err, "server_error")
+                        err_resp = (_sa_error_payload(e_stream_call) if retry_client_factory is not None
+                                    else create_openai_error_response(500, s_err, "server_error"))
                         yield f"data: {json.dumps(err_resp)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -1546,15 +1602,17 @@ async def _execute_gemini_call(
                     current_client = _get_fallback_client()
                     print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
-                if is_retryable_exception(e_call) and attempt < max_retries:
+                retryable = _sa_retryable(e_call) if retry_client_factory else is_retryable_exception(e_call)
+                if retryable and attempt < max_retries:
+                    current_client = await _retry_client(current_client, retry_client_factory, e_call)
                     stats.add_retry()
                     wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     await asyncio.sleep(wait_time)
                     continue
                 # hybrid 故障转移：限流/上游繁忙且内部重试已耗尽 → 抛给路由层切兜底通道
-                if failover_mode and is_retryable_exception(e_call):
-                    raise UpstreamUnstartedError(str(e_call))
+                if failover_mode and retryable:
+                    raise UpstreamUnstartedError(str(e_call)) from e_call
                 # 服务账号通道 403（计费/权限）给专属排查指引
                 _sa_hint = sa_channel_hint(channel_name, str(e_call))
                 if _sa_hint:
