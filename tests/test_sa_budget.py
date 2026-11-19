@@ -208,6 +208,22 @@ def test_price_reserves_hydrogen_at_sku_rate():
                            tier="flex") == sa_budget.money("4.14375")
 
 
+@pytest.mark.parametrize("tier,location,total,cache_read", [
+    ("standard", "global", "18", "0.15"),
+    ("priority", "global", "32.4", "0.27"),
+    ("flex", "global", "9", "0.075"),
+    ("standard", "us", "19.8", "0.165"),
+    ("priority", "us", "35.64", "0.297"),
+    ("flex", "us", "9.9", "0.0825"),
+])
+def test_price_reserves_neon_at_official_rate(tier, location, total, cache_read):
+    model = "gemini-4-neon"
+    assert sa_budget.price(model, 1_000_000, 1_000_000, tier=tier,
+                           location=location) == sa_budget.money(total)
+    assert sa_budget.price(model, 1_000_000, 0, cached=1_000_000, tier=tier,
+                           location=location) == sa_budget.money(cache_read)
+
+
 # ---------- BudgetModels：非流 / 流 / 中断 ----------
 
 class FakeModels:

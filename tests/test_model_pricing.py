@@ -142,6 +142,31 @@ class TestCarbonPrices:
         assert abs(c - 24.0) < 1e-9
 
 
+class TestNeonPrices:
+    def test_neon_price_and_proxy_aliases(self):
+        for model in ("gemini-4-neon", "fake-gemini-4-neon-search",
+                      "[EXPRESS] gemini-4-neon", "[PAY] gemini-4-neon-openai"):
+            assert get_model_price(model) == (3.00, 15.00)
+            assert model_pricing.get_cached_input_ratio(model) == 0.05
+        assert get_model_price("gemini-4n") is None
+
+    def test_neon_cost_for_standard_priority_and_flex(self):
+        for tier, input_price, output_price, cache_read in (
+            ("standard", 3.00, 15.00, 0.15),
+            ("priority", 5.40, 27.00, 0.27),
+            ("auto", 5.40, 27.00, 0.27),
+            ("flex", 1.50, 7.50, 0.075),
+        ):
+            model = "gemini-4-neon"
+            assert abs(estimate_cost(model, 1_000_000, 0, tier=tier) - input_price) < 1e-9
+            assert abs(estimate_cost(model, 0, 1_000_000, tier=tier) - output_price) < 1e-9
+            assert abs(estimate_cost(model, 1_000_000, 0, 1_000_000, tier=tier) - cache_read) < 1e-9
+
+    def test_neon_does_not_inherit_carbon_argon_price_change(self):
+        for day in (datetime.date(2026, 11, 30), datetime.date(2026, 12, 1)):
+            assert get_model_price("gemini-4-neon", day) == (3.00, 15.00)
+
+
 class TestHydrogenPrices:
     """2026-11-12 官方 SKU：Standard $1.5/$7.5，缓存 $0.075，无已公布调价日。"""
 

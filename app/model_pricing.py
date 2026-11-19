@@ -5,6 +5,7 @@
 gemini-4-carbon 于 2026-11-11 补核，与 4-argon 同价同调价日）。
 gemini-4-hydrogen 于 2026-11-12 按官方 SKU 目录补核：https://cloud.google.com/skus/?filter=hydrogen
 Hydrogen 尚无公开调价日；Priority/Flex 沿用三档系数（SKU 已列 Priority 输入与 Flex 输入价）。
+gemini-4-neon 于 2026-11-19 按 https://cloud.google.com/model-garden/pricing 核对，未公布定时调价。
 官方按「Standard / Priority / Flex-Batch」三张独立表计价（global 档）。
 规律：Priority = Standard × 1.8，Flex = Standard × 0.5（半价）；缓存命中输入默认 90% 折扣，
 个别模型另有折扣（见 CACHED_INPUT_RATIO_OVERRIDES）。
@@ -19,6 +20,7 @@ import model_capabilities as mc
 # 模型名（前缀匹配，越长越优先）→ Standard 档 (input $/1M, output $/1M)，即当前生效价；
 # 官方已公布的调价见 PRICE_SCHEDULE，到日期后自动切换，无需改这里。
 MODEL_PRICING: dict = {
+    "gemini-4-neon": (3.00, 15.00),           # 官方标准价，无已公布调价日
     "gemini-4-hydrogen": (1.50, 7.50),        # 官方 SKU 标准价，无已公布调价日
     "gemini-4-carbon": (2.00, 10.00),          # introductory，见 PRICE_SCHEDULE
     "gemini-4-argon": (2.00, 10.00),           # introductory，见 PRICE_SCHEDULE
@@ -61,6 +63,7 @@ CACHED_INPUT_DISCOUNT = 0.1
 
 # 个别模型的缓存命中系数（同样按最长前缀匹配）：4 系缓存输入 $0.1 / 输入 $2 → 95% 折扣
 CACHED_INPUT_RATIO_OVERRIDES: dict = {
+    "gemini-4-neon": 0.05,
     "gemini-4-hydrogen": 0.05,
     "gemini-4-carbon": 0.05,
     "gemini-4-argon": 0.05,
