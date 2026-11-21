@@ -21,6 +21,24 @@ class TestGetModelPrice:
         assert get_model_price("gemini-3.6-flash-search") == (0.75, 3.75)
         assert get_model_price("fake-gemini-3.6-flash-search") == (0.75, 3.75)
 
+    def test_full_resource_path_uses_model_id(self):
+        full = "projects/p/locations/us-central1/publishers/google/models/gemini-4-hydrogen"
+        assert get_model_price(full) == (1.50, 7.50)
+        assert get_model_price("models/gemini-4-hydrogen") == (1.50, 7.50)
+        assert get_model_price("fake-models/gemini-4-hydrogen") == (1.50, 7.50)
+        assert get_model_price("fake-publishers/google/models/gemini-4-hydrogen") == (1.50, 7.50)
+        assert get_model_price("publishers/google/models/gemini-4-hydrogen") == (1.50, 7.50)
+        assert abs(estimate_cost(full, 1_000_000, 1_000_000, location="us") -
+                   (1.50 + 7.50) * 1.1) < 1e-9
+        # 项目自有 Model 资源不是官方模型，保持不计费。
+        assert get_model_price("projects/p/locations/us-central1/models/gemini-4-hydrogen") is None
+
+    def test_full_path_flex_still_detects_2x(self):
+        full = "projects/p/locations/global/publishers/google/models/gemini-2.5-flash"
+        standard = estimate_cost("gemini-2.5-flash", 1_000_000, 1_000_000, tier="standard")
+        assert estimate_cost(full, 1_000_000, 1_000_000, tier="flex") == standard
+        assert estimate_cost("fake-" + full, 1_000_000, 1_000_000, tier="flex") == standard
+
     def test_unknown_returns_none(self):
         assert get_model_price("gemini-9.9-flash") is None
         assert get_model_price("") is None
@@ -216,3 +234,16 @@ class TestPriceSchedule:
         assert get_model_price("gemini-4-argon") == (4.00, 20.00)
         c = estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, 0)
         assert abs(c - 24.0) < 1e-9
+
+class TestLocationSurcharge:
+    """非 global 端点（us / eu 多区域及具体区域）按官方 +10% 计；global 与空值不加价。"""
+
+    def test_non_global_costs_ten_percent_more(self):
+        base = estimate_cost("gemini-3.6-flash", 1_000_000, 1_000_000, 500_000)
+        for location in ("us", "eu", "us-central1"):
+            assert abs(estimate_cost("gemini-3.6-flash", 1_000_000, 1_000_000,
+                                     500_000, location=location) - base * 1.1) < 1e-9
+        assert estimate_cost("gemini-3.6-flash", 1_000_000, 1_000_000, 500_000,
+                             location="global") == base
+        assert estimate_cost("gemini-3.6-flash", 1_000_000, 1_000_000, 500_000,
+                             location="") == base

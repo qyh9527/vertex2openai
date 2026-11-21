@@ -34,7 +34,8 @@ import config as app_config
 from config import VERTEX_REASONING_TAG
 
 import model_capabilities as mc
-from runtime_state import app_state
+from runtime_state import (_current_pricing_location, _current_pricing_tier,
+                           _current_region_fallback, _pending_region_failure, app_state)
 from usage_mapping import map_usage, with_usage_null
 from failover import UpstreamUnstartedError
 from outcome import (
@@ -62,6 +63,7 @@ from input_relay import RelayBlockStreamStripper, strip_generated_relay_blocks
 from logger import stats
 import request_log
 import sa_affinity
+import sa_region_pin
 
 # 假流式前缀：请求 fake-<模型名> 时该请求走假流式（标准 SDK 通道通用），其余模型保持真实流式。
 # 定义在公共模块：models_api（列表暴露）、express_sdk（强制假流式）、cookie_proxy（剥前缀）共用。
@@ -179,6 +181,18 @@ def is_retryable_exception(e):
 RetryClientFactory = Callable[[Exception], Awaitable[Any]]
 
 
+class RetryStop(Exception):
+    """retry 工厂明确表示该通道不应再发起更多上游尝试（例如区域回退已用完且无备用凭证）。
+
+    original_error 保存临时区域尝试之前的原始失败；终态响应/故障转移应使用它，
+    避免把区域端点的 404 当成「模型不存在」返回给客户端。
+    """
+
+    def __init__(self, message="", original_error=None):
+        super().__init__(message)
+        self.original_error = original_error
+
+
 def upstream_exception_status(error: Exception):
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code
@@ -191,9 +205,30 @@ def _sa_retryable(error: Exception) -> bool:
         return isinstance(error, BudgetUnavailable)
     status = upstream_exception_status(error)
     if isinstance(status, int):
+        # 区域回退仅换了 location；此时 404 视为该区域不可用，继续按凭证轮换重试。
+        if status == 404 and _current_region_fallback.get():
+            return True
         return status in (429, 502, 503)
     detail = str(error).lower()
     return is_retryable_exception(error) or "resource_exhausted" in detail or "resource exhausted" in detail
+
+
+def _region_terminal_error(error: Exception) -> Exception:
+    """区域回退进入终态时换回原始 global 错误，保持不同重试配置下的响应一致。"""
+    try:
+        if not _current_region_fallback.get():
+            return error
+        # 仅替换可重试的区域失败；区域 403/400 与本地预算错误必须保留给路由判断，
+        # 否则会被误当成原始 429/503 而触发不该有的通道切换。
+        from sa_budget import BudgetError
+        if isinstance(error, BudgetError) or not _sa_retryable(error):
+            return error
+        pending = _pending_region_failure.get()
+        if pending is not None:
+            return pending
+    except Exception:
+        pass
+    return error
 
 
 def _sa_error_payload(error: Exception) -> dict:
@@ -209,6 +244,8 @@ async def _retry_client(client, factory: Optional[RetryClientFactory], error: Ex
         return client
     try:
         replacement = await factory(error)
+    except RetryStop:
+        raise
     except Exception as exc:
         # A credential construction error can contain sensitive configuration.
         print(f"⚠️ [账号切换] 无法准备备用凭证（{type(exc).__name__}），保持当前凭证重试。")
@@ -252,11 +289,53 @@ def _extract_cached_tokens(resp: Any) -> int:
 
 
 def _effective_pricing_tier() -> str:
-    """按控制台 paygo_tier 设置决定美刀计费档（standard/priority/flex/auto/off）。"""
+    """本次请求实际生效的计费档；未记录时回退控制台 paygo_tier 设置。
+
+    实际档位由上游解析阶段写入（non-global 的 auto 会降级为 standard，
+    避免统计按 Priority 虚高）；auto/off 等设置值只在没有实际档位时使用。
+    """
+    try:
+        actual = _current_pricing_tier.get()
+    except Exception:
+        actual = None
+    if actual:
+        return str(actual)
     try:
         return str(app_state.get_setting("paygo_tier", "auto") or "auto")
     except Exception:
         return "auto"
+
+
+def _reset_pricing_context_to_default_route() -> None:
+    """钉定失败退回裸模型/默认路由：实际区域未知，按 global 与 Standard 计。"""
+    _current_pricing_location.set("global")
+    _current_pricing_tier.set("standard")
+    _current_region_fallback.set(False)
+
+
+def _response_pricing_tier(usage_metadata) -> str | None:
+    """按上游返回的 service_tier / traffic_type 判定实际结算档；无信息返回 None。
+
+    与 sa_budget._settle 保持一致：global 打了 Priority 头但上游返回 ON_DEMAND 时，
+    实际按 Standard 结算，统计不能继续按 1.8 倍估算。
+    """
+    service = getattr(usage_metadata, "service_tier", None)
+    service = str(getattr(service, "value", service) or "").strip().lower()
+    if service in ("standard", "priority", "flex"):
+        return service
+    traffic = (getattr(getattr(usage_metadata, "traffic_type", None), "value", None)
+               or getattr(usage_metadata, "traffic_type", ""))
+    if str(traffic).strip().upper() == "ON_DEMAND":
+        return "standard"
+    return None
+
+
+def _effective_pricing_location() -> str:
+    """本次请求实际使用的区域；统计美刀时非 global 按官方 +10% 计。"""
+    try:
+        return str(_current_pricing_location.get() or "global").strip().lower() or "global"
+    except Exception:
+        return "global"
 
 
 def _record_usage(resp: Any, model_name: str = "") -> dict:
@@ -272,8 +351,10 @@ def _record_usage(resp: Any, model_name: str = "") -> dict:
     p_tk, c_tk, t_tk = usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
     if p_tk or c_tk:
         cached = usage["prompt_tokens_details"]["cached_tokens"]
+        tier = _response_pricing_tier(usage_metadata) or _effective_pricing_tier()
         stats.add_tokens(p_tk, c_tk, cached=cached, model=model_name,
-                         tier=_effective_pricing_tier())
+                         tier=tier,
+                         location=_effective_pricing_location())
         cache_note = f" | 缓存命中: {cached}" if cached else ""
         print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens{cache_note}")
     return usage
@@ -739,36 +820,44 @@ async def gemini_fake_stream_generator(
                     report_client_failure(gemini_client_instance, kind="conn")
                 retryable = _sa_retryable(e_call) if retry_client_factory else is_retryable_exception(e_call)
                 if retryable and attempt < max_retries:
-                    gemini_client_instance = await _retry_client(
-                        gemini_client_instance, retry_client_factory, e_call)
-                    stats.add_retry()
-                    ctx.retries += 1
-                    _set_phase("backoff")
-                    ctx.emit("attempt_failed",
-                             f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
-                             f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。"
-                             f"（{ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试失败，"
-                             f"本轮 {_seconds_text(attempt_ms)}，累计 {_seconds_text(ctx.elapsed_ms())}）",
-                             "WARN", attempt=attempt + 1, max_attempts=max_attempts, phase="backoff",
-                             attempt_elapsed_ms=attempt_ms, retryable=True,
-                             next_attempt=attempt + 2, backoff_seconds=backoff_sec,
-                             error_type=e_call.__class__.__name__,
-                             error_summary=request_log.redact(e_call), channel=channel_name)
-                    waited = 0.0
-                    while waited < backoff_sec:
-                        step = min(max(0.5, outer_keep_alive_interval or 1.0), backoff_sec - waited)
-                        await asyncio.sleep(step)
-                        waited += step
-                        if await _client_gone():
-                            print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
-                            _mark_cancelled()
-                            return
-                        if outer_keep_alive_interval > 0:
-                            keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
-                                               "created": int(time.time()), "model": request_obj.model,
-                                               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
-                    continue
+                    try:
+                        gemini_client_instance = await _retry_client(
+                            gemini_client_instance, retry_client_factory, e_call)
+                    except RetryStop as stop:
+                        # 停止内部重试，但保留 retryable 供 hybrid 故障转移判断。
+                        if stop.original_error is not None:
+                            e_call = stop.original_error
+                    else:
+                        stats.add_retry()
+                        ctx.retries += 1
+                        _set_phase("backoff")
+                        ctx.emit("attempt_failed",
+                                 f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
+                                 f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。"
+                                 f"（{ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试失败，"
+                                 f"本轮 {_seconds_text(attempt_ms)}，累计 {_seconds_text(ctx.elapsed_ms())}）",
+                                 "WARN", attempt=attempt + 1, max_attempts=max_attempts, phase="backoff",
+                                 attempt_elapsed_ms=attempt_ms, retryable=True,
+                                 next_attempt=attempt + 2, backoff_seconds=backoff_sec,
+                                 error_type=e_call.__class__.__name__,
+                                 error_summary=request_log.redact(e_call), channel=channel_name)
+                        waited = 0.0
+                        while waited < backoff_sec:
+                            step = min(max(0.5, outer_keep_alive_interval or 1.0), backoff_sec - waited)
+                            await asyncio.sleep(step)
+                            waited += step
+                            if await _client_gone():
+                                print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
+                                _mark_cancelled()
+                                return
+                            if outer_keep_alive_interval > 0:
+                                keep_alive_data = {"id": response_id, "object": "chat.completion.chunk",
+                                                   "created": int(time.time()), "model": request_obj.model,
+                                                   "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+                                yield f"data: {json.dumps(keep_alive_data)}\n\n"
+
+                        continue
+                e_call = _region_terminal_error(e_call)
                 ctx.emit("attempt_failed",
                          f"❌ [尝试失败] {ctx.request_id} 第 {attempt + 1}/{max_attempts} 次尝试失败"
                          f"（{e_call.__class__.__name__}），"
@@ -777,7 +866,7 @@ async def gemini_fake_stream_generator(
                          phase="waiting_upstream", attempt_elapsed_ms=attempt_ms,
                          retryable=bool(retryable), error_type=e_call.__class__.__name__,
                          error_summary=request_log.redact(e_call), channel=channel_name)
-                raise
+                raise e_call
 
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
@@ -844,6 +933,7 @@ async def gemini_fake_stream_generator(
         _prepend_prefill(openai_response_dict, prefill_text)
         # 假流式：响应已通过有效性/终止原因检查，此刻才算上游成功，写会话亲和绑定。
         await sa_affinity.commit_success()
+        await sa_region_pin.commit_success()
         convert_ms = int((request_log.now_mono() - convert_started) * 1000)
         _set_phase("sending_downstream")
         ctx.emit("phase", f"📤 [阶段] {ctx.request_id} 转换完成，开始向下游发送 SSE",
@@ -1174,6 +1264,8 @@ async def _execute_gemini_call(
                             selected_text_channel = None
                             synthetic_seen = False
                         final_usage = map_usage()
+                        final_service_tier = None
+                        final_on_demand = False
                         pending_finishes = {}
                         seen_candidate_indexes = set()
                         candidate_tool_calls = set()
@@ -1219,6 +1311,15 @@ async def _execute_gemini_call(
                                         terminal_finish_reasons[candidate_index] = raw_end.finish_reason
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_usage = map_usage(chunk_item_call.usage_metadata)
+                                # 显式 service_tier 优先于 ON_DEMAND；后续块缺字段时保留已有结论。
+                                _usage = chunk_item_call.usage_metadata
+                                _service = getattr(_usage, "service_tier", None)
+                                _service = str(getattr(_service, "value", _service) or "").strip().lower()
+                                if _service in ("standard", "priority", "flex"):
+                                    final_service_tier = _service
+                                _traffic = getattr(getattr(_usage, "traffic_type", None), "value", None)                                     or getattr(_usage, "traffic_type", "")
+                                if str(_traffic).strip().upper() == "ON_DEMAND":
+                                    final_on_demand = True
                                 request_log.note_traffic_type(
                                     getattr(chunk_item_call.usage_metadata, "traffic_type", None))
                                 # 纯用量块不代表已向客户端输出正文；安全反馈仍交由转换器处理。
@@ -1453,7 +1554,10 @@ async def _execute_gemini_call(
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk,
                                              cached=final_cached_tk, model=request_obj.model,
-                                             tier=_effective_pricing_tier())
+                                             tier=(final_service_tier
+                                                   or ("standard" if final_on_demand else None)
+                                                   or _effective_pricing_tier()),
+                                             location=_effective_pricing_location())
                             cache_note = f" | 缓存命中: {final_cached_tk}" if final_cached_tk else ""
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens{cache_note}")
 
@@ -1469,6 +1573,7 @@ async def _execute_gemini_call(
                                           selected_text_channel=selected_text_channel)
                         # 仅在流完整性和终态检查通过后刷新绑定。
                         await sa_affinity.commit_success()
+                        await sa_region_pin.commit_success()
                         yield "data: [DONE]\n\n"
                         return
 
@@ -1507,32 +1612,41 @@ async def _execute_gemini_call(
                                   "或把「标准模式 location」设为“默认（后端自选）”。")
                             model_to_call = fallback_model
                             current_client = _get_fallback_client()
+                            _reset_pricing_context_to_default_route()
                             print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                             continue
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
                         if is_retryable and not has_yielded and not prefill_sent and attempt < max_retries:
-                            current_client = await _retry_client(current_client, retry_client_factory, e_stream_call)
-                            # F-5：退避时长改读控制台的 retry_backoff_seconds，
-                            # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
-                            wait_time = backoff_sec
-                            stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [自动重试] {channel_call_text(channel_name)} 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
-                            if await _client_gone():
-                                print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
-                                return
-                            # 退避等待期间持续吐 SSE 心跳，保活前端连接
-                            _waited = 0.0
-                            while _waited < wait_time:
-                                await asyncio.sleep(min(3.0, wait_time - _waited))
-                                _waited += 3.0
+                            try:
+                                current_client = await _retry_client(current_client, retry_client_factory, e_stream_call)
+                            except RetryStop as stop:
+                                # 停止内部重试，但保留 is_retryable 供 hybrid 故障转移判断。
+                                if stop.original_error is not None:
+                                    e_stream_call = stop.original_error
+                            else:
+                                # F-5：退避时长改读控制台的 retry_backoff_seconds，
+                                # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
+                                wait_time = backoff_sec
+                                stats.add_retry() # 核心：手动重试计入大盘
+                                print(f"⚠️ [自动重试] {channel_call_text(channel_name)} 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                                 if await _client_gone():
-                                    print(f"ℹ️ [客户端断开] 重试等待期间检测到客户端已断开，停止调用模型 {model_to_call}。")
+                                    print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                     return
-                                yield ": keep-alive\n\n"
-                            continue
+                                # 退避等待期间持续吐 SSE 心跳，保活前端连接
+                                _waited = 0.0
+                                while _waited < wait_time:
+                                    await asyncio.sleep(min(3.0, wait_time - _waited))
+                                    _waited += 3.0
+                                    if await _client_gone():
+                                        print(f"ℹ️ [客户端断开] 重试等待期间检测到客户端已断开，停止调用模型 {model_to_call}。")
+                                        return
+                                    yield ": keep-alive\n\n"
 
+                                continue
+
+                        e_stream_call = _region_terminal_error(e_stream_call)
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] {channel_call_text(channel_name)} 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         _sa_hint = sa_channel_hint(channel_name, str(e_stream_call))
@@ -1600,16 +1714,25 @@ async def _execute_gemini_call(
                           "或把「标准模式 location」设为“默认（后端自选）”。")
                     model_to_call = fallback_model
                     current_client = _get_fallback_client()
+                    _reset_pricing_context_to_default_route()
                     print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 retryable = _sa_retryable(e_call) if retry_client_factory else is_retryable_exception(e_call)
                 if retryable and attempt < max_retries:
-                    current_client = await _retry_client(current_client, retry_client_factory, e_call)
-                    stats.add_retry()
-                    wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
-                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
-                    await asyncio.sleep(wait_time)
-                    continue
+                    try:
+                        current_client = await _retry_client(current_client, retry_client_factory, e_call)
+                    except RetryStop as stop:
+                        # 停止内部重试，但保留 retryable 供 hybrid 故障转移判断。
+                        if stop.original_error is not None:
+                            e_call = stop.original_error
+                    else:
+                        stats.add_retry()
+                        wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
+                        print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                        await asyncio.sleep(wait_time)
+
+                        continue
+                e_call = _region_terminal_error(e_call)
                 # hybrid 故障转移：限流/上游繁忙且内部重试已耗尽 → 抛给路由层切兜底通道
                 if failover_mode and retryable:
                     raise UpstreamUnstartedError(str(e_call)) from e_call
@@ -1617,7 +1740,7 @@ async def _execute_gemini_call(
                 _sa_hint = sa_channel_hint(channel_name, str(e_call))
                 if _sa_hint:
                     print(f"⚠️ [服务账号] 上游报错，疑似计费或权限问题：{_sa_hint}")
-                raise
+                raise e_call
 
         # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”
         if response_obj_call is None:

@@ -197,6 +197,13 @@ def test_price_reserves_carbon_at_post_introductory_rate():
     assert sa_budget.price("gemini-4-carbon", 1_000_000, 0, cached=1_000_000) == sa_budget.money("0.2")
 
 
+def test_price_normalizes_location_case_and_space():
+    model = "gemini-4-hydrogen"
+    assert sa_budget.price(model, 1_000_000, 1_000_000, location="GLOBAL") == sa_budget.money(9)
+    assert sa_budget.price(model, 1_000_000, 1_000_000, location=" global ") == sa_budget.money(9)
+    assert sa_budget.price(model, 1_000_000, 1_000_000, location=" us ") == sa_budget.money("9.9")
+
+
 def test_price_reserves_hydrogen_at_sku_rate():
     """Hydrogen 无已公布促销返还，不套用 Carbon/Argon 的 $4/$20 预留价。"""
     model = "gemini-4-hydrogen"
@@ -318,6 +325,27 @@ async def test_budget_models_stream_settles_once_at_end():
     assert after["reserved"] == 0.0
     assert after["spent"] == pytest.approx(_expected_settlement())
     assert _query("SELECT COUNT(*) FROM holds") == [(0,)]
+
+
+async def test_budget_models_stream_explicit_tier_survives_later_on_demand_chunk():
+    """前块 service_tier=priority、末块只有 ON_DEMAND 时，结算仍按 priority。"""
+    key = _init("acct", 100)
+    priority_usage = SimpleNamespace(
+        prompt_token_count=100, candidates_token_count=20, thoughts_token_count=30,
+        cached_content_token_count=0, service_tier=SimpleNamespace(value="priority"))
+    demand_usage = SimpleNamespace(
+        prompt_token_count=100, candidates_token_count=20, thoughts_token_count=30,
+        cached_content_token_count=0, traffic_type=SimpleNamespace(value="ON_DEMAND"))
+    sdk = FakeModels(chunks=[SimpleNamespace(usage_metadata=priority_usage),
+                             SimpleNamespace(usage_metadata=demand_usage)])
+    bm = _budget_models(sdk)
+
+    stream = await bm.generate_content_stream(**_call_kwargs())
+    _ = [chunk async for chunk in stream]
+
+    after = sa_budget.status(key)
+    expected = sa_budget.price(MODEL, 100, 50, 0, tier="priority", location="global") / NANO
+    assert after["spent"] == pytest.approx(expected)
 
 
 async def test_budget_models_stream_interrupt_keeps_hold():

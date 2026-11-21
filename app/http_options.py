@@ -36,7 +36,14 @@ _FLEX_UNSUPPORTED_RE = re.compile(r"^gemini-?2\.\d", re.IGNORECASE)
 
 def is_flex_supported(model_name: str) -> bool:
     """Flex 层级是否支持该模型（自动化黑名单判定，无需维护静态名单）。"""
-    return not _FLEX_UNSUPPORTED_RE.match((model_name or "").strip())
+    name = str(model_name or "").strip().lower()
+    for prefix in ("fake-", "[express] ", "[pay] "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    # 完整资源路径/代理前缀按实际模型 ID 判断；否则 gemini-2.x 会漏过黑名单。
+    name = name.rsplit("/", 1)[-1]
+    return not _FLEX_UNSUPPORTED_RE.match(name)
 
 
 def should_use_priority_paygo(model_path: str) -> bool:

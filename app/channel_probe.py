@@ -27,7 +27,7 @@ from google.genai import types
 import config as app_config
 import model_capabilities as mc
 import outcome as outcome_mod
-from api_helpers import CHANNEL_META, channel_display_name
+from api_helpers import CHANNEL_META, channel_display_name, upstream_exception_status
 from cookie_auth import BATCH_GRAPHQL_URL, build_headers, validate_cookie
 from model_loader import get_express_models
 from protocol_conversion import extract_upstream_error
@@ -41,9 +41,11 @@ from upstreams.cookie_proxy import (
     _is_project_error,
     _iter_json_objects,
 )
-from upstreams.express_sdk import resolve_express_model_path
+from upstreams.express_sdk import (pinned_resource_location, pinned_resource_project,
+                                   resolve_express_model_path, resource_location_error)
 from upstreams.service_account import (
     _effective_project,
+    _supports_region_fallback,
     build_sa_credentials,
     validate_sa_credentials,
 )
@@ -157,7 +159,7 @@ def _pick_default_model(text_models: list) -> tuple[str, str]:
 
 # ========== 探活请求构造 ==========
 
-def _probe_http_options() -> types.HttpOptions:
+def _probe_http_options(base_url: str | None = None) -> types.HttpOptions:
     """探活专用 HttpOptions：只带代理/证书与超时，**刻意不打 PayGo 层级头**。
 
     flex 档允许上游排队至 30 分钟，会把探活拖成"假死"；层级行为属于正式请求路径
@@ -170,6 +172,8 @@ def _probe_http_options() -> types.HttpOptions:
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
     options = {"api_version": "v1beta1"}
+    if base_url:
+        options["base_url"] = base_url
     if client_args:
         hc_kwargs = dict(client_args, timeout=PROBE_TIMEOUT_SECONDS)
         options["httpx_client"] = httpx.Client(**hc_kwargs)
@@ -218,7 +222,8 @@ def _upstream_fail(e: Exception, latency_ms: int) -> dict:
 async def _probe_express(key: str, model: str, settings: dict) -> dict:
     """Express 通道：真实请求走 resolve_express_model_path（含 express_location 钉定）。"""
     model_to_call = resolve_express_model_path(model, settings)
-    client = genai.Client(vertexai=True, api_key=key, http_options=_probe_http_options())
+    client = genai.Client(vertexai=True, api_key=key,
+                          http_options=_probe_http_options(app_config.VERTEX_BASE_URL))
     started = time.monotonic()
     try:
         await client.aio.models.generate_content(
@@ -231,17 +236,72 @@ async def _probe_express(key: str, model: str, settings: dict) -> dict:
         await _aclose_client(client)
 
 
+def _sa_probe_model(location: str, model: str) -> tuple[str, str]:
+    """us/eu 多区域节点覆盖 Gemini 4 全家；非 Gemini 4 用清单内模型探活，避免误报凭证失效。"""
+    location = str(location or "global").strip().lower()
+    target = _strip_search_alias(model)
+    # 与正式 SA 请求一致：-search 别名剥掉后再判断区域能力（探活不构造 Google Search 工具）。
+    model_name = target.lower().rsplit("/", 1)[-1]
+    if location in ("us", "eu") and not _supports_region_fallback(model_name):
+        return "gemini-4-hydrogen", "（所选模型不是 Gemini 4，已改用 gemini-4-hydrogen）"
+    return target, ""
+
+
+def _strip_probe_prefixes(model: str) -> str:
+    """探活入口与正式 SA 请求一样剥掉 fake-/Express/Pay 前缀。"""
+    value = str(model or "").strip()
+    while True:
+        lower = value.lower()
+        for prefix in ("fake-", "[express] ", "[pay] "):
+            if lower.startswith(prefix):
+                value = value[len(prefix):]
+                break
+        else:
+            return value.strip()
+
+
+def _strip_search_alias(model: str) -> str:
+    """正式 SA 请求会剥掉末尾 -search；探活保持同一模型 ID。"""
+    target = str(model or "").strip()
+    if target.lower().endswith("-search"):
+        return target[:-len("-search")]
+    return target
+
+
+def _sa_probe_target(account: dict, model: str) -> tuple[str, str, str, str | None]:
+    """返回 (客户端区域, 实际探活模型, 说明, 路径错误)。
+
+    完整资源路径显式钉定的区域优先于账号配置区域；路径写坏时本地拒绝，
+    避免拿账号区域的主机去请求另一区域的路径。
+    """
+    model = _strip_probe_prefixes(model)
+    location = str(account.get("location") or "global").strip().lower()
+    path_error = resource_location_error(model)
+    if path_error:
+        return location, model, "", path_error
+    pinned = pinned_resource_location(model)
+    if pinned:
+        return pinned.strip().lower(), _strip_search_alias(model), "", None
+    effective, note = _sa_probe_model(location, model)
+    return location, effective, note, None
+
+
 async def _probe_sa(account: dict, model: str) -> dict:
-    """服务账号通道：凭证直接构造 Client（project/location 取自该账号自身）。"""
+    """服务账号通道：凭证直接构造 Client（project/location 取自该账号自身或显式路径）。"""
     sa_json = account.get("sa_json") or ""
     project = _effective_project(sa_json, account.get("project_id") or "")
-    location = account.get("location") or "global"
+    location, model, model_note, path_error = _sa_probe_target(account, model)
+    if path_error:
+        return _local_fail(path_error)
+    target_project = pinned_resource_project(model) or project
+    if model_note:
+        model_note += "；若该模型也返回 404，只说明区域/模型不可用，凭证有效性未确认"
     client = genai.Client(
         vertexai=True,
         project=project or None,
         location=location,
         credentials=build_sa_credentials(sa_json),
-        http_options=_probe_http_options(),
+        http_options=_probe_http_options(app_config.VERTEX_BASE_URL),
     )
     import sa_budget
     key = sa_budget.credential_id(sa_json)
@@ -250,10 +310,21 @@ async def _probe_sa(account: dict, model: str) -> dict:
     try:
         await client.aio.models.generate_content(
             model=model, contents=PROBE_PROMPT, config=_probe_config())
-        return _ok(f"✅ 上游返回 200（project={project or '取 SA 自带'} location={location}）",
-                   int((time.monotonic() - started) * 1000))
+        project_note = f"project={target_project or '取 SA 自带'} location={location}"
+        if target_project and project and target_project != project:
+            project_note += f"（凭证项目={project}）"
+        return _ok(f"✅ 上游返回 200（model={model} {project_note}）"
+                   f"{model_note}", int((time.monotonic() - started) * 1000))
     except Exception as e:
-        return _upstream_fail(e, int((time.monotonic() - started) * 1000))
+        result = _upstream_fail(e, int((time.monotonic() - started) * 1000))
+        if model_note:
+            result["message"] += "\n" + model_note
+            # 只有「模型/区域 404」或网络不可达这类无法判断凭证状态的错误才标未确认；
+            # 401/403/429 等明确归因不能被替代模型说明掩盖。
+            _status = upstream_exception_status(e)
+            if _status == 404 or _status is None:
+                result["credential_unconfirmed"] = True
+        return result
     finally:
         await _aclose_client(client)
 
@@ -352,9 +423,12 @@ async def _probe_one(entry: dict, sem: asyncio.Semaphore) -> dict:
         try:
             result = await asyncio.wait_for(entry["probe"](), timeout=PROBE_HARD_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            timeout_message = (f"⏱️ 超过 {PROBE_HARD_TIMEOUT_SECONDS:.0f}s 未返回：网络不通、"
+                               "上游无响应或该凭证被静默挂起。")
+            if entry.get("probe_model"):
+                timeout_message += f"（实际探活模型 {entry['probe_model']}）"
             result = {"ok": False, "stage": "upstream", "latency_ms": int(PROBE_HARD_TIMEOUT_SECONDS * 1000),
-                      "message": f"⏱️ 超过 {PROBE_HARD_TIMEOUT_SECONDS:.0f}s 未返回：网络不通、"
-                                 "上游无响应或该凭证被静默挂起。"}
+                      "message": timeout_message}
         except Exception as e:
             result = _upstream_fail(e, 0)
         return {**entry["identity"], **result}
@@ -379,10 +453,12 @@ def _entries_for_channel(channel: str, model: str, settings: dict) -> list:
             })
     elif channel == "vertex":
         for i, account in enumerate(_sa_accounts()):
+            _location, effective_model, _note, _error = _sa_probe_target(account, model)
             entries.append({
                 "identity": {"channel": channel, "index": i, "label": _label_sa(account, i)},
                 "local_check": (lambda a=account: _local_check_sa(a)),
                 "probe": (lambda a=account: _probe_sa(a, model)),
+                "probe_model": effective_model,
             })
     return entries
 
@@ -435,7 +511,12 @@ async def probe_all(channels=None, model: str = "") -> dict:
         elif ok_count == len(creds):
             message, ok = f"全部 {len(creds)} 条凭证可用。", True
         else:
-            message, ok = f"{len(creds) - ok_count}/{len(creds)} 条凭证不可用。", False
+            unconfirmed = sum(1 for c in creds if c.get("credential_unconfirmed"))
+            if unconfirmed:
+                message, ok = (f"{len(creds) - ok_count}/{len(creds)} 条探活未通过"
+                               f"（其中 {unconfirmed} 条因模型/区域不可达，凭证状态未确认）。"), False
+            else:
+                message, ok = f"{len(creds) - ok_count}/{len(creds)} 条凭证不可用。", False
         channel_reports.append({
             "channel": channel,
             "display": channel_display_name(channel),

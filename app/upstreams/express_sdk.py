@@ -35,8 +35,10 @@ from http_options import get_http_options, resolve_paygo_bundle
 import model_capabilities as mc
 import request_log
 from conversion_report import ConversionReport
-from runtime_state import app_state
+from runtime_state import (_current_pricing_location, _current_pricing_tier,
+                           _current_region_fallback, app_state)
 import sa_affinity
+import sa_region_pin
 from failover import UpstreamUnstartedError
 from anti_truncation import (is_enabled_for_request, inject_request, get_enabled_field,
                             enable_stream_partial_args, partial_args_enabled,
@@ -175,6 +177,69 @@ def _log_client_reuse(channel: str, reused: bool, evicted: bool = False) -> None
     else:
         state = "新建 Client 连接池"
     print(f"🔌 [Client 复用] {channel_display_name(channel)} 本次请求{state}。")
+
+
+_LOCATION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def is_valid_location(location: str) -> bool:
+    """只接受规范的 GCP location（小写）；路径会原样发给上游，不能只在校验时转小写。"""
+    value = str(location or "")
+    if value != value.strip():
+        return False
+    return bool(_LOCATION_RE.fullmatch(value))
+
+
+def pinned_resource_project(model_name: str) -> str | None:
+    """从 projects/{project}/... 资源路径取项目；非资源路径返回 None。"""
+    parts = str(model_name or "").strip().split("/")
+    if "projects" not in parts:
+        return None
+    index = parts.index("projects")
+    if index + 1 >= len(parts) or not parts[index + 1].strip():
+        return None
+    return parts[index + 1].strip()
+
+
+def pinned_resource_location(model_name: str) -> str | None:
+    """从 projects/{p}/locations/{loc}/... 资源路径取区域；按固定段位解析，避免把项目 ID 当区域。"""
+    parts = str(model_name or "").strip().split("/")
+    if "projects" not in parts:
+        return None
+    index = parts.index("projects")
+    if index + 3 >= len(parts) or parts[index + 2] != "locations":
+        return None
+    return parts[index + 3] or None
+
+
+def resource_location_error(model_name: str) -> str | None:
+    """完整资源路径的 location 段明确非法时返回说明；没有 locations 段时返回 None。
+
+    区分「不是资源路径」与「资源路径写坏了」：后者不能静默当作未钉定区域，
+    否则会带着带空白的路径请求，或错误启用自动换区。
+    """
+    parts = str(model_name or "").strip().split("/")
+    if "projects" not in parts:
+        return None
+    index = parts.index("projects")
+    if index + 2 >= len(parts) or parts[index + 2] != "locations":
+        return None
+    if index + 3 >= len(parts) or not parts[index + 3]:
+        return "资源路径缺少 location 段"
+    if not is_valid_location(parts[index + 3]):
+        return f"资源路径的 location 段非法：{parts[index + 3]!r}"
+    return None
+
+
+def apply_pricing_context(resolved: dict) -> None:
+    """把解析结果中的实际区域/档位写入请求上下文。
+
+    SA 的 _resolve_client 在 asyncio.to_thread 中执行，线程内的 ContextVar.set()
+    不会回传到请求任务；必须由请求任务根据返回字段落地，统计才拿到真实区域/档位。
+    """
+    _current_pricing_location.set(resolved.get("pricing_location") or "global")
+    _current_pricing_tier.set(resolved.get("pricing_tier") or "standard")
+    _current_region_fallback.set(False)
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, bool, str | None]:
@@ -380,6 +445,8 @@ class ExpressSDKUpstream(BaseUpstream):
 
         _, express_api_key = key_tuple
         model_to_call = resolve_express_model_path(base_model_name, settings)
+        # 裸模型名由后端自选区域，按 global 基准计；只有实际钉定的资源路径才取其中的 location。
+        location = (pinned_resource_location(model_to_call) or "global").strip().lower()
         is_global = "/locations/global/" in model_to_call
         headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
         request_log.note_transport(headers, timeout)
@@ -397,6 +464,8 @@ class ExpressSDKUpstream(BaseUpstream):
             "client": client_to_use,
             "model_to_call": model_to_call,
             "priority_paygo": priority_paygo,
+            "pricing_location": location,
+            "pricing_tier": headers.get("X-Vertex-AI-LLM-Shared-Request-Type") or "standard",
             "fallback_model": fallback_model,
             "fallback_client_factory": fallback_client_factory,
         }
@@ -445,6 +514,7 @@ class ExpressSDKUpstream(BaseUpstream):
             resolved = self._resolve_client(fastapi_request, base_model_name, _inj_settings)
         if "error" in resolved:
             return resolved["error"]
+        apply_pricing_context(resolved)
         # SA 会话亲和：登记待写入决策（上游成功后才落库）；非 SA 通道为空操作。
         sa_affinity.begin_commit(resolved.get("sa_affinity"))
         client_to_use = resolved["client"]
@@ -688,4 +758,5 @@ class ExpressSDKUpstream(BaseUpstream):
         if not isinstance(result, StreamingResponse):
             if not (isinstance(result, JSONResponse) and result.status_code >= 400):
                 await sa_affinity.commit_success()
+                await sa_region_pin.commit_success()
         return result

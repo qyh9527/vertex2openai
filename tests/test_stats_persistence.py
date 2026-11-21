@@ -58,6 +58,14 @@ class TestStatsPersistence:
         assert day["cached_prompt_tokens"] == 500_000
         assert day["cost"] > 0
 
+    def test_non_global_location_adds_surcharge(self, tmp_path, monkeypatch):
+        """非 global 端点（含 us/eu）按官方 +10% 计入花费。"""
+        st, _ = self._fresh(tmp_path, monkeypatch)
+        st.add_tokens(1_000_000, 1_000_000, model="gemini-4-hydrogen", location="us")
+        assert abs(st.cost - (1.50 + 7.50) * 1.1) < 1e-6
+        day = st.get_json_stats()["daily"][0]
+        assert abs(day["cost"] - (1.50 + 7.50) * 1.1) < 1e-6
+
     def test_unknown_model_no_cost(self, tmp_path, monkeypatch):
         """未知模型不计费（cost 保持 0，不误报）。"""
         st, _ = self._fresh(tmp_path, monkeypatch)

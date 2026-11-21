@@ -90,6 +90,10 @@ class TestFlexModelBlacklist:
         assert is_flex_supported("gemini-2.5-pro") is False
         assert is_flex_supported("Gemini-2.0-flash") is False      # 大小写不敏感
         assert is_flex_supported("gemini-3-pro-image") is True     # 生图 3.x 放行
+        assert is_flex_supported(
+            "projects/p/locations/global/publishers/google/models/gemini-2.5-flash") is False
+        assert is_flex_supported(
+            "fake-projects/p/locations/global/publishers/google/models/gemini-2.5-flash") is False
 
     def test_flex_downgraded_for_2x_model(self):
         headers, timeout, warnings = resolve_paygo_bundle(

@@ -28,9 +28,17 @@ def _clear_account_context():
     import runtime_state
     runtime_state._current_cookie_account.set(None)
     runtime_state._current_sa_account.set(None)
+    runtime_state._current_pricing_location.set(None)
+    runtime_state._current_pricing_tier.set(None)
+    runtime_state._current_region_fallback.set(False)
+    runtime_state._pending_region_failure.set(None)
     yield
     runtime_state._current_cookie_account.set(None)
     runtime_state._current_sa_account.set(None)
+    runtime_state._current_pricing_location.set(None)
+    runtime_state._current_pricing_tier.set(None)
+    runtime_state._current_region_fallback.set(False)
+    runtime_state._pending_region_failure.set(None)
 
 
 @pytest.fixture(autouse=True)

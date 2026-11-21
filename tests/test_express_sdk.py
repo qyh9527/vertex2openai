@@ -180,3 +180,19 @@ class TestClientReuseGuard:
             assert sdk._get_cached_client("key1", False) is client
         finally:
             self._restore_settings()
+
+def test_apply_pricing_context_sets_actual_region_and_tier():
+    from runtime_state import (_current_pricing_location, _current_pricing_tier,
+                               _current_region_fallback)
+    from upstreams.express_sdk import apply_pricing_context
+
+    _current_region_fallback.set(True)
+    apply_pricing_context({"pricing_location": "us", "pricing_tier": "priority"})
+    assert _current_pricing_location.get() == "us"
+    assert _current_pricing_tier.get() == "priority"
+    assert _current_region_fallback.get() is False
+
+    _current_pricing_tier.set("priority")
+    apply_pricing_context({})
+    assert _current_pricing_location.get() == "global"
+    assert _current_pricing_tier.get() == "standard"

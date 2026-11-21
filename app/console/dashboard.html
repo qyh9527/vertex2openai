@@ -449,7 +449,7 @@
         <div id="sa-new-account" class="empty:hidden mb-3"></div>
         <div id="sa-accounts" class="grid gap-3"></div>
         <p class="text-xs text-neutral-500 mt-3 leading-relaxed">同一份赠金可手动挂载多份凭证，共享 $295 保护线和截止日。请按实际账单校正起算日。预留不等于实扣，搜索结算可能超额。每份凭证填入完整 <b>SA JSON</b>（含 <code>client_email</code> / <code>private_key</code> / <code>project_id</code>）+ 可选 Project ID 覆盖 + 区域。SA JSON 输入框留空 = 保持该账号原值不变。<b>凭证只回显掩码</b>（client_email + project + location），永不回填 JSON。</p>
-        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限：请妥善保管、只用于本项目、必要时轮换。区域默认 <code>global</code>（多数 Gemini 模型只在 global 提供）。</p>
+        <p class="text-xs text-neutral-500 mt-2 leading-relaxed">💡 服务账号 Key 是长期静态凭证，泄漏等于该账号全部权限：请妥善保管、只用于本项目、必要时轮换。区域默认 <code>global</code>；<code>us</code> / <code>eu</code> 是 Google 多区域节点（SDK 自动使用 <code>aiplatform.us.rep.googleapis.com</code> / <code>eu</code>，可在 global 拥堵 429 时分流；Gemini 4 全系在 global 明确 429 时用同一凭证按下方设置尝试 1 或 2 个区域；某个区域成功后该凭证固定该区域 24 小时；自定义 VERTEX_BASE_URL 部署不自动换主机），非 global 单价 +10% 已计入花费统计；某个区域是否真正开放由上游决定，Neon 等模型手动选区域请先核实。<b>区域是该凭证所有裸模型请求的默认端点，不按模型过滤</b>：把账号设为 us/eu 后，不支持该区域的模型会直接 404，不会自动换号；探活通过也不代表业务模型在该区域可用。global 账号遇到上游 <b>429</b> 时按「重试与退避」里的次数最多随机或完整尝试 us/eu；有数据驻留要求请把请求的 <code>model</code> 写成含 <code>locations/&lt;区域&gt;</code> 的完整资源路径（不是只选这里的账号区域），并使用 <code>/vertex/v1</code> 等不参与 hybrid 的入口；完整资源路径会禁用自动换区与区域固定。该入口不跨通道，但完整资源路径请求不会在 SA 通道内自动轮换凭证。设置 <code>VERTEX_BASE_URL</code> 时完整路径也不会覆盖自定义主机，需另行确认端点满足区域要求，此配置本身不构成数据驻留合规保证。把 SA 通道重试次数设为 0 只禁用通道内重试，不禁用 hybrid 切换到其它通道。</p>
       </div>
 
       <dialog id="sa-merge-dialog" aria-labelledby="sa-merge-title" class="rounded-xl border border-neutral-200 text-sm overflow-hidden backdrop:bg-black/40" style="width:min(680px,calc(100% - 24px));max-height:88vh" oncancel="if(saMergeBusy)event.preventDefault()">
@@ -714,6 +714,14 @@
         <div class="grid grid-cols-2 gap-3">
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
           <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+        </div>
+        <div class="mt-3">
+          <div class="lbl mb-1">SA 区域回退尝试次数<span class="helpq" onclick="hlp(this,'h_sa_region')">?</span></div>
+          <select id="sa_region_fallback_attempts" class="inp">
+            <option value="1">1 次 · 随机 us/eu</option>
+            <option value="2">最多 2 次 · us/eu（顺序随机）</option>
+          </select>
+          <div id="h_sa_region" class="helpbox">只对服务账号通道、Gemini 4 系列模型、账号为 global 且上游明确返回 <b>429</b> 时生效。剩余重试限制的是<b>实际发出的区域请求</b>：剩 0 次不换区；剩 1 次仍可发一个区域请求；剩至少 2 次且首区请求发生可重试错误（如临时 404）时才发第二个；若首区客户端构造失败、尚未发请求，会在同一重试槽继续构造另一个候选区。1 次 = 随机挑一个区域；2 次 = 最多 us/eu 都试，先试哪个随机；首区成功、403 或本地预算错误都不再发第二个区域请求。某个区域返回成功后会把这枚凭证固定在该区域 <b>24 小时</b>，期间该凭证被选中后的 Gemini 4 请求直接走该区域（固定不改变轮询/亲和选号）；非 global 单价 +10% 已计入额度账本与花费统计。完整资源路径、自定义 VERTEX_BASE_URL、账号已手动设为 us/eu 时不参与自动换区。区域是否真的开放由上游决定；只有可重试的区域请求失败（含临时区域 404）会用原始 global 错误收尾。区域 403 保留自身归因且不触发通道切换；本地预算错误保留自身归因，但 <code>BudgetUnavailable</code> 仍按既有规则参与凭证轮换与 hybrid 切换。</div>
         </div>
       </div>
 
@@ -1404,15 +1412,16 @@ async function loadRuntime(){
 }
 
 /* ---- 服务账号（第三通道）---- */
-const SA_LOCATIONS=['global','us-central1','us-east1','us-east4','us-west1','us-west4','northamerica-northeast1','southamerica-east1','europe-west1','europe-west4','europe-west8','europe-west9','asia-east1','asia-east2','asia-northeast1','asia-northeast3','asia-southeast1','australia-southeast1'];
+const SA_LOCATIONS=['global','us','eu','us-central1','us-east1','us-east4','us-west1','us-west4','northamerica-northeast1','southamerica-east1','europe-west1','europe-west4','europe-west8','europe-west9','asia-east1','asia-east2','asia-northeast1','asia-northeast3','asia-southeast1','australia-southeast1'];
 function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function saRowHtml(acc){
   const idx=acc?acc.index:-1;
+  const accLocation=String(acc&&acc.location?acc.location:'global').trim().toLowerCase();
   const row=document.createElement('div');
   row.className='account-row border border-neutral-200 rounded-lg p-3 mb-3';
   if(acc)row.dataset.credentialId=acc.credential_id||'';
   const head=acc
-    ? `<div class="text-xs text-neutral-500 mb-2 break-all">凭证 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(acc.location||'global')}</div>`
+    ? `<div class="text-xs text-neutral-500 mb-2 break-all">凭证 #${idx+1} <span class="pill pill-accent" style="text-transform:none">${escapeHtml(acc.client_email||'(未解析 email)')}</span> · ${escapeHtml(accLocation)}</div>`
     : `<div class="text-xs text-neutral-500 mb-2">新增账号</div>`;
   let destination='';
   if(!acc&&saControlled&&saGroups.size){
@@ -1426,7 +1435,7 @@ function saRowHtml(acc){
     `<textarea class="inp log mb-2 acc-sa-json" aria-label="服务账号 JSON" rows="3" placeholder="粘贴完整服务账号 JSON（SA JSON；留空 = 保持原值）"></textarea>`+
     `<div class="flex flex-wrap gap-2 mb-2">`+
       `<input class="inp acc-sa-project" aria-label="Project ID" placeholder="Project ID 覆盖（留空 = 取 SA JSON 自带）" value="${escapeHtml(acc?acc.project_id||'':'')}" style="flex:1;min-width:min(180px,100%)">`+
-      `<select class="inp acc-sa-location" aria-label="区域">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${acc&&acc.location===l?'selected':''}>${l}</option>`).join('')+`</select>`+
+      `<select class="inp acc-sa-location" aria-label="区域">`+SA_LOCATIONS.map(l=>`<option value="${l}" ${l===accLocation?'selected':''}>${l}</option>`).join('')+`</select>`+
     `</div>`+
     `<div class="flex justify-end gap-2">`+
     (acc?`<button class="px-3 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="delSaAccount(this,${idx})">删除</button>`:'')+
@@ -1771,7 +1780,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     $('history_tool_template').value=JSON.stringify(s.history_tool_template,null,2);
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','anti_truncation_side_buffer_bytes','history_tool_mode','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','sa_region_fallback_attempts','client_reuse_evict_threshold','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','anti_truncation_field','anti_truncation_side_buffer_bytes','history_tool_mode','input_relay_mode','input_relay_tag','input_relay_placeholder','top_input_injection_mode','top_input_injection_selected_plan_id','top_input_injection_random'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','client_reuse','input_relay_strip_generated','top_input_injection_fake_only','anti_truncation_partial_args','sa_session_affinity'].forEach(k=>setV(k,s[k]));
     loadAffinity();
     const legacyTop=['fake_stream_only','non_vertex_only'].includes(s.top_input_injection_mode);
@@ -2006,6 +2015,7 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    sa_region_fallback_attempts:$('sa_region_fallback_attempts').value==='2'?2:1,
     client_reuse:$('client_reuse').checked,
     client_reuse_evict_threshold:numOr('client_reuse_evict_threshold',5),
     anti_truncation_field:($('anti_truncation_field').value||'').trim() || 'anti_truncation',

@@ -127,6 +127,14 @@ DEFAULT_SETTINGS = {
     # 开启后，同一会话（system + 首条 user 的内容指纹）尽量钉在同一 GCP project，
     # 保住上游隐式缓存；只影响 SA 账号选择，不涉及 Express Key / Cookie 账号。
     "sa_session_affinity": False,
+    # ===== SA 区域回退尝试次数 =====
+    # global 账号遇上游 429 时，同一凭证改试 us/eu 多区域节点的次数，只接受 1 或 2：
+    #   1 = 随机试一个区域（默认，保持旧行为）
+    #   2 = 最多试 us/eu 两个区域，顺序随机（受通道剩余重试次数限制）；
+    #       成功后把该凭证固定到成功区域 24 小时。
+    # 仅在模型属于 Gemini 4 系列、账号/请求未显式指定区域、设置重试次数足够时生效；
+    # 首个区域返回 403 等不可重试错误时不会继续尝试第二个区域。
+    "sa_region_fallback_attempts": 1,
     # ===== PayGo 流量等级（ST-Vertex-PayGo 方案融合，作用于标准 Vertex 端点类通道）=====
     # Express 与 服务账号 两通道打同一组官方"按量共享容量"层级头（cookie 通道走 batchGraphql 不适用）：
     #   auto      = 保持现状：钉定到 global 时自动打 priority 头

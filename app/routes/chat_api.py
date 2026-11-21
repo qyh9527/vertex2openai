@@ -9,7 +9,7 @@ from models import OpenAIRequest
 from auth import get_api_key
 
 # 引入运行状态管理器与多通道分发策略
-from runtime_state import app_state
+from runtime_state import _current_region_fallback, _pending_region_failure, app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstreams.service_account import ServiceAccountUpstream
@@ -198,6 +198,9 @@ def _current_credential_id(channel: str) -> str:
 
 def _report_failure(channel, credential, category, message, *, error=None):
     if channel == "vertex":
+        # 区域尝试不计熔断；原始 global 失败已在换区时立即上报，避免终态路径漏报/重复。
+        if _current_region_fallback.get():
+            return
         if isinstance(error, BudgetError) or category in (
                 outcome_mod.CLIENT_CLOSED, outcome_mod.REQUEST_PERMANENT, outcome_mod.POLICY_BLOCKED):
             return
@@ -216,6 +219,10 @@ def _report_failure(channel, credential, category, message, *, error=None):
 
 def _report_success(channel, credential=""):
     if channel == "vertex":
+        # 临时区域成功不代表该凭证的配置端点已恢复，不能提前清冷却；也不补报原始失败。
+        if _current_region_fallback.get():
+            _pending_region_failure.set(None)
+            return
         credential = _current_credential_id(channel) or credential
         if credential:
             breaker.report_success((channel, credential))
@@ -327,6 +334,18 @@ def _chunk_has_effective_output(chunk: str) -> bool:
     return False
 
 
+def _dedupe_vertex_channels(channels: list) -> list:
+    """折叠重复 vertex，保留 Express 等其它通道的重复项（Express 重复是换 Key 兜底）。"""
+    deduped, seen_vertex = [], False
+    for channel in channels:
+        if channel == "vertex":
+            if seen_vertex:
+                continue
+            seen_vertex = True
+        deduped.append(channel)
+    return deduped
+
+
 async def _dispatch(channels: list, request: OpenAIRequest,
                     fastapi_request: Request, failover_mode: bool,
                     raw_mode: bool = False):
@@ -342,6 +361,7 @@ async def _dispatch(channels: list, request: OpenAIRequest,
                 503, "当前策略下没有可用的上游通道：请配置 Express API Key、Google Cookie 或服务账号 JSON。",
                 "upstream_error"),
         )
+    channels = _dedupe_vertex_channels(channels)
 
     # SA 会话亲和：只在本次可能走服务账号时计算指纹/查绑定（原始请求、提示词改写之前）。
     # 指纹与 ContextVar 留在请求任务；SQLite 查询放到线程，避免阻塞事件循环。

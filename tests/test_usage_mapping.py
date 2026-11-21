@@ -73,4 +73,42 @@ def test_stats_count_thoughts_once(monkeypatch):
     monkeypatch.setattr(api_helpers, "_effective_pricing_tier", lambda: "standard")
     response = types.GenerateContentResponse(usage_metadata=sdk_meta(META))
     assert api_helpers._record_usage(response, "gemini-3.6-flash") == EXPECTED
-    stats.add_tokens.assert_called_once_with(100, 50, cached=40, model="gemini-3.6-flash", tier="standard")
+    stats.add_tokens.assert_called_once_with(100, 50, cached=40, model="gemini-3.6-flash",
+                                             tier="standard", location="global")
+
+def test_pricing_location_reads_context_location():
+    from runtime_state import _current_pricing_location
+    token = _current_pricing_location.set("eu")
+    try:
+        assert api_helpers._effective_pricing_location() == "eu"
+    finally:
+        _current_pricing_location.reset(token)
+    assert api_helpers._effective_pricing_location() == "global"
+
+def test_actual_pricing_tier_overrides_setting(monkeypatch):
+    from runtime_state import _current_pricing_tier
+    monkeypatch.setattr(api_helpers.app_state, "get_setting", lambda key, default=None: "auto")
+    assert api_helpers._effective_pricing_tier() == "auto"
+    token = _current_pricing_tier.set("standard")
+    try:
+        assert api_helpers._effective_pricing_tier() == "standard"
+    finally:
+        _current_pricing_tier.reset(token)
+
+def test_region_fallback_404_is_retryable_only_during_fallback():
+    from runtime_state import _current_region_fallback
+
+    class _NotFound(Exception):
+        code = 404
+
+    assert api_helpers._sa_retryable(_NotFound()) is False
+    token = _current_region_fallback.set(True)
+    try:
+        assert api_helpers._sa_retryable(_NotFound()) is True
+    finally:
+        _current_region_fallback.reset(token)
+
+def test_response_pricing_tier_matches_budget_settlement():
+    assert api_helpers._response_pricing_tier(SimpleNamespace(service_tier="priority")) == "priority"
+    assert api_helpers._response_pricing_tier(SimpleNamespace(traffic_type="ON_DEMAND")) == "standard"
+    assert api_helpers._response_pricing_tier(SimpleNamespace()) is None

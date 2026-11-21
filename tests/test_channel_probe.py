@@ -17,7 +17,7 @@ import pytest
 import channel_probe as cp
 from channel_probe import (
     DEFAULT_CHANNELS, PROBE_HARD_TIMEOUT_SECONDS, _label_cookie, _label_key, _label_sa,
-    pick_probe_model, probe_all,
+    _sa_probe_model, _sa_probe_target, pick_probe_model, probe_all,
 )
 import config as app_config
 from runtime_state import app_state
@@ -86,6 +86,44 @@ def test_probe_model_falls_back_to_first_text_model():
     model, note = pick_probe_model(["gemini-9-unknown-flash"])
     assert model == "gemini-9-unknown-flash"
     assert note == ""
+
+
+def test_sa_probe_model_switches_for_us_eu_account():
+    """us/eu 账号不能用 global 的 3.x 模型探活，否则会把区域无模型误报成凭证失效。"""
+    model, note = _sa_probe_model("us", "gemini-3.6-flash")
+    assert model == "gemini-4-hydrogen" and "Gemini 4" in note
+    model, note = _sa_probe_model("EU", "gemini-4-carbon")
+    assert model == "gemini-4-carbon" and note == ""
+    model, note = _sa_probe_model("us", "gemini-4-neon")
+    assert model == "gemini-4-neon" and note == ""
+    model, note = _sa_probe_model("global", "gemini-3.6-flash")
+    assert model == "gemini-3.6-flash" and note == ""
+
+
+def test_sa_probe_model_handles_search_alias():
+    model, note = _sa_probe_model("us", "gemini-4-carbon-search")
+    assert model == "gemini-4-carbon" and note == ""
+
+
+def test_sa_probe_target_respects_explicit_path_and_validates_location():
+    account = {"location": "us"}
+    location, model, note, error = _sa_probe_target(
+        account, "projects/p/locations/global/publishers/google/models/gemini-3.6-flash")
+    assert (location, model, note, error) == (
+        "global", "projects/p/locations/global/publishers/google/models/gemini-3.6-flash", "", None)
+    _location, model, _note, _error = _sa_probe_target(
+        account, "projects/p/locations/global/publishers/google/models/gemini-4-carbon-search")
+    assert model == "projects/p/locations/global/publishers/google/models/gemini-4-carbon"
+    _location, model, _note, error = _sa_probe_target(
+        account, "[PAY] projects/p/locations/global/publishers/google/models/gemini-4-carbon")
+    assert (model, error) == (
+        "projects/p/locations/global/publishers/google/models/gemini-4-carbon", None)
+    location, model, note, error = _sa_probe_target(account, "gemini-3.6-flash")
+    assert (location, model, note, error) == ("us", "gemini-4-hydrogen", note, None)
+    assert "Gemini 4" in note
+    _location, model, _note, error = _sa_probe_target(
+        account, "projects/p/locations//publishers/google/models/gemini-4-hydrogen")
+    assert model.endswith("gemini-4-hydrogen") and "缺少" in error
 
 
 # ---------- 凭证枚举：控制台优先、环境变量兜底 ----------
@@ -324,6 +362,9 @@ def test_probe_http_options_omit_paygo_headers():
     options = cp._probe_http_options()
     assert not (options.headers or {}).get("X-Vertex-AI-LLM-Request-Type")
     assert options.api_version == "v1beta1"
+    options = cp._probe_http_options("https://example.invalid")
+    assert options.base_url == "https://example.invalid"
+    assert not (options.headers or {}).get("X-Vertex-AI-LLM-Request-Type")
 
 
 def test_probe_config_disables_afc_and_caps_tokens():

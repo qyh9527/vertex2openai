@@ -272,7 +272,7 @@ def price(model, prompt, output, cached=0, tier="standard", location="global", i
         elif name == "gemini-2.5-pro":
             inp, out = 2.5, 15
     factor = Decimal("1.8" if tier == "priority" else "0.5" if tier == "flex" else "1")
-    if location != "global":
+    if str(location or "global").strip().lower() != "global":
         factor *= Decimal("1.1")
     cached = min(max(0, cached), prompt)
     dollars = (Decimal(str(inp)) * (prompt - cached + Decimal(str(get_cached_input_ratio(name))) * cached)
@@ -362,7 +362,8 @@ class BudgetModels:
             cleanup.add_done_callback(_pending_cleanup.discard)
             raise
 
-    def _settle(self, token, response, model, search_queries=0, media_input=False):
+    def _settle(self, token, response, model, search_queries=0, media_input=False,
+                tier_override=None):
         usage = getattr(response, "usage_metadata", None)
         if usage is None:
             return
@@ -372,12 +373,16 @@ class BudgetModels:
             return
         mapped = map_usage(usage)
         traffic = str(getattr(getattr(usage, "traffic_type", None), "value", None) or getattr(usage, "traffic_type", ""))
-        tier = "standard" if traffic == "ON_DEMAND" else self.tier
         service = getattr(usage, "service_tier", None)
-        if service:
-            service = str(getattr(service, "value", service)).lower()
-            if service in ("standard", "priority", "flex"):
-                tier = service
+        service = str(getattr(service, "value", service)).lower() if service else ""
+        if service in ("standard", "priority", "flex"):
+            tier = service
+        elif tier_override is not None:
+            tier = tier_override
+        elif traffic == "ON_DEMAND":
+            tier = "standard"
+        else:
+            tier = self.tier
         image_tokens = 0
         details = getattr(usage, "candidates_tokens_details", None)
         for entry in details or []:
@@ -446,16 +451,28 @@ class BudgetModels:
             last = None
             received = False
             search_queries = 0
+            last_service_tier = None
+            last_on_demand = False
             try:
                 async for chunk in stream:
                     received = True
                     search_queries = max(search_queries, self._search_queries(chunk))
-                    if getattr(chunk, "usage_metadata", None) is not None:
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage is not None:
                         last = chunk
+                        traffic = str(getattr(getattr(usage, "traffic_type", None), "value", None)
+                                      or getattr(usage, "traffic_type", ""))
+                        service = str(getattr(getattr(usage, "service_tier", None), "value", None)
+                                      or getattr(usage, "service_tier", "")).lower()
+                        if service in ("standard", "priority", "flex"):
+                            last_service_tier = service
+                        if traffic == "ON_DEMAND":
+                            last_on_demand = True
                     yield chunk
                 if last is not None:
+                    tier_override = last_service_tier or ("standard" if last_on_demand else None)
                     await asyncio.to_thread(self._settle, token, last, kwargs["model"], search_queries,
-                                            has_media(kwargs.get("contents")))
+                                            has_media(kwargs.get("contents")), tier_override)
             except Exception as exc:
                 if not received and getattr(exc, "code", None) in (400, 401, 403, 404, 429):
                     await asyncio.to_thread(settle, token, 0)

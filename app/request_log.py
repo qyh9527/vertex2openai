@@ -241,7 +241,7 @@ def note_traffic_type(traffic_type: Any) -> None:
             ctx.emit("paygo_downgraded",
                      f"⚠️ [流量等级] {ctx.request_id} 优先档已被上游降级为标准档"
                      f"（请求头 priority，实际 traffic_type=ON_DEMAND）：上游当时没有空闲算力按优先档处理，"
-                     f"本次按标准档计费，等待可能明显变长。",
+                     f"本次估算以 service_tier 优先；没有 service_tier 时按标准档。等待可能明显变长。",
                      "WARN", paygo_tier=ctx.paygo_tier, traffic_type=value, paygo_downgraded=True,
                      channel=ctx.channel)
     except Exception:

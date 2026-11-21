@@ -278,11 +278,12 @@ class ProxyStats:
             self._touch_hourly(success=1)
             self._maybe_save()
 
-    def add_tokens(self, p_tokens, c_tokens, cached=0, model=None, tier="standard"):
+    def add_tokens(self, p_tokens, c_tokens, cached=0, model=None, tier="standard",
+                   location="global"):
         """累计 token 用量；cached = 命中上下文缓存的输入 token（隐式缓存 90% 折扣）。
 
         model + tier（standard/priority/flex/auto/off）用于按官方按量价估算美刀成本
-        （model_pricing）；未知模型不计费。
+        （model_pricing）；location 非 global（含 us / eu）按官方 +10% 计；未知模型不计费。
         """
         with self.lock:
             self.prompt_tokens += p_tokens
@@ -291,7 +292,8 @@ class ProxyStats:
             self.cached_prompt_tokens += cached
             try:
                 from model_pricing import estimate_cost
-                cost = estimate_cost(model, p_tokens, c_tokens, cached, tier=tier)
+                cost = estimate_cost(model, p_tokens, c_tokens, cached, tier=tier,
+                                     location=location)
             except Exception:
                 cost = None
             cost = cost if cost is not None else 0.0

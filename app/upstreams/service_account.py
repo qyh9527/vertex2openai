@@ -20,6 +20,7 @@
 
 import asyncio
 import json
+import random
 from functools import partial
 from typing import Any, Optional
 
@@ -28,15 +29,20 @@ from fastapi.responses import JSONResponse
 from google import genai
 from google.oauth2 import service_account
 
-from upstreams.express_sdk import ExpressSDKUpstream
-from api_helpers import create_openai_error_response
+from upstreams.express_sdk import (ExpressSDKUpstream,
+                                   pinned_resource_location, pinned_resource_project,
+                                   resource_location_error)
+from api_helpers import RetryStop, create_openai_error_response, upstream_exception_status
 from http_options import get_http_options, resolve_paygo_bundle
-from runtime_state import _current_sa_account, app_state, sa_breaker_id
+from runtime_state import (_current_pricing_location, _current_pricing_tier,
+                           _current_region_fallback, _current_sa_account,
+                           _pending_region_failure, app_state, sa_breaker_id)
 import request_log
 import outcome
 import sa_budget
 from failover import breaker
 import sa_affinity
+import sa_region_pin
 import config as app_config
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -93,6 +99,39 @@ def _effective_project(sa_json: str, project_id: str) -> str:
         return str(json.loads(sa_json).get("project_id") or "")
     except Exception:
         return ""
+
+
+def _supports_region_fallback(model_name: str) -> bool:
+    """该模型是否允许尝试 us/eu 多区域节点（Gemini 4 全家，含 Neon/cyber 变体）。
+
+    某个区域是否真的开放由上游决定：尝试失败会回到原始 global 错误，
+    不会把一个区域的 404 当成模型不存在返回给客户端。
+    """
+    name = str(model_name or "").strip().lower().rsplit("/", 1)[-1]
+    if name.endswith("-search"):
+        name = name[:-len("-search")]
+    return name == "gemini-4" or name.startswith("gemini-4-")
+
+
+def _region_attempt_count(settings: dict) -> int:
+    """本次请求允许尝试的区域数：1（随机一个）或 2（us/eu 都试）。"""
+    raw = (settings or {}).get("sa_region_fallback_attempts", 1)
+    return 2 if str(raw) == "2" else 1
+
+
+def _pinned_region_for(sa_json: str, location: str, base_model_name: str,
+                       explicit_location: Optional[str] = None) -> Optional[str]:
+    """该凭证是否有可用的 24 小时固定区域；显式路径/自定义主机/非 Gemini 4 不适用。"""
+    if explicit_location is not None:
+        return None
+    if str(location or "").strip().lower() != "global":
+        return None
+    if app_config.VERTEX_BASE_URL or not _supports_region_fallback(base_model_name):
+        return None
+    try:
+        return sa_region_pin.lookup(sa_budget.credential_id(sa_json))
+    except (sa_budget.BudgetError, ValueError, OSError):
+        return None
 
 
 def validate_sa_credentials(sa_json: str) -> dict:
@@ -177,6 +216,14 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"))}
 
+        # 路径写坏必须优先返回 400；否则空模型 ID 会先撞上预算/价表检查变成 429。
+        location_error = resource_location_error(base_model_name)
+        if location_error:
+            return {"error": JSONResponse(status_code=400, content=create_openai_error_response(
+                400, location_error, "invalid_request_error"))}
+        pinned_location_raw = pinned_resource_location(base_model_name)
+        pinned_location = pinned_location_raw.strip().lower() if pinned_location_raw else None
+        location = (pinned_location or location or "global").strip().lower()
         try:
             key = sa_budget.credential_id(sa_json)
             budget = sa_budget.status(key)
@@ -188,7 +235,13 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
         except (sa_budget.BudgetError, ValueError, OSError) as exc:
             return {"error": JSONResponse(status_code=429, content=create_openai_error_response(
                 429, str(exc), "insufficient_quota"))}
-        location = location or "global"
+        # 区域回退成功过的凭证，24 小时内直接使用成功区域；显式路径/自定义主机不参与。
+        pinned_region = _pinned_region_for(
+            sa_json, location, base_model_name, explicit_location=pinned_location)
+        if pinned_region:
+            location = pinned_region
+            print(f"📌 [区域固定] 凭证 …{key[-4:]} 在 {location} 有 24 小时固定记录，"
+                  f"本次直接使用该多区域节点（非 global 单价 +10%）。")
         is_global = location == "global"
         headers, timeout, warnings = resolve_paygo_bundle(is_global, settings, model_name=base_model_name)
         request_log.note_transport(headers, timeout)
@@ -206,59 +259,180 @@ class ServiceAccountUpstream(ExpressSDKUpstream):
             "client": client_to_use,
             "model_to_call": base_model_name,   # 裸名，SDK 按 Client 的 project/location 拼路径
             "priority_paygo": bool(headers),
+            "pricing_location": location,
+            "pricing_tier": headers.get("X-Vertex-AI-LLM-Shared-Request-Type") or "standard",
             "fallback_model": None,              # 无钉定失败回退需求
             "fallback_client_factory": None,
             # 会话亲和：待写入的绑定决策（上游响应通过验证后提交）。
+            # 亲和键必须用所选凭证自身的生效项目；资源路径里的目标项目只决定请求目标。
             "sa_affinity": sa_affinity.build_decision(
                 _effective_project(sa_json, project_id), key, base_model_name),
             # 重试换号：可重试故障（429/503/配额）时换下一个未被本次请求试过的账号。
             "retry_client_factory": self.make_retry_client_factory(
-                settings, base_model_name, sa_json),
+                settings, base_model_name, sa_json, project_id, location,
+                allow_region_fallback=(pinned_location is None
+                                       and not app_config.VERTEX_BASE_URL)),
         }
 
     def make_retry_client_factory(self, settings: dict, base_model_name: str,
-                                  current_sa_json: str):
-        """Prepare the next eligible credential off-loop; adopt it in the request task."""
+                                  current_sa_json: str, project_id: str = "",
+                                  current_location: str = "global",
+                                  allow_region_fallback: bool = True):
+        """Prepare the next retry target off-loop; adopt it in the request task.
+
+        第一次可重试失败优先用同一凭证换一个多区域节点（仅 global 429 → us/eu；
+        控制台可设 1 或 2 次，2 次会无顺序尝试两个区域）。区域回退不修改账号配置、
+        不计入凭证熔断；之后的重试仍按原逻辑轮换其它凭证。多区域端点由 SDK 拼为
+        aiplatform.{us|eu}.rep.googleapis.com，单价按非 global +10% 计。
+        """
         tried = {sa_budget.credential_id(current_sa_json)}
         current_id = sa_breaker_id(current_sa_json)
+        region_candidates = list(("us", "eu"))
+        random.shuffle(region_candidates)
+        region_candidates = region_candidates[:_region_attempt_count(settings)]
+        region_total = len(region_candidates)
+        current_is_region = False
+        region_original_reported = False
+        pinned_project = pinned_resource_project(base_model_name)
+        pinned_location_raw = pinned_resource_location(base_model_name)
+        pinned_location = pinned_location_raw.strip().lower() if pinned_location_raw else None
+        active_sa_json = current_sa_json
+        active_project = project_id
+        active_location = (pinned_location or current_location or "global").strip().lower()
+
+        def _build(target_sa_json: str, target_project: str, location: str):
+            key = sa_budget.credential_id(target_sa_json)
+            headers, timeout, _warnings = resolve_paygo_bundle(
+                location == "global", settings, model_name=base_model_name)
+            client = _get_cached_sa_client(target_sa_json, target_project, location,
+                                           headers, timeout)
+            client = sa_budget.BudgetClient(
+                client, key, location,
+                headers.get("X-Vertex-AI-LLM-Shared-Request-Type", "standard"))
+            return client, headers, timeout
+
+        def prepare_region(location: str):
+            project = _effective_project(active_sa_json, active_project)
+            client, headers, timeout = _build(active_sa_json, project, location)
+            return client, {"project_id": project, "location": location,
+                            "sa_json": active_sa_json}, headers, timeout
 
         def prepare():
+            # 显式完整资源路径已钉定项目；换号可能把请求发到别的项目/凭证权限下，直接不轮换。
+            if pinned_project:
+                return None
             while True:
-                project_id, location, sa_json = app_state.next_sa_account_excluding(tried)
+                project_id_next, location, sa_json = app_state.next_sa_account_excluding(tried)
                 if not sa_json:
                     return None
                 key = sa_budget.credential_id(sa_json)
                 tried.add(key)
-                location = location or "global"
+                location = (location or "global").strip().lower()
+                pinned_region = _pinned_region_for(
+                    sa_json, location, base_model_name, explicit_location=pinned_location)
+                if pinned_region:
+                    location = pinned_region
+                    print(f"📌 [区域固定] 备用凭证 …{key[-4:]} 使用固定区域 {location}。")
                 try:
-                    headers, timeout, _warnings = resolve_paygo_bundle(
-                        location == "global", settings, model_name=base_model_name)
-                    client = _get_cached_sa_client(sa_json, project_id, location, headers, timeout)
-                    client = sa_budget.BudgetClient(
-                        client, key, location,
-                        headers.get("X-Vertex-AI-LLM-Shared-Request-Type", "standard"))
+                    client, headers, timeout = _build(sa_json, project_id_next, location)
                 except Exception as exc:
                     print(f"⚠️ [账号切换] 跳过无法构造的备用凭证（{type(exc).__name__}）。")
                     continue
-                return client, {"project_id": project_id, "location": location, "sa_json": sa_json}, key, headers, timeout
+                return client, {"project_id": project_id_next, "location": location,
+                                "sa_json": sa_json}, headers, timeout
+
+        def _adopt(account, headers, timeout, region_fallback=False):
+            _current_sa_account.set(account)
+            _current_pricing_location.set(account.get("location") or "global")
+            _current_region_fallback.set(region_fallback)
+            _current_pricing_tier.set(
+                headers.get("X-Vertex-AI-LLM-Shared-Request-Type") or "standard")
+            project = _effective_project(account["sa_json"], account["project_id"])
+            key = sa_budget.credential_id(account["sa_json"])
+            sa_affinity.begin_commit(sa_affinity.build_decision(project, key, base_model_name))
+            request_log.note_transport(headers, timeout)
 
         async def switch(error: Exception):
-            nonlocal current_id
+            nonlocal current_id, current_is_region, region_original_reported
+            nonlocal active_sa_json, active_project, active_location
+            can_region = (allow_region_fallback
+                          and pinned_location is None
+                          and _supports_region_fallback(base_model_name)
+                          and not isinstance(error, sa_budget.BudgetError))
+            # 第一次换区：只在 global 明确 429 时触发，避免把普通限流以外的错误也搬去区域端点。
+            if (can_region and region_candidates
+                    and active_location == "global"
+                    and upstream_exception_status(error) == 429):
+                # 构造失败不消耗整条回退路径：继续试剩余区域；全失败再交回凭证轮换。
+                while region_candidates:
+                    location = region_candidates.pop(0)
+                    try:
+                        client, account, headers, timeout = await asyncio.to_thread(
+                            prepare_region, location)
+                    except Exception as exc:
+                        print(f"⚠️ [区域回退] 多区域节点 {location} 客户端构造失败"
+                              f"（{type(exc).__name__}），继续尝试下一个区域。")
+                        continue
+                    current_is_region = True
+                    if not region_original_reported:
+                        region_original_reported = True
+                        # 原始 global 失败立即计入候选熔断一次；之后的区域尝试结果不再计入。
+                        # 与普通失败路径同样豁免明确的永久/策略/客户端关闭类错误。
+                        _category = outcome.classify_exception(error)
+                        if _category not in (outcome.CLIENT_CLOSED, outcome.REQUEST_PERMANENT,
+                                             outcome.POLICY_BLOCKED):
+                            if _category == outcome.RATE_LIMITED:
+                                breaker.report_candidate_rate_limited("vertex", current_id, str(error))
+                            else:
+                                breaker.report_failure(("vertex", current_id))
+                        _pending_region_failure.set(error)
+                    _adopt(account, headers, timeout, region_fallback=True)
+                    active_location = account["location"]
+                    print(f"🔁 [区域回退] global 上游 429，本次请求改用多区域节点 {location}"
+                          f"（第 {region_total - len(region_candidates)}/{region_total} 次尝试；"
+                          f"同一凭证，不修改账号配置，非 global 单价 +10%）。")
+                    return client
+            # 第一次换区也没有成功：按配置继续尝试另一个多区域节点（us/eu 无固定顺序）。
+            if can_region and region_candidates and current_is_region:
+                while region_candidates:
+                    previous = active_location
+                    location = region_candidates.pop(0)
+                    try:
+                        client, account, headers, timeout = await asyncio.to_thread(
+                            prepare_region, location)
+                    except Exception as exc:
+                        print(f"⚠️ [区域回退] 多区域节点 {location} 客户端构造失败"
+                              f"（{type(exc).__name__}），继续尝试下一个区域。")
+                        continue
+                    _adopt(account, headers, timeout, region_fallback=True)
+                    active_location = account["location"]
+                    print(f"🔁 [区域回退] {previous} 未成功，继续尝试多区域节点 {location}"
+                          f"（第 {region_total - len(region_candidates)}/{region_total} 次尝试；"
+                          f"同一凭证，不修改账号配置，非 global 单价 +10%）。")
+                    return client
             prepared = await asyncio.to_thread(prepare)
             if prepared is None:
+                if current_is_region:
+                    original = (error if isinstance(error, sa_budget.BudgetError)
+                                else (_pending_region_failure.get() or error))
+                    raise RetryStop("区域回退已尝试，且没有其它可用凭证。",
+                                    original_error=original)
                 return None
-            client, account, key, headers, timeout = prepared
-            project = _effective_project(account["sa_json"], account["project_id"])
-            # The local reservation gate is not a Google credential failure.
-            if not isinstance(error, sa_budget.BudgetError):
+            client, account, headers, timeout = prepared
+            # 区域尝试本身不计熔断（原始 global 失败已在换区时上报）；普通轮换仍按当前错误上报。
+            if not current_is_region and not isinstance(error, sa_budget.BudgetError):
                 if outcome.classify_exception(error) == outcome.RATE_LIMITED:
                     breaker.report_candidate_rate_limited("vertex", current_id, str(error))
                 else:
                     breaker.report_failure(("vertex", current_id))
+            _pending_region_failure.set(None)
+            current_is_region = False
+            region_original_reported = False
             current_id = sa_breaker_id(account["sa_json"])
-            _current_sa_account.set(account)
-            sa_affinity.begin_commit(sa_affinity.build_decision(project, key, base_model_name))
-            request_log.note_transport(headers, timeout)
+            active_sa_json = account["sa_json"]
+            active_project = account["project_id"]
+            active_location = account["location"]
+            _adopt(account, headers, timeout)
             print(f"🔁 [账号切换] 本次请求改用另一份服务账号凭证（…{current_id[-4:]}）。")
             return client
 

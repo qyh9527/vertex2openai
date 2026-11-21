@@ -17,6 +17,11 @@ from models import OpenAIRequest
 from runtime_state import app_state
 
 
+def test_vertex_duplicates_collapsed_but_express_kept():
+    assert chat_api._dedupe_vertex_channels(["vertex", "express", "vertex"]) == ["vertex", "express"]
+    assert chat_api._dedupe_vertex_channels(["express", "express"]) == ["express", "express"]
+
+
 def _req():
     return OpenAIRequest(model="gemini-3.6-flash", messages=[{"role": "user", "content": "你好"}])
 

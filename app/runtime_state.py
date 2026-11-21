@@ -25,6 +25,23 @@ _current_cookie_account = contextvars.ContextVar(
 _current_sa_account = contextvars.ContextVar(
     "current_sa_account", default=None)
 
+# 本请求实际发出请求的区域（global / us / eu / 具体区域）；用量统计对非 global 按官方 +10% 计。
+_current_pricing_location = contextvars.ContextVar(
+    "current_pricing_location", default=None)
+
+# 本请求实际生效的 PayGo 档位（flex / priority / standard）；非 global 的 auto 会降级为 standard。
+_current_pricing_tier = contextvars.ContextVar(
+    "current_pricing_tier", default=None)
+
+# 当前上游尝试是否由「global → us/eu 区域回退」产生；用于把该区域的 404 视为可继续重试，
+# 而不是让一次区域不可用直接终止整条请求。
+_current_region_fallback = contextvars.ContextVar(
+    "current_region_fallback", default=False)
+
+# 区域回退期间保留的原始 global 错误；终态响应/故障转移优先使用它，避免回传区域 404。
+_pending_region_failure = contextvars.ContextVar(
+    "pending_region_failure", default=None)
+
 
 def _sa_env_fallback() -> list:
     """服务账号环境变量兜底：VERTEX_SA_JSON（内联）或 VERTEX_SA_FILE（文件路径）。

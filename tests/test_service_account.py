@@ -254,6 +254,33 @@ class TestResolveClient:
         headers = resolved["client"]._api_client._http_options.headers or {}
         assert headers.get("X-Vertex-AI-LLM-Shared-Request-Type") == "priority"
 
+    def test_pinned_region_applied_to_global_gemini4_account(self, monkeypatch):
+        import sa_budget
+        import sa_region_pin
+        monkeypatch.setattr(app_state, "get_current_sa_account",
+                            lambda: ("proj-a", "global", _SA_A))
+        sa_region_pin.pin(sa_budget.credential_id(_SA_A), "eu")
+        up = ServiceAccountUpstream()
+        resolved = up._resolve_client(object(), "gemini-4-hydrogen", {"paygo_tier": "off"})
+        assert "error" not in resolved
+        assert resolved["pricing_location"] == "eu"
+        assert resolved["priority_paygo"] is False
+
+    def test_pinned_region_not_used_for_non_gemini4_or_explicit_path(self, monkeypatch):
+        import sa_budget
+        import sa_region_pin
+        monkeypatch.setattr(app_state, "get_current_sa_account",
+                            lambda: ("proj-a", "global", _SA_A))
+        sa_region_pin.pin(sa_budget.credential_id(_SA_A), "eu")
+        up = ServiceAccountUpstream()
+        resolved = up._resolve_client(object(), "gemini-3.6-flash", {"paygo_tier": "off"})
+        assert resolved["pricing_location"] == "global"
+        resolved = up._resolve_client(
+            object(),
+            "projects/p/locations/global/publishers/google/models/gemini-4-hydrogen",
+            {"paygo_tier": "off"})
+        assert resolved["pricing_location"] == "global"
+
     async def test_pay_prefix_stripped_before_chat(self, monkeypatch):
         """[PAY] 旧前缀被剥掉后再走本通道（B4 兼容入口）。"""
         from models import OpenAIRequest

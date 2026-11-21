@@ -97,6 +97,26 @@ def _today() -> datetime.date:
     return datetime.date.today()
 
 
+def _model_id(model_name: str) -> str:
+    """取官方模型 ID：支持裸名、models/ 与 projects/.../publishers/google/models/ 路径。
+
+    项目自有 Model 资源（projects/.../models/... 且不在 publishers/google 下）保持原样，
+    查不到价即不计费，避免按官方 SKU 误报。
+    """
+    name = (model_name or "").strip().lower()
+    for prefix in ("fake-", "[express] ", "[pay] "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    marker = "/publishers/google/models/"
+    if marker in name:
+        return name.rsplit(marker, 1)[-1]
+    for prefix in ("publishers/google/models/", "models/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 def _longest_prefix_match(model_name: str, table: dict):
     """返回 (命中的键, 值)；未命中返回 None。"""
     name = (model_name or "").strip().lower()
@@ -104,6 +124,7 @@ def _longest_prefix_match(model_name: str, table: dict):
         if name.startswith(prefix):
             name = name[len(prefix):]
             break
+    name = _model_id(name)
     for suffix in ("-search", "-openai", "-openaisearch"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
@@ -119,7 +140,7 @@ def _longest_prefix_match(model_name: str, table: dict):
 
 def estimate_cost(model_name: str, prompt_tokens: int, completion_tokens: int,
                   cached_tokens: int = 0, tier: str = "standard",
-                  on_date: datetime.date = None):
+                  on_date: datetime.date = None, location: str = "global"):
     """估算一次请求的美刀成本；未知模型或全 0 返回 None（不计费）。
 
     计费拆三块（官方按量价，tier 决定 Standard/Priority/Flex 档）：
@@ -128,17 +149,21 @@ def estimate_cost(model_name: str, prompt_tokens: int, completion_tokens: int,
       - 输出：              档 output 价 × completion / 1M
     Flex 档对 2.x 模型不可用（请求侧会自动降级为普通请求），这里同样降级为 Standard 计费。
     单价按 on_date（缺省服务器当天）取 PRICE_SCHEDULE 生效价。
+    location 非 global（含 us / eu 多区域）按官方非 global 端点 +10% 计。
     """
+    model_id = _model_id(model_name)
     price = get_model_price(model_name, on_date)
     if price is None:
         return None
     # 2.x 模型不支持 flex：打 flex 头的请求实际被降级为标准，计费保持一致
-    if tier == "flex" and (model_name or "").startswith("gemini-2"):
+    if tier == "flex" and model_id.startswith("gemini-2"):
         tier = "standard"
     # auto 档对生图模型不打 Priority 头（http_options.resolve_paygo_bundle），按 Standard 计费
-    if tier == "auto" and mc.get_profile(model_name)["is_image"]:
+    if tier == "auto" and mc.get_profile(model_id)["is_image"]:
         tier = "standard"
     factor = PRICING_FACTORS.get(tier or "standard", 1.0)
+    if str(location or "global").strip().lower() != "global":
+        factor *= 1.1
 
     prompt_tokens = max(0, prompt_tokens or 0)
     completion_tokens = max(0, completion_tokens or 0)
